@@ -5,7 +5,7 @@ Contains data structures and utilities for loading, processing, and batching dat
 """
 import math
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Tuple, Callable, Any
+from typing import Dict, Iterator, List, Optional, Tuple, Callable, Any, Union
 
 import torch
 from datasets import load_dataset
@@ -70,7 +70,7 @@ def get_tokenizer() -> PreTrainedTokenizer:
     return tokenizer
 
 
-def tokenize_text(text: str or List[str], tokenizer: PreTrainedTokenizer) -> List[int] or List[List[int]]:
+def tokenize_text(text: Union[str, List[str]], tokenizer: PreTrainedTokenizer) -> Union[List[int], List[List[int]]]:
     """
     Tokenize text into token IDs.
     
