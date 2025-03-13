@@ -121,7 +121,7 @@ def iter_wikipedia_articles() -> Iterator[Dict]:
         yield article
 
 
-def filter_articles_by_length(tokenizer: PreTrainedTokenizer) -> Iterator[Dict]:
+def filter_articles_by_length(tokenizer: PreTrainedTokenizer) -> Iterator[Tuple[Dict, List[int]]]:
     """
     Filter Wikipedia articles by length.
     
@@ -129,7 +129,8 @@ def filter_articles_by_length(tokenizer: PreTrainedTokenizer) -> Iterator[Dict]:
         tokenizer: The tokenizer to use for length calculation
         
     Returns:
-        Iterator[Dict]: Iterator yielding articles that meet the length requirement
+        Iterator[Tuple[Dict, List[int]]]: Iterator yielding articles that meet the length 
+                                    requirement along with their tokenized text
     """
     min_tokens = (TOKENS_PER_KEY + TOKENS_PER_VALUE) * NUM_KV_PAIRS
     
@@ -138,7 +139,7 @@ def filter_articles_by_length(tokenizer: PreTrainedTokenizer) -> Iterator[Dict]:
         tokens = tokenize_text(text, tokenizer)
         
         if len(tokens) >= min_tokens:
-            yield article
+            yield article, tokens
 
 
 def iter_key_value_pairs(batch_size: int = 1, embedding_fn=None) -> Iterator[Tuple[KeyValuePair, List[Dict]]]:
@@ -159,18 +160,13 @@ def iter_key_value_pairs(batch_size: int = 1, embedding_fn=None) -> Iterator[Tup
         article_batch = []
         all_tokens = []
         
-        for article in filter_articles_by_length(tokenizer):
-            # Tokenize article text in place
-            tokens = tokenize_text(article["text"], tokenizer)
+        for article, tokens in filter_articles_by_length(tokenizer):
+            # Articles and tokens have already been filtered for length, so we can use them directly
+            article_batch.append(article)
+            all_tokens.append(tokens)
             
-            # Only include articles with enough tokens
-            tokens_needed = (TOKENS_PER_KEY + TOKENS_PER_VALUE) * NUM_KV_PAIRS
-            if len(tokens) >= tokens_needed:
-                article_batch.append(article)
-                all_tokens.append(tokens)
-                
-                if len(article_batch) >= batch_size:
-                    break
+            if len(article_batch) >= batch_size:
+                break
         
         # If we couldn't collect enough articles, exit
         if not article_batch:
