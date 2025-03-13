@@ -142,7 +142,7 @@ def filter_articles_by_length(tokenizer: PreTrainedTokenizer) -> Iterator[Tuple[
             yield article, tokens
 
 
-def iter_key_value_pairs(batch_size: int = 1, embedding_fn=None) -> Iterator[Tuple[KeyValuePair, List[Dict]]]:
+def iter_key_value_pairs(batch_size: int = 1, embedding_fn=None) -> Iterator[KeyValuePair]:
     """
     Create an iterator that yields batches of key-value pairs.
     
@@ -151,7 +151,7 @@ def iter_key_value_pairs(batch_size: int = 1, embedding_fn=None) -> Iterator[Tup
         embedding_fn: Optional function to compute embeddings
         
     Returns:
-        Iterator[Tuple[KeyValuePair, List[Dict]]]: Iterator yielding a batched KeyValuePair object and the source articles
+        Iterator[KeyValuePair]: Iterator yielding a batched KeyValuePair object
     """
     tokenizer = get_tokenizer()
     
@@ -250,5 +250,5 @@ def iter_key_value_pairs(batch_size: int = 1, embedding_fn=None) -> Iterator[Tup
             value_text=all_value_text_list
         )
         
-        # Include the article_indices for downstream processing
-        yield kv_pair, article_batch 
+        # Previously, we also returned the article_batch, now we just yield kv_pair
+        yield kv_pair 

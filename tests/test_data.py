@@ -89,13 +89,13 @@ def test_data_iterator():
         return torch.ones((batch_size, 768), device=DEVICE)
 
     # Test with small batch size
-    batch_size = 1
-    
+    batch_size = 1 
+      
     # Get the iterator
     iterator = iter_key_value_pairs(batch_size=batch_size, embedding_fn=dummy_embedding_fn)
     
     # Process one batch
-    kv_pair, articles = next(iterator)
+    kv_pair = next(iterator)
     
     # Verify KeyValuePair object
     assert isinstance(kv_pair, KeyValuePair)
@@ -103,8 +103,12 @@ def test_data_iterator():
     assert kv_pair.key_tokens.shape[1] == TOKENS_PER_KEY
     assert kv_pair.value_tokens.shape[1] == TOKENS_PER_VALUE
     
-    # Verify article batch
-    assert len(articles) == batch_size
+    # Verify that first dimension matches batch_size exactly
+    assert kv_pair.key_tokens.shape[0] == batch_size
+    assert kv_pair.value_tokens.shape[0] == batch_size
+    assert kv_pair.key_embedding.shape[0] == batch_size
+    assert len(kv_pair.key_text) == batch_size
+    assert len(kv_pair.value_text) == batch_size
     
     # Test with larger batch size
     batch_size = 2
@@ -113,14 +117,14 @@ def test_data_iterator():
     iterator = iter_key_value_pairs(batch_size=batch_size, embedding_fn=dummy_embedding_fn)
     
     # Process one batch
-    kv_pair, articles = next(iterator)
+    kv_pair = next(iterator)
     
-    # Verify the batch size
-    assert len(articles) == batch_size
-    
-    # Verify key-value pair scaling
-    # The number of pairs should scale with batch size (approximately)
-    assert kv_pair.key_tokens.shape[0] > 1
+    # Verify that first dimension matches batch_size exactly
+    assert kv_pair.key_tokens.shape[0] == batch_size
+    assert kv_pair.value_tokens.shape[0] == batch_size
+    assert kv_pair.key_embedding.shape[0] == batch_size
+    assert len(kv_pair.key_text) == batch_size
+    assert len(kv_pair.value_text) == batch_size
 
 
 def test_format_prompt_with_kv_pairs():
@@ -146,4 +150,4 @@ def test_format_prompt_with_kv_pairs():
 
 if __name__ == "__main__":
     # Run the tests manually
-    test_data_iterator() 
+    test_data_iterator()
