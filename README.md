@@ -26,4 +26,5 @@ python src/main.py
 
 ```bash
 pytest tests/
+
 ``` 
