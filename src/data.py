@@ -115,7 +115,7 @@ def iter_wikipedia_articles() -> Iterator[Dict]:
         Iterator[Dict]: Iterator yielding article dictionaries
     """
     # Use streaming mode to avoid loading the entire dataset into memory
-    dataset = load_dataset("wikipedia", "20220301.en", split="train", streaming=True)
+    dataset = load_dataset("wikipedia", "20220301.en", split="train", streaming=True, trust_remote_code=True)
     
     for article in dataset:
         yield article
