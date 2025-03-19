@@ -15,14 +15,17 @@ if torch.cuda.is_available():
         # Less than 12GB of GPU memory, use a lighter model: GPT-2.
         MODEL_NAME = "gpt2"
         TOKENIZER_NAME = "gpt2"
+        MODEL_TYPE = "gpt2"
     else:
         MODEL_NAME = "meta-llama/Llama-3.2-3B"
         TOKENIZER_NAME = "meta-llama/Llama-3.2-3B"
+        MODEL_TYPE = "llama"
 else:
     device = "cpu"
     # Use GPT-2 on CPU for resource reasons.
     MODEL_NAME = "gpt2"
     TOKENIZER_NAME = "gpt2"
+    MODEL_TYPE = "gpt2"
 
 DEVICE = device
 DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
@@ -40,7 +43,7 @@ TOKENS_PER_KV_PAIR = TOKENS_PER_KEY + TOKENS_PER_VALUE
 KV_EVERY_N = 4
 
 model_config = AutoConfig.from_pretrained(MODEL_NAME)
-if MODEL_NAME.startswith("meta-llama"):
+if MODEL_TYPE == "llama":
     context_length = model_config.max_position_embeddings
 else:
     context_length = model_config.n_positions

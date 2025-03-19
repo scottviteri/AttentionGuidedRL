@@ -175,51 +175,12 @@ This batched implementation ensures both numerical stability and efficient compu
   - Pre-compute and store embeddings during data loading to avoid redundant computation.
 
 - **Grouped Query Attention Handling:**  
-  - Dynamically retrieve `num_query_heads`, `num_kv_groups`, and `head_dim` from the model (e.g., via `first_layer.self_attn.k_proj` and `q_proj`).  
-  - Reshape query embeddings to `(batch_size, num_query_heads, head_dim)`.  
-  - Reshape key embeddings to `(batch_size, num_kv_groups, head_dim)`.  
-  - Compute dot products between query and key embeddings per head-group pair, fully leveraging batched operations:
-  ```python
-  # Reshape for batched computation
-  # query_embeddings: [batch_size, embedding_dim] -> [batch_size, num_query_heads, head_dim]
-  query_heads = query_embeddings.view(batch_size, num_query_heads, head_dim)
-  
-  # key_embeddings: [num_keys, batch_size, embedding_dim] -> [num_keys, batch_size, num_kv_groups, head_dim]
-  key_groups = key_embeddings.view(num_keys, batch_size, num_kv_groups, head_dim)
-  
-  # Compute similarities for all batches at once
-  similarities = torch.zeros(batch_size, num_query_heads, num_keys, device=query_heads.device)
-  
-  # Calculate per-head similarities efficiently using batched operations
-  for h in range(num_query_heads):
-      # Determine which KV group this head should attend to
-      kv_group_idx = h // (num_query_heads // num_kv_groups)
-      
-      # Extract corresponding query heads for all batches [batch_size, head_dim]
-      query_head_batch = query_heads[:, h]
-      
-      # Extract corresponding key groups for all keys and batches [num_keys, batch_size, head_dim]
-      key_groups_batch = key_groups[:, :, kv_group_idx]
-      
-      # Efficiently compute similarity for all keys and all batches at once
-      # [batch_size, 1, head_dim] × [num_keys, batch_size, head_dim]ᵀ → [batch_size, num_keys]
-      batch_similarities = torch.bmm(
-          query_head_batch.unsqueeze(1),
-          key_groups_batch.permute(1, 0, 2)
-      ).squeeze(1) / math.sqrt(head_dim)
-      
-      similarities[:, h] = batch_similarities
-  
-  # Average across heads to get final similarity scores
-  # [batch_size, num_heads, num_keys] → [batch_size, num_keys]
-  mean_similarities = torch.mean(similarities, dim=1)
-  
-  # Apply softmax to get probability distribution over keys for each batch
-  probabilities = F.softmax(mean_similarities * temperature, dim=-1)
-  ```
-  - Apply softmax per head to obtain probability distributions over keys for each head.  
-  - Average these probability distributions across the head dimension to get a single probability distribution per batch.
-  - Efficiently implement using PyTorch's batch operations for maximum performance.
+  - Dynamically retrieve `num_query_heads`, `num_kv_groups`, and `head_dim` from the model (e.g., via `last_layer.self_attn.k_proj` and `q_proj`).  
+  - Reshape query embeddings to `(batch_size, num_query_heads * head_dim)`.  
+  - Reshape key embeddings to `(batch_size, seq_len, num_kv_groups * head_dim)`.  
+  - Compute dot products between query and key embeddings per head-group pair, fully leveraging batched operations
+  - Apply softmax per head to obtain probability distributions over the key sequence length for each head.  
+  - Average these probability distributions across the head dimension to get a single distribution over the sequence length per batch.
 
 ### 4.2. Data Processing and Batching
 
@@ -289,23 +250,10 @@ This batched implementation ensures both numerical stability and efficient compu
         key_text: List[str]  # For logging and debugging
         value_text: List[str]  # For logging and debugging
         
-        # Implement tensor shape validation here
-        
-    @dataclass
-    class TrajectoryStep:
-        context_tokens: torch.Tensor  # Shape: [batch_size, context_length]
-        query_tokens: torch.Tensor  # Shape: [batch_size, TOKENS_PER_KEY]
-        selected_pair: KeyValuePair
-        reward: torch.Tensor  # Shape: [batch_size]
-        similarity_score: torch.Tensor  # Shape: [batch_size]
-        context_text: List[str]  # For logging and debugging
-        query_text: List[str]  # For logging and debugging
-        
     @dataclass
     class Trajectory:
         steps: List[TrajectoryStep]
-        avg_reward: torch.Tensor  # Shape: [batch_size]
-        total_reward: torch.Tensor  # Shape: [batch_size]
+        rewards: Optional[torch.Tensor]  # Shape: [batch_size, trajectory_length]
     ```
   
   - All data structures maintain fixed tensor dimensions to avoid padding and enable efficient batched operations.
@@ -451,3 +399,13 @@ attention-guided-rl/
 ## 6. Conclusion
 
 This design document provides a comprehensive blueprint for implementing an RL-driven, self-directed language model training system using Wikipedia data. By integrating Llama-3.2-3B with LoRA, leveraging attention-guided embeddings with grouped query attention, ensuring tokenization consistency with spaces around prompts, filtering articles based on required token counts, and adopting a functional dataloading approach with iterators, the system achieves efficient and stable learning. Extensive testing and modularity ensure reliability and reproducibility. This standalone guide equips developers with a clear, detailed plan to construct a PyTorch-based software repository.
+
+# GPU Resource Selection and Parameter Mapping
+
+Depending on on the available GPU resources, the repository dynamically selects a model variant. On systems with limited GPU memory, a smaller model (GPT-2) is chosen for its lower memory footprint, while systems with ample GPU resources can leverage larger models, such as LLaMA.
+
+One significant architectural difference lies in the attention mechanism implementations. LLaMA defines separate projection layers (e.g., `last_layer.self_attn.k_proj`, `last_layer.self_attn.v_proj`, and corresponding query projection) for its self-attention operations. In contrast, GPT-2 consolidates these projections into a single linear layer (typically found as part of the `h.<layer_index>.attn.c_attn` module) and then splits the output into query, key, and value components.
+
+For example, the key projection in LLaMA (`first_layer.self_attn.k_proj`) corresponds to a segment of the weight matrix within GPT-2's `h.0.attn.c_attn`. Similar mappings are applied for the query and value projections.
+
+These mappings are handled in the configuration module (src/config.py), ensuring that when the model is selected based on GPU capabilities, the appropriate architectural differences are reconciled for consistent behavior in the attention mechanism.
