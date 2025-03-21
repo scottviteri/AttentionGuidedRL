@@ -13,6 +13,8 @@ import torch.optim as optim
 from tqdm import tqdm
 from datetime import datetime
 from typing import List, Optional, Dict, Callable, Any
+import numpy as np
+from copy import deepcopy
 
 from src.config import (
     DEVICE,
@@ -28,8 +30,11 @@ from src.config import (
     KEY_PREFIX,
     VALUE_PREFIX,
     INITIAL_PROMPT,
+    CHECKPOINT_DIR,
+    ENABLE_WANDB,
+    LOG_INTERVAL,
 )
-from src.model import setup_model_and_tokenizer, save_checkpoint, load_checkpoint, create_model_copy
+from src.model import setup_model_and_tokenizer, save_checkpoint, load_checkpoint, create_model_copy, get_checkpoint_path
 from src.data import iter_key_value_pairs, QKVStep
 from src.embeddings import register_embedding_hook, extract_embeddings, compute_similarity, sample_key_value
 from src.training import (
@@ -40,6 +45,20 @@ from src.training import (
     train_step,
 )
 
+# Import wandb for logging
+import wandb
+
+# Setup matplotlib for plotting
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+
+# Lists to store metrics for plotting
+training_steps = []
+total_losses = []
+policy_losses = []
+kl_losses = []
+avg_rewards = []
 
 def setup_logging(args):
     """
@@ -78,6 +97,22 @@ def setup_logging(args):
     logging.info(f"  Batch size: {args.batch_size}")
     logging.info(f"  Learning rate: {LEARNING_RATE}")
     logging.info(f"  Episodes: {NUM_EPISODES}")
+    
+    # Initialize wandb if enabled
+    if ENABLE_WANDB:
+        wandb_config = {
+            "learning_rate": args.learning_rate,
+            "episodes": args.episodes,
+            "batch_size": args.batch_size,
+            "kl_penalty": KL_PENALTY_COEFFICIENT,
+            "num_kv_pairs": NUM_KV_PAIRS,
+        }
+        wandb.init(
+            project="attention-guided-rl",
+            name=args.run_name if args.run_name else None,
+            config=wandb_config
+        )
+        logging.info("Weights & Biases logging enabled")
     
     return log_dir
 
@@ -229,6 +264,8 @@ def parse_args():
     parser.add_argument("--episodes", type=int, default=NUM_EPISODES, help="Number of episodes to train")
     parser.add_argument("--log-interval", type=int, default=10, help="Logging interval")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose trajectory logging")
+    parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE, help="Learning rate for training")
+    parser.add_argument("--run-name", type=str, default=None, help="Name for this training run")
     return parser.parse_args()
 
 
@@ -264,7 +301,7 @@ def main():
     # Make sure hook is removed at the end
     try:
         # Create optimizer
-        optimizer = optim.Adam(adapter_model.parameters(), lr=LEARNING_RATE)
+        optimizer = optim.Adam(adapter_model.parameters(), lr=args.learning_rate)
         
         # Initialize reward stats
         reward_stats = {"mean": 0.0, "std": 1.0, "count": 0}
@@ -284,11 +321,21 @@ def main():
         # Try to load checkpoint if resume is specified
         start_episode = 0
         if args.resume:
-            for episode in range(args.episodes, 0, -1):
-                if load_checkpoint(adapter_model, episode):
-                    start_episode = episode
-                    logging.info(f"Resumed from episode {start_episode}")
-                    break
+            # First try to load the "latest" checkpoint
+            if load_checkpoint(adapter_model, "latest"):
+                # Get the checkpoint filename to parse the episode number
+                latest_path = get_checkpoint_path("latest")
+                # For backward compatibility, we'll set start_episode to the last episode
+                # This ensures we don't restart from 0
+                start_episode = args.episodes - 1
+                logging.info(f"Resumed from latest checkpoint, continuing from episode {start_episode}")
+            else:
+                # Fall back to checking numbered checkpoints
+                for episode in range(args.episodes, 0, -1):
+                    if load_checkpoint(adapter_model, episode):
+                        start_episode = episode
+                        logging.info(f"Resumed from episode {start_episode}")
+                        break
         
         # Set up data loader
         logging.info("Setting up data loader...")
@@ -364,7 +411,7 @@ def main():
                     print(f"  Count: {reward_stats['count']}")
             
             # Perform training step
-            loss, num_filtered = train_step(
+            total_loss, num_filtered, policy_loss, kl_loss = train_step(
                 trajectory,
                 adapter_model,
                 base_model,
@@ -375,12 +422,25 @@ def main():
                 verbose=args.verbose
             )
             
+            # Calculate average reward across the batch
+            if trajectory.avg_reward is not None and trajectory.avg_reward.numel() > 0:
+                avg_reward = trajectory.avg_reward.mean().item()
+            else:
+                avg_reward = 0.0
+                
+            # Store metrics for plotting
+            training_steps.append(episode)
+            total_losses.append(total_loss)
+            policy_losses.append(policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss)
+            kl_losses.append(kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss)
+            avg_rewards.append(avg_reward)
+            
             # Update progress bar
             progress_bar.set_description(
                 f"Episode {episode}/{args.episodes}, "
-                f"Loss: {loss:.4f}, "
+                f"Loss: {total_loss:.4f}, "
                 f"Filtered: {num_filtered}/{trajectory.avg_reward.shape[0]}, "
-                f"Reward: {trajectory.avg_reward[0].item():.4f}, "
+                f"Reward: {avg_reward:.4f}, "
                 f"Threshold: {reward_stats['mean'] + reward_stats['std']:.4f}"
             )
             
@@ -418,28 +478,111 @@ def main():
             
             # Save checkpoint if needed
             if episode > 0 and episode % CHECKPOINT_INTERVAL == 0:
-                save_checkpoint(adapter_model, episode)
+                save_checkpoint(adapter_model, "latest")
                 if args.verbose:
                     print(f"\nCheckpoint saved at episode {episode}")
+                
+                # Plot metrics periodically
+                plot_metrics(log_dir)
             
             # Log statistics
             if episode % args.log_interval == 0:
+                log_dict = {
+                    "episode": episode,
+                    "total_loss": total_loss,
+                    "policy_loss": policy_loss,
+                    "kl_loss": kl_loss,
+                    "kl_penalty_term": kl_loss * KL_PENALTY_COEFFICIENT,
+                    "reward": avg_reward,
+                    "reward_mean": reward_stats["mean"],
+                    "reward_std": reward_stats["std"],
+                    "filtered_ratio": num_filtered / trajectory.avg_reward.shape[0] if trajectory.avg_reward.shape[0] > 0 else 0
+                }
+                
                 logging.info(
                     f"Episode {episode}/{args.episodes}, "
-                    f"Loss: {loss:.4f}, "
+                    f"Total Loss: {total_loss:.4f}, "
+                    f"Policy Loss: {policy_loss:.4f}, "
+                    f"KL Loss: {kl_loss:.4f}, "
                     f"Filtered: {num_filtered}/{trajectory.avg_reward.shape[0]}, "
-                    f"Reward: {trajectory.avg_reward[0].item():.4f}, "
+                    f"Reward: {avg_reward:.4f}, "
                     f"Reward Mean: {reward_stats['mean']:.4f}, "
                     f"Reward Std: {reward_stats['std']:.4f}"
                 )
+                
+                # Log to wandb if enabled
+                if ENABLE_WANDB:
+                    wandb.log(log_dict)
             
         # Save final checkpoint
-        save_checkpoint(adapter_model, args.episodes)
+        save_checkpoint(adapter_model, "latest")
+        
+        # Create final plots
+        plot_metrics(log_dir)
+        
         logging.info("Training complete!")
+        
+        # Close wandb if enabled
+        if ENABLE_WANDB:
+            wandb.finish()
     
     finally:
         # Remove hook
         hook_remover()
+
+
+def plot_metrics(log_dir, step=None):
+    """
+    Create and save plots of training metrics.
+    
+    Args:
+        log_dir: Directory where logs and plots are saved
+        step: Current training step (optional, not used for filename)
+    """
+    # Create plots directory
+    plots_dir = f"{log_dir}/plots"
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    # Make sure all tensors are converted to CPU before plotting
+    cpu_training_steps = [step.item() if isinstance(step, torch.Tensor) else step for step in training_steps]
+    cpu_total_losses = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in total_losses]
+    cpu_policy_losses = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in policy_losses]
+    cpu_kl_losses = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in kl_losses]
+    cpu_avg_rewards = [reward.item() if isinstance(reward, torch.Tensor) else reward for reward in avg_rewards]
+    
+    plt.figure(figsize=(12, 8))
+    
+    # Loss plots in the first subplot
+    plt.subplot(2, 1, 1)
+    plt.plot(cpu_training_steps, cpu_total_losses, label='Total Loss', color='blue')
+    plt.plot(cpu_training_steps, cpu_policy_losses, label='Policy Loss', color='green')
+    plt.plot(cpu_training_steps, cpu_kl_losses, label='KL Loss', color='red')
+    plt.xlabel('Training Step')
+    plt.ylabel('Loss')
+    plt.title('Loss Components During Training')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Reward plot in the second subplot
+    plt.subplot(2, 1, 2)
+    plt.plot(cpu_training_steps, cpu_avg_rewards, label='Avg Reward', color='purple')
+    plt.xlabel('Training Step')
+    plt.ylabel('Average Reward')
+    plt.title('Average Reward During Training')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save the plot to a single file that gets overwritten
+    plt.savefig(f"{plots_dir}/training_metrics.png", dpi=150)
+    plt.close()
+    
+    # If wandb is enabled, log the plot
+    if ENABLE_WANDB:
+        wandb.log({
+            "training_metrics_plot": wandb.Image(f"{plots_dir}/training_metrics.png")
+        })
 
 
 if __name__ == "__main__":

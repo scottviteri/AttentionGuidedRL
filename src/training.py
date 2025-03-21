@@ -381,7 +381,7 @@ def compute_policy_loss(
     previous_model: Any,
     kl_penalty_coef: float,
     verbose: bool = False
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the policy gradient loss with KL penalty.
     
@@ -393,7 +393,10 @@ def compute_policy_loss(
         verbose: Flag to enable verbose logging
         
     Returns:
-        torch.Tensor: The loss value
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: 
+            total_loss: The combined loss value
+            policy_loss: The policy gradient component
+            kl_loss: The KL divergence component
     """
     policy_loss = 0.0
     kl_loss = 0.0
@@ -463,20 +466,22 @@ def compute_policy_loss(
     if count > 0:
         avg_policy_loss = policy_loss / count
         avg_kl_loss = kl_loss / count
-        total_loss = avg_policy_loss + kl_penalty_coef * avg_kl_loss
+        kl_penalty_term = kl_penalty_coef * avg_kl_loss
+        total_loss = avg_policy_loss + kl_penalty_term
         
         if verbose:
             print(f"\n=== Loss Components ===")
             print(f"Policy loss: {avg_policy_loss.item():.4f}")
             print(f"KL divergence loss: {avg_kl_loss.item():.4f}")
             print(f"KL penalty coefficient: {kl_penalty_coef:.4f}")
-            print(f"KL penalty term: {(kl_penalty_coef * avg_kl_loss).item():.4f}")
+            print(f"KL penalty term: {kl_penalty_term.item():.4f}")
             print(f"Total loss: {total_loss.item():.4f}")
             print(f"=== End Loss Components ===\n")
             
-        return total_loss
+        return total_loss, avg_policy_loss, avg_kl_loss
     else:
-        return torch.tensor(0.0, device=device, requires_grad=True)
+        zero_tensor = torch.tensor(0.0, device=device, requires_grad=True)
+        return zero_tensor, zero_tensor, zero_tensor
 
 
 def train_step(
@@ -488,7 +493,7 @@ def train_step(
     reward_stats: Dict[str, float],
     kl_penalty_coef: float,
     verbose: bool = False,
-) -> Tuple[float, int]:
+) -> Tuple[float, int, float, float]:
     """
     Perform a single training step.
     
@@ -503,7 +508,11 @@ def train_step(
         verbose: Flag to enable verbose logging
         
     Returns:
-        Tuple[float, int]: Loss value and number of filtered batch elements
+        Tuple[float, int, float, float]: 
+            total_loss: Total loss value 
+            num_filtered: Number of filtered batch elements
+            policy_loss: Policy gradient component of the loss
+            kl_loss: KL divergence component of the loss
     """
     # Import WARMUP_EPISODES only
     from src.config import WARMUP_EPISODES
@@ -528,7 +537,7 @@ def train_step(
     if filtered_trajectory is None:
         if verbose:
             print("No batch elements meet filtering criteria. Skipping update.")
-        return 0.0, 0
+        return 0.0, 0, 0.0, 0.0
     
     # Get the number of batch elements that passed filtering
     filtered_batch_size = filtered_trajectory.avg_reward.shape[0]
@@ -543,7 +552,7 @@ def train_step(
     optimizer.zero_grad()
     
     # Compute policy loss
-    loss = compute_policy_loss(
+    total_loss, policy_loss, kl_loss = compute_policy_loss(
         filtered_trajectory,
         adapter_model,
         previous_model,
@@ -552,10 +561,10 @@ def train_step(
     )
     
     if verbose:
-        print(f"Total loss: {loss.item():.4f}")
+        print(f"Total loss: {total_loss.item():.4f}")
     
     # Backpropagate loss
-    loss.backward()
+    total_loss.backward()
     
     # Get gradient norm for logging
     grad_norm = torch.nn.utils.clip_grad_norm_(adapter_model.parameters(), GRADIENT_CLIP_NORM)
@@ -570,4 +579,4 @@ def train_step(
         print("Parameters updated.")
         print(f"=== Training Step Complete ===\n")
     
-    return loss.item(), filtered_batch_size 
+    return total_loss.item(), filtered_batch_size, policy_loss, kl_loss 

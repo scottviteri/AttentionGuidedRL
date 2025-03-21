@@ -92,7 +92,7 @@ TOP_P = 0.9
 
 # Checkpoint parameters
 CHECKPOINT_DIR = "checkpoints"
-CHECKPOINT_INTERVAL = 100
+CHECKPOINT_INTERVAL = 5 
 
 # Logging
 ENABLE_WANDB = False

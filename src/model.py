@@ -178,12 +178,15 @@ def get_checkpoint_path(episode):
     Get the checkpoint path for a specific episode.
     
     Args:
-        episode: The episode number
+        episode: The episode number or "latest"
         
     Returns:
         The checkpoint path
     """
-    return os.path.join(CHECKPOINT_DIR, f"model_episode_{episode}.pt")
+    if episode == "latest":
+        return os.path.join(CHECKPOINT_DIR, "model_latest.pt")
+    else:
+        return os.path.join(CHECKPOINT_DIR, f"model_episode_{episode}.pt")
 
 
 def save_checkpoint(model, episode):
@@ -204,7 +207,7 @@ def load_checkpoint(model, episode):
     
     Args:
         model: The model to load into
-        episode: The episode number to load
+        episode: The episode number to load or "latest"
         
     Returns:
         The loaded model

@@ -21,6 +21,7 @@ class MockArgs:
         self.episodes = 10
         self.log_interval = 5
         self.verbose = False
+        self.learning_rate = 0.001
 
 
 @pytest.fixture
@@ -209,76 +210,78 @@ def test_main(
     with patch("src.config") as mock_config:
         # Also mock compute_trajectory_rewards to avoid issues with mock trajectory
         with patch("src.main.compute_trajectory_rewards") as mock_compute_rewards:
-            # Import main after patching config
-            from src.main import main
-            
-            # Create a proper mock for tqdm
-            mock_progress_bar = MagicMock()
-            # Make the progress_bar iterable and return only a single episode to avoid many iterations
-            mock_progress_bar.__iter__.return_value = iter([0])
-            mock_progress_bar.set_description = MagicMock()
-            
-            # Mock optimizer
-            mock_optimizer = MagicMock()
-            mock_adam.return_value = mock_optimizer
-            
-            # Mock parse_args
-            with patch("src.main.parse_args") as mock_parse_args:
-                mock_args = MockArgs()
-                mock_args.episodes = 1  # Set to 1 to minimize iterations
-                mock_parse_args.return_value = mock_args
+            # Also mock plot_metrics to avoid matplotlib issues
+            with patch("src.main.plot_metrics") as mock_plot_metrics:
+                # Import main after patching config
+                from src.main import main
                 
-                # Create mock models
-                base_model = MagicMock()
-                adapter_model = MagicMock()
-                tokenizer = MagicMock()
+                # Create a proper mock for tqdm
+                mock_progress_bar = MagicMock()
+                # Make the progress_bar iterable and return only a single episode to avoid many iterations
+                mock_progress_bar.__iter__.return_value = iter([0])
+                mock_progress_bar.set_description = MagicMock()
                 
-                # Setup adapter_model.parameters to return a valid parameter list
-                mock_param = MagicMock()
-                adapter_model.parameters.return_value = [mock_param]
+                # Mock optimizer
+                mock_optimizer = MagicMock()
+                mock_adam.return_value = mock_optimizer
                 
-                # Mock necessary return values
-                mock_setup_logging.return_value = "logs/test"
-                mock_setup_models.return_value = (base_model, adapter_model, tokenizer)
-                mock_register_hook.return_value = ({"embeddings": None}, MagicMock())
-                
-                # Create a mock key-value pair
-                mock_kv_pair = MagicMock()
-                
-                # Set up the mock generator that won't exhaust
-                mock_kv_generator = MockGenerator(mock_kv_pair)
-                mock_iter_kv_pairs.return_value = mock_kv_generator
-                
-                # Create a mock trajectory and set the attributes we need
-                mock_trajectory = MagicMock()
-                batch_size = 2  # Define batch_size
-                device = torch.device('cpu')  # Define device
-                mock_trajectory.rewards = torch.zeros(batch_size, 1, device=device)
-                
-                # Set up avg_reward to handle .item() calls
-                mock_avg_reward = torch.tensor([0.5, 0.6], device=device)
-                mock_avg_reward_item = MagicMock(return_value=0.5)
-                mock_avg_reward.__getitem__ = lambda self, idx: mock_avg_reward_item
-                mock_trajectory.avg_reward = mock_avg_reward
-                
-                mock_trajectory.qkv_steps = [mock_kv_pair]
-                
-                # Mock generate_trajectory to return our mock trajectory
-                mock_generate_trajectory.return_value = mock_trajectory
-                
-                # Mock train_step - returns loss and number of filtered batch elements
-                mock_train_step.return_value = (0.5, 2)
-                
-                # Mock torch.zeros
-                with patch("torch.zeros", return_value=torch.zeros((2, 1), dtype=torch.long)):
-                    # Mock load_checkpoint
-                    with patch("src.main.load_checkpoint", return_value=False):
-                        # Mock tqdm properly
-                        with patch("src.main.tqdm", return_value=mock_progress_bar):
-                            # Mock next to handle batch key-value pair creation
-                            with patch("builtins.next", side_effect=lambda gen: mock_kv_pair):
-                                # Call function
-                                main()
+                # Mock parse_args
+                with patch("src.main.parse_args") as mock_parse_args:
+                    mock_args = MockArgs()
+                    mock_args.episodes = 1  # Set to 1 to minimize iterations
+                    mock_parse_args.return_value = mock_args
+                    
+                    # Create mock models
+                    base_model = MagicMock()
+                    adapter_model = MagicMock()
+                    tokenizer = MagicMock()
+                    
+                    # Setup adapter_model.parameters to return a valid parameter list
+                    mock_param = MagicMock()
+                    adapter_model.parameters.return_value = [mock_param]
+                    
+                    # Mock necessary return values
+                    mock_setup_logging.return_value = "logs/test"
+                    mock_setup_models.return_value = (base_model, adapter_model, tokenizer)
+                    mock_register_hook.return_value = ({"embeddings": None}, MagicMock())
+                    
+                    # Create a mock key-value pair
+                    mock_kv_pair = MagicMock()
+                    
+                    # Set up the mock generator that won't exhaust
+                    mock_kv_generator = MockGenerator(mock_kv_pair)
+                    mock_iter_kv_pairs.return_value = mock_kv_generator
+                    
+                    # Create a mock trajectory and set the attributes we need
+                    mock_trajectory = MagicMock()
+                    batch_size = 2  # Define batch_size
+                    device = torch.device('cpu')  # Define device
+                    mock_trajectory.rewards = torch.zeros(batch_size, 1, device=device)
+                    
+                    # Set up avg_reward to handle .item() calls
+                    mock_avg_reward = torch.tensor([0.5, 0.6], device=device)
+                    mock_avg_reward_item = MagicMock(return_value=0.5)
+                    mock_avg_reward.__getitem__ = lambda self, idx: mock_avg_reward_item
+                    mock_trajectory.avg_reward = mock_avg_reward
+                    
+                    mock_trajectory.qkv_steps = [mock_kv_pair]
+                    
+                    # Mock generate_trajectory to return our mock trajectory
+                    mock_generate_trajectory.return_value = mock_trajectory
+                    
+                    # Mock train_step - returns loss and number of filtered batch elements
+                    mock_train_step.return_value = (0.5, 0, 0.3, 0.2)  # total_loss, num_filtered, policy_loss, kl_loss
+                    
+                    # Mock torch.zeros
+                    with patch("torch.zeros", return_value=torch.zeros((2, 1), dtype=torch.long)):
+                        # Mock load_checkpoint
+                        with patch("src.main.load_checkpoint", return_value=False):
+                            # Mock tqdm properly
+                            with patch("src.main.tqdm", return_value=mock_progress_bar):
+                                # Mock next to handle batch key-value pair creation
+                                with patch("builtins.next", side_effect=lambda gen: mock_kv_pair):
+                                    # Call function
+                                    main()
                 
                 # Check that setup functions were called
                 mock_setup_logging.assert_called_once()
@@ -341,7 +344,7 @@ def test_weights_update_with_real_model(gpt2_model, gpt2_tokenizer):
     reward_stats = {"mean": 0.0, "std": 1.0, "count": 1}
     
     # Run a training step
-    loss, num_filtered = train_step(
+    total_loss, num_filtered, policy_loss, kl_loss = train_step(
         trajectory,
         adapter_model,
         base_model,
