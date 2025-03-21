@@ -12,30 +12,30 @@ from typing import Dict, List, Any, Tuple, Optional
 
 from src.config import (
     DEVICE,
-    WARMUP_EPISODES,
+    TOKENS_PER_QUERY,
     TOKENS_PER_KEY,
-    TOKENS_PER_VALUE,
     QUERY_PREFIX,
-    RESPONSE_PREFIX,
+    VALUE_PREFIX,
     GRADIENT_CLIP_NORM,
     TEMPERATURE,
     TOP_P,
+    KEY_PREFIX,
 )
 from src.model import create_model_copy
-from src.data import KeyValuePair
+from src.data import QKVStep
 
 
 @dataclass
 class Trajectory:
     """
-    A trajectory consisting of key-value pairs and optional rewards.
+    A trajectory consisting of query-key-value steps and optional rewards.
     
     Attributes:
-        kv_pairs: List of key-value pairs selected during trajectory
-        rewards: Optional tensor of rewards for each pair [batch_size, num_pairs]
-        avg_reward: Average reward across pairs [batch_size]
+        qkv_steps: List of QKVStep objects selected during trajectory
+        rewards: Optional tensor of rewards for each step [batch_size, num_steps]
+        avg_reward: Average reward across steps [batch_size]
     """
-    kv_pairs: List[KeyValuePair]
+    qkv_steps: List[QKVStep]
     rewards: Optional[torch.Tensor] = None
     avg_reward: Optional[torch.Tensor] = None
 
@@ -87,9 +87,7 @@ def calculate_conditional_log_prob(
 def generate_query(
     model: torch.nn.Module,
     tokenizer: Any,
-    context: List[str],
-    max_length: int = TOKENS_PER_KEY,
-    ensure_exact_length: bool = True,
+    context: List[str]
 ) -> torch.Tensor:
     """
     Generate a query from the model given context.
@@ -99,7 +97,6 @@ def generate_query(
         tokenizer: The tokenizer
         context: Context text list [batch_size]
         max_length: Maximum number of tokens to generate
-        ensure_exact_length: If True, ensure exactly max_length tokens are generated
         
     Returns:
         torch.Tensor: Generated token IDs [batch_size, max_length]
@@ -110,18 +107,16 @@ def generate_query(
         return_tensors="pt",
         padding=True,
         truncation=True,
+        add_special_tokens=False
     ).to(DEVICE)
     
-    # Configure min and max tokens to be the same if exact length is required
-    min_new_tokens = max_length if ensure_exact_length else 1
-    
-    # Generate query tokens
+    # Generate query tokens - using same value for min and max tokens to ensure exact length
     with torch.no_grad():
         output_ids = model.generate(
             input_ids=batch_inputs["input_ids"],
             attention_mask=batch_inputs["attention_mask"],
-            min_new_tokens=min_new_tokens,
-            max_new_tokens=max_length,
+            min_new_tokens=TOKENS_PER_QUERY,
+            max_new_tokens=TOKENS_PER_QUERY,
             do_sample=True,
             temperature=TEMPERATURE,
             top_p=TOP_P,
@@ -133,14 +128,6 @@ def generate_query(
     # Extract only the new tokens (query tokens)
     query_tokens = output_ids[:, batch_inputs["input_ids"].shape[1]:]
     
-    # Ensure exact length by truncating if necessary
-    if query_tokens.shape[1] > max_length:
-        query_tokens = query_tokens[:, :max_length]
-    
-    # Check if we got the exact length requested
-    if ensure_exact_length and query_tokens.shape[1] != max_length:
-        raise ValueError(f"Generated query length {query_tokens.shape[1]} does not match requested length {max_length}")
-    
     return query_tokens
 
 
@@ -149,47 +136,56 @@ def compute_trajectory_rewards(
     adapter_model: torch.nn.Module,
     base_model: torch.nn.Module,
     context_tokens: torch.Tensor,
+    tokenizer: Any = None,
     verbose: bool = False,
 ) -> torch.Tensor:
     """
-    Compute rewards for all key-value pairs in a trajectory.
+    Compute rewards for all query-key-value steps in a trajectory.
     
     Args:
-        trajectory: The trajectory containing key-value pairs
+        trajectory: The trajectory containing QKVStep objects
         adapter_model: The model with LoRA adapter
         base_model: The base model without LoRA
         context_tokens: Initial context tokens [batch_size, context_length]
+        tokenizer: The tokenizer for processing text
         verbose: Flag to enable verbose logging
         
     Returns:
-        torch.Tensor: Rewards for each key-value pair [batch_size, num_pairs]
+        torch.Tensor: Rewards for each step [batch_size, num_steps]
     """
     batch_size = context_tokens.shape[0]
-    num_pairs = len(trajectory.kv_pairs)
+    num_steps = len(trajectory.qkv_steps)
     
     if verbose:
         print("\n=== Computing Trajectory Rewards ===")
         print(f"Batch size: {batch_size}")
-        print(f"Number of key-value pairs: {num_pairs}")
+        print(f"Number of steps: {num_steps}")
     
     # Ensure context_tokens is on the correct device
     device = context_tokens.device
     
     # Initialize rewards tensor
-    rewards = torch.zeros((batch_size, num_pairs), device=device)
+    rewards = torch.zeros((batch_size, num_steps), device=device)
     
-    # Build context incrementally, including each key-value pair
+    # Build context incrementally, including each step
     current_context = context_tokens
     
-    for i, kv_pair in enumerate(trajectory.kv_pairs):
+    for i, qkv_step in enumerate(trajectory.qkv_steps):
         if verbose:
-            print(f"\n--- Reward Calculation for Pair {i+1}/{num_pairs} ---")
-            print(f"Key: {kv_pair.key_text[0]}")
-            print(f"Value: {kv_pair.value_text[0]}")
+            print(f"\n--- Reward Calculation for Step {i+1}/{num_steps} ---")
+            
+            # Display query first if available
+            if qkv_step.query_text is not None:
+                print(f"Query: {qkv_step.query_text[0]}")
+            
+            # Then display key and value
+            print(f"Key: {qkv_step.key_text[0]}")
+            print(f"Value: {qkv_step.value_text[0]}")
             print(f"Current context length: {current_context.shape[1]} tokens")
         
-        # Get value tokens and ensure they're on the same device as context
-        value_tokens = kv_pair.value_tokens.to(device)
+        # Get key and value tokens and ensure they're on the same device as context
+        key_tokens = qkv_step.key_tokens.to(device)
+        value_tokens = qkv_step.value_tokens.to(device)
         
         # Compute log prob with adapter model
         adapter_log_prob = calculate_conditional_log_prob(
@@ -214,12 +210,47 @@ def compute_trajectory_rewards(
             print(f"Reward: {rewards[0, i].item():.4f}")
         
         # Update context for next iteration
-        # Append key and value tokens to context, ensuring same device
-        current_context = torch.cat([
-            current_context, 
-            kv_pair.key_tokens.to(device), 
-            kv_pair.value_tokens.to(device)
-        ], dim=1)
+        # Append query, key and value tokens to context, all on the same device
+        if tokenizer:
+            # Add prefixes if tokenizer is available
+            batch_size = current_context.shape[0]
+            query_prefix_tokens = tokenizer([QUERY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+            key_prefix_tokens = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+            value_prefix_tokens = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+            
+            # Use the stored query tokens if available, otherwise generate new ones
+            query_tokens = None
+            if qkv_step.query_tokens is not None:
+                query_tokens = qkv_step.query_tokens.to(device)
+            else:
+                # Generate query tokens
+                query_tokens = generate_query(
+                    adapter_model,
+                    tokenizer,
+                    tokenizer.batch_decode(current_context)
+                ).to(device)
+            
+                # Display generated query text in verbose mode
+                if verbose and qkv_step.query_text is None:
+                    query_text = tokenizer.batch_decode(query_tokens)
+                    print(f"Generated Query: {query_text[0]}")
+            
+            current_context = torch.cat([
+                current_context,
+                query_prefix_tokens,
+                query_tokens,
+                key_prefix_tokens,
+                key_tokens, 
+                value_prefix_tokens,
+                value_tokens
+            ], dim=1)
+        else:
+            # Fallback for tests or when tokenizer is not available
+            current_context = torch.cat([
+                current_context, 
+                key_tokens, 
+                value_tokens
+            ], dim=1)
     
     # Compute average reward
     avg_reward = rewards.mean(dim=1)
@@ -272,31 +303,23 @@ def update_reward_stats(
     return {"mean": new_mean, "std": new_std, "count": new_count}
 
 
-def filter_trajectories(
-    trajectory: Trajectory,
-    reward_stats: Dict[str, float],
-) -> Trajectory:
+def filter_trajectories(trajectory: Trajectory, reward_stats: Dict[str, float]) -> Optional[Trajectory]:
     """
-    Filter batch elements within a trajectory based on reward.
+    Filter a batch of trajectories based on rewards, keeping only those that exceed a certain threshold.
     
     Args:
-        trajectory: A trajectory with batch dimension
-        reward_stats: Reward statistics for filtering
+        trajectory: The batch of trajectories to filter
+        reward_stats: Statistics about rewards used for normalization
         
     Returns:
-        Trajectory: Filtered trajectory with potentially reduced batch size
-                   (None if no batch elements pass the filter)
+        Filtered trajectory, or None if no trajectories pass the filter
     """
-    # Only filter if we've collected enough data
-    if reward_stats["count"] <= WARMUP_EPISODES:
+    if trajectory.avg_reward is None or reward_stats["count"] < 10:
+        # Not enough data to filter meaningfully
         return trajectory
     
-    # Calculate threshold for filtering (mean + std)
-    threshold = reward_stats["mean"] + reward_stats["std"]
-    
-    # No rewards yet
-    if trajectory.avg_reward is None:
-        return None
+    # Calculate threshold as mean reward
+    threshold = reward_stats["mean"]
     
     # Get batch indices where reward exceeds threshold
     batch_mask = trajectory.avg_reward > threshold
@@ -306,28 +329,48 @@ def filter_trajectories(
         return None
     
     # Create a new trajectory with only the filtered batch elements
-    filtered_kv_pairs = []
+    filtered_qkv_steps = []
     
-    for kv_pair in trajectory.kv_pairs:
-        # Select the filtered batch elements for each tensor
-        filtered_kv_pair = KeyValuePair(
-            key_tokens=kv_pair.key_tokens[batch_mask],
-            value_tokens=kv_pair.value_tokens[batch_mask],
-            key_embedding=kv_pair.key_embedding[batch_mask],
-            key_text=[kv_pair.key_text[i] for i in range(len(kv_pair.key_text)) if batch_mask[i]],
-            value_text=[kv_pair.value_text[i] for i in range(len(kv_pair.value_text)) if batch_mask[i]]
-        )
-        filtered_kv_pairs.append(filtered_kv_pair)
+    for qkv_step in trajectory.qkv_steps:
+        # Ensure batch_mask is on the same device as tensors
+        batch_mask_device = batch_mask.to(qkv_step.key_tokens.device)
+        
+        # Prepare the filtered attributes
+        filtered_attributes = {
+            "key_tokens": qkv_step.key_tokens[batch_mask_device],
+            "value_tokens": qkv_step.value_tokens[batch_mask_device],
+            "key_embedding": qkv_step.key_embedding[batch_mask_device],
+            "key_text": [qkv_step.key_text[i] for i in range(len(qkv_step.key_text)) if batch_mask[i]],
+            "value_text": [qkv_step.value_text[i] for i in range(len(qkv_step.value_text)) if batch_mask[i]],
+        }
+        
+        # Include query attributes if present
+        if qkv_step.query_text is not None:
+            filtered_attributes["query_text"] = [qkv_step.query_text[i] for i in range(len(qkv_step.query_text)) if batch_mask[i]]
+        
+        if qkv_step.query_tokens is not None:
+            filtered_attributes["query_tokens"] = qkv_step.query_tokens[batch_mask_device]
+        
+        if qkv_step.query_embedding is not None:
+            filtered_attributes["query_embedding"] = qkv_step.query_embedding[batch_mask_device]
+        
+        # Create the filtered QKVStep
+        filtered_qkv_step = QKVStep(**filtered_attributes)
+        filtered_qkv_steps.append(filtered_qkv_step)
     
     # Create new trajectory with filtered elements
-    filtered_trajectory = Trajectory(kv_pairs=filtered_kv_pairs)
+    filtered_trajectory = Trajectory(qkv_steps=filtered_qkv_steps)
     
     # Copy over rewards, filtering to keep only selected batch elements
     if trajectory.rewards is not None:
-        filtered_trajectory.rewards = trajectory.rewards[batch_mask]
+        # Get the device from one of the tensors
+        device = filtered_qkv_steps[0].key_tokens.device
+        filtered_trajectory.rewards = trajectory.rewards[batch_mask.to(device)]
     
     if trajectory.avg_reward is not None:
-        filtered_trajectory.avg_reward = trajectory.avg_reward[batch_mask]
+        # Ensure avg_reward is on the same device
+        device = filtered_qkv_steps[0].key_tokens.device
+        filtered_trajectory.avg_reward = trajectory.avg_reward[batch_mask.to(device)]
     
     return filtered_trajectory
 
@@ -336,7 +379,8 @@ def compute_policy_loss(
     trajectory: Trajectory,
     adapter_model: torch.nn.Module,
     previous_model: Any,
-    kl_penalty_coef: float
+    kl_penalty_coef: float,
+    verbose: bool = False
 ) -> torch.Tensor:
     """
     Compute the policy gradient loss with KL penalty.
@@ -346,6 +390,7 @@ def compute_policy_loss(
         adapter_model: The language model with LoRA adapter
         previous_model: The model state before update
         kl_penalty_coef: KL penalty coefficient (beta)
+        verbose: Flag to enable verbose logging
         
     Returns:
         torch.Tensor: The loss value
@@ -355,16 +400,24 @@ def compute_policy_loss(
     count = 0
     
     # Determine device to use
-    device = next(adapter_model.parameters()).device if hasattr(adapter_model, 'parameters') else DEVICE
+    device = next(adapter_model.parameters()).device
     
     # Ensure trajectory has rewards
     if trajectory.rewards is None or trajectory.avg_reward is None:
         raise ValueError("Trajectory must have rewards computed before policy loss")
     
-    # Get all queries from the trajectory's KVPairs
-    for kv_pair in trajectory.kv_pairs:
-        # Get query tokens (key_tokens in KVPair) and ensure consistent device
-        query_tokens = kv_pair.key_tokens.to(device)
+    # Get all queries from the trajectory's QKVSteps
+    for qkv_step in trajectory.qkv_steps:
+        # Get query tokens and ensure consistent device
+        if qkv_step.query_tokens is not None:
+            query_tokens = qkv_step.query_tokens.to(device)
+        else:
+            # In real usage, query_tokens should be populated by this point
+            # This fallback is mainly for tests
+            if verbose:
+                print("WARNING: Using key_tokens as query_tokens since query_tokens is None. "
+                      "In normal operation, query_tokens should be populated by this point.")
+            query_tokens = qkv_step.key_tokens.to(device)
         
         # Use the average reward for the trajectory
         rewards = trajectory.avg_reward.to(device)
@@ -411,6 +464,16 @@ def compute_policy_loss(
         avg_policy_loss = policy_loss / count
         avg_kl_loss = kl_loss / count
         total_loss = avg_policy_loss + kl_penalty_coef * avg_kl_loss
+        
+        if verbose:
+            print(f"\n=== Loss Components ===")
+            print(f"Policy loss: {avg_policy_loss.item():.4f}")
+            print(f"KL divergence loss: {avg_kl_loss.item():.4f}")
+            print(f"KL penalty coefficient: {kl_penalty_coef:.4f}")
+            print(f"KL penalty term: {(kl_penalty_coef * avg_kl_loss).item():.4f}")
+            print(f"Total loss: {total_loss.item():.4f}")
+            print(f"=== End Loss Components ===\n")
+            
         return total_loss
     else:
         return torch.tensor(0.0, device=device, requires_grad=True)
@@ -484,11 +547,12 @@ def train_step(
         filtered_trajectory,
         adapter_model,
         previous_model,
-        kl_penalty_coef
+        kl_penalty_coef,
+        verbose=verbose
     )
     
     if verbose:
-        print(f"Policy loss: {loss.item():.4f}")
+        print(f"Total loss: {loss.item():.4f}")
     
     # Backpropagate loss
     loss.backward()

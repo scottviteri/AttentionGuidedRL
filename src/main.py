@@ -12,27 +12,25 @@ import torch
 import torch.optim as optim
 from tqdm import tqdm
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Callable, Any
 
 from src.config import (
     DEVICE,
     MODEL_NAME,
-    TOKENS_PER_KEY,
-    TOKENS_PER_VALUE,
-    TOKENS_PER_KV_PAIR,
+    TOKENS_PER_QUERY,
     NUM_KV_PAIRS,
-    CHECKPOINT_DIR,
     CHECKPOINT_INTERVAL,
     NUM_EPISODES,
     GENERATION_BATCH_SIZE,
-    WARMUP_EPISODES,
     LEARNING_RATE,
     KL_PENALTY_COEFFICIENT,
     QUERY_PREFIX,
-    RESPONSE_PREFIX,
+    KEY_PREFIX,
+    VALUE_PREFIX,
+    INITIAL_PROMPT,
 )
 from src.model import setup_model_and_tokenizer, save_checkpoint, load_checkpoint, create_model_copy
-from src.data import iter_key_value_pairs
+from src.data import iter_key_value_pairs, QKVStep
 from src.embeddings import register_embedding_hook, extract_embeddings, compute_similarity, sample_key_value
 from src.training import (
     Trajectory,
@@ -86,17 +84,17 @@ def setup_logging(args):
 
 def generate_trajectory(
     context_tokens: torch.Tensor,
-    adapter_model,
-    base_model,
-    tokenizer,
-    embeddings_dict,
-    hook_remover,
-    available_kv_pairs: List,
+    adapter_model: torch.nn.Module,
+    base_model: torch.nn.Module,
+    tokenizer: Any,
+    embeddings_dict: Dict,
+    hook_remover: Callable,
+    available_qkv_steps: List[QKVStep],
     batch_size: int,
     verbose: bool = False,
 ) -> Trajectory:
     """
-    Generate a single trajectory by sequentially selecting key-value pairs.
+    Generate a trajectory by selecting query-key-value steps.
     
     Args:
         context_tokens: Initial context tokens
@@ -105,82 +103,61 @@ def generate_trajectory(
         tokenizer: The tokenizer
         embeddings_dict: Dictionary to store embeddings from hooks
         hook_remover: Function to remove hooks
-        available_kv_pairs: List of available key-value pairs
+        available_qkv_steps: List of available QKVStep objects
         batch_size: Batch size
         verbose: Flag to enable verbose logging
         
     Returns:
         Trajectory: The generated trajectory
     """
-    # Initialize context for each batch item
-    current_context = context_tokens
+    # Ensure context_tokens is on the correct device
+    device = next(adapter_model.parameters()).device
+    current_context = context_tokens.to(device)
     context_text = tokenizer.batch_decode(current_context)
     
     if verbose:
         print("\n=== Starting New Trajectory ===")
         print(f"Initial context: {context_text[0][:50]}...")
-        print(f"Available key-value pairs: {len(available_kv_pairs)}")
+        print(f"Available query-key-value steps: {len(available_qkv_steps)}")
+        print(f"Query token length: {TOKENS_PER_QUERY} tokens")
     
-    # Initialize selected pair list
-    selected_pairs = []
+    # Initialize selected steps list
+    selected_steps = []
     
-    # Loop until we've selected a fixed number of key-value pairs
+    # Loop until we've selected a fixed number of steps
     for step_idx in range(NUM_KV_PAIRS):
-        if verbose:
-            print(f"\n--- Step {step_idx + 1}/{NUM_KV_PAIRS} ---")
-        
         # Generate query
         query_tokens = generate_query(
             adapter_model,
             tokenizer,
-            context_text,
-            max_length=TOKENS_PER_KEY,
-            ensure_exact_length=True,
+            context_text
         )
         
         # Ensure query_tokens is on the same device as context_tokens
-        query_tokens = query_tokens.to(current_context.device)
+        query_tokens = query_tokens.to(device)
         
         # Decode query for logging
         query_text = tokenizer.batch_decode(query_tokens)
         
-        if verbose:
-            print(f"Generated query: {query_text[0]}")
-        
         # Extract query embeddings
         query_embeddings = extract_embeddings(adapter_model, query_tokens, embeddings_dict)
         
-        if verbose:
-            print(f"Query embedding shape: {query_embeddings.shape}")
-        
-        # Extract key embeddings from available pairs using extract_embeddings
+        # Extract key embeddings from available steps using extract_embeddings
         key_embs = []
-        for kv_pair in available_kv_pairs:
-            # Move key_tokens to the same device as context_tokens
-            key_tokens = kv_pair.key_tokens.to(current_context.device)
+        for qkv_step in available_qkv_steps:
+            # Move key_tokens to the correct device
+            key_tokens = qkv_step.key_tokens.to(device)
             key_emb = extract_embeddings(adapter_model, key_tokens, embeddings_dict)
             key_embs.append(key_emb)
             
         # Stack key embeddings with shape [batch_size, num_keys, hidden_size]
         key_embeddings = torch.stack(key_embs, dim=1)
         
-        if verbose:
-            print(f"Key embeddings shape: {key_embeddings.shape}")
-        
         # Compute similarity scores
         similarity_scores = compute_similarity(query_embeddings, key_embeddings, adapter_model)
-        
-        if verbose:
-            print(f"Similarity scores shape: {similarity_scores.shape}")
-            if similarity_scores.shape[1] <= 5:  # Only show all scores if there are few pairs left
-                print(f"Similarity scores: {similarity_scores[0].tolist()}")
-            else:
-                # Show top 5 scores with their indices
-                top_scores, top_indices = torch.topk(similarity_scores[0], min(5, similarity_scores.shape[1]))
-                print(f"Top 5 similarity scores: {list(zip(top_indices.tolist(), top_scores.tolist()))}")
-        
-        # Sample next key-value pair
-        available_indices = list(range(len(available_kv_pairs)))
+                   
+        # Sample next step
+        available_indices = list(range(len(available_qkv_steps)))
         sampled_indices, _ = sample_key_value(
             similarity_scores, 
             [available_indices] * batch_size,
@@ -189,42 +166,57 @@ def generate_trajectory(
         
         # For simplicity, use the first batch item's choice
         selected_idx = sampled_indices[0]
-        selected_pair = available_kv_pairs[selected_idx]
+        selected_step = available_qkv_steps[selected_idx]
         
-        if verbose:
-            print(f"Selected key: {selected_pair.key_text[0]}")
-            print(f"Selected value: {selected_pair.value_text[0]}")
+        # Create a copy of the selected step with tensors on the correct device
+        device_selected_step = QKVStep(
+            key_tokens=selected_step.key_tokens.to(device),
+            value_tokens=selected_step.value_tokens.to(device),
+            key_embedding=selected_step.key_embedding.to(device),
+            key_text=selected_step.key_text,
+            value_text=selected_step.value_text
+        )
         
-        # Add selected pair to the list
-        selected_pairs.append(selected_pair)
+        # Store query text, tokens and embedding with the selected step for later display
+        device_selected_step.query_text = query_text
+        device_selected_step.query_tokens = query_tokens
+        device_selected_step.query_embedding = query_embeddings
         
-        # Remove the selected pair from available pairs
-        available_kv_pairs.pop(selected_idx)
+        # Add selected step to the list
+        selected_steps.append(device_selected_step)
+        
+        # Remove the selected step from available steps
+        available_qkv_steps.pop(selected_idx)
         
         # Update context for next iteration
-        # Add key and value tokens to context - ensure correct device
-        key_tokens = selected_pair.key_tokens.to(current_context.device)
-        value_tokens = selected_pair.value_tokens.to(current_context.device)
+        # Add query, key and value tokens to context - already on the correct device
+        # Create prefix tensors with proper batch dimension
+        query_prefix_tokens = tokenizer([QUERY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        key_prefix_tokens = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        value_prefix_tokens = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
         
-        # Update context tokens
         current_context = torch.cat([
-            current_context, 
+            current_context,
+            query_prefix_tokens,
             query_tokens,
-            value_tokens
+            key_prefix_tokens, 
+            device_selected_step.key_tokens,
+            value_prefix_tokens,
+            device_selected_step.value_tokens
         ], dim=1)
         
         # Update context text
-        context_text = tokenizer.batch_decode(current_context)
-        
-        if verbose:
-            print(f"Updated context length: {current_context.shape[1]} tokens")
-            print(f"Remaining key-value pairs: {len(available_kv_pairs)}")
+        context_text = tokenizer.batch_decode(current_context, skip_special_tokens=True)
     
     if verbose:
+        # Print the full context at the end of the trajectory
+        full_context = tokenizer.batch_decode(current_context)[0]
+        print(f"\n=== Complete Context from Trajectory ===")
+        print(full_context)
         print("\n=== Trajectory Complete ===\n")
     
     # Create trajectory object
-    trajectory = Trajectory(kv_pairs=selected_pairs)
+    trajectory = Trajectory(qkv_steps=selected_steps)
     
     return trajectory
 
@@ -255,6 +247,16 @@ def main():
     # Set up models and tokenizer
     logging.info("Setting up models and tokenizer...")
     base_model, adapter_model, tokenizer = setup_model_and_tokenizer()
+    
+    # Log the dynamically calculated token counts
+    import src.config as config
+    logging.info(f"Token count configuration:")
+    logging.info(f"  Query prefix tokens: {config.PREFIX_TOKENS_PER_QUERY}")
+    logging.info(f"  Key prefix tokens: {config.PREFIX_TOKENS_PER_KEY}")
+    logging.info(f"  Value prefix tokens: {config.PREFIX_TOKENS_PER_VALUE}")
+    logging.info(f"  Total tokens per round: {config.TOKENS_PER_ROUND}")
+    logging.info(f"  Initial prompt tokens: {config.INITIAL_PROMPT_TOKENS}")
+    logging.info(f"  Number of KV pairs: {config.NUM_KV_PAIRS}")
     
     # Register embedding hooks
     embeddings_dict, hook_remover = register_embedding_hook(adapter_model)
@@ -305,21 +307,24 @@ def main():
                 print(f"\n\n======== EPISODE {episode}/{args.episodes} ========")
             
             # Get a batch of key-value pairs
-            available_kv_pairs = [next(kv_pair_generator) for _ in range(20)]  # Get a pool of KV pairs
+            available_qkv_steps = [next(kv_pair_generator) for _ in range(NUM_KV_PAIRS)]  # Get a pool of QKV steps
             
             if args.verbose:
-                print(f"Generated pool of {len(available_kv_pairs)} key-value pairs")
+                print(f"Generated pool of {len(available_qkv_steps)} query-key-value steps")
             
             # Create initial context with a prompt explaining the task
+            # Note: The token count of this prompt is accounted for in 
+            # the NUM_KV_PAIRS calculation in config.py to ensure we don't exceed the context window
             batch_size = args.batch_size
-            initial_prompt = "I need to find information to answer questions effectively. "
             
             # Tokenize the initial prompt
+            device = next(adapter_model.parameters()).device
             initial_tokens = tokenizer(
-                [initial_prompt] * batch_size, 
-                return_tensors="pt", 
-                padding=True
-            ).input_ids.to(DEVICE)
+                [INITIAL_PROMPT] * batch_size,
+                return_tensors="pt",
+                padding=True,
+                add_special_tokens=False
+            ).input_ids.to(device)
             
             # Generate a trajectory
             trajectory = generate_trajectory(
@@ -329,7 +334,7 @@ def main():
                 tokenizer,
                 embeddings_dict,
                 hook_remover,
-                available_kv_pairs,
+                available_qkv_steps,
                 batch_size,
                 verbose=args.verbose,
             )
@@ -340,6 +345,7 @@ def main():
                 adapter_model, 
                 base_model, 
                 initial_tokens,
+                tokenizer=tokenizer,
                 verbose=args.verbose
             )
             

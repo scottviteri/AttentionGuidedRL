@@ -121,21 +121,19 @@ def test_data_iterator():
 
 
 def test_format_prompt_with_kv_pairs():
-    """Test the format_prompt_with_kv_pairs function."""
+    """Test formatting key-value pairs into a prompt."""
     # Create sample key-value pairs
-    pairs = [("This is a key", "This is a value"), ("Another key", "Another value")]
-
-    # Format the prompt
+    pairs = [
+        ("key1", "value1"),
+        ("key2", "value2"),
+    ]
+    
+    # Call the function
     prompt = format_prompt_with_kv_pairs(pairs)
-
-    # Verify the prompt contains the expected content
-    assert " Query: " in prompt
-    assert " Response: " in prompt
-    assert "This is a key" in prompt
-    assert "This is a value" in prompt
-
-    # Verify the format is correct
-    assert prompt.startswith(" Query: ")
+    
+    # Check the result
+    expected_prompt = " Query: key1 Value: value1 Query: key2 Value: value2"
+    assert prompt == expected_prompt
 
 
 def test_keyvaluepair_validation():
@@ -145,8 +143,8 @@ def test_keyvaluepair_validation():
     embedding_dim = 768
     
     # Valid inputs
-    key_tokens = torch.randint(0, 1000, (batch_size, 20))
-    value_tokens = torch.randint(0, 1000, (batch_size, 20))
+    key_tokens = torch.randint(0, 1000, (batch_size, 10))
+    value_tokens = torch.randint(0, 1000, (batch_size, 10))
     key_embedding = torch.randn(batch_size, embedding_dim)
     key_text = ["key1", "key2"]
     value_text = ["value1", "value2"]
@@ -161,14 +159,14 @@ def test_keyvaluepair_validation():
     )
     
     # Test that no exception is raised
-    assert kv_pair.key_tokens.shape == (batch_size, 20)
-    assert kv_pair.value_tokens.shape == (batch_size, 20)
+    assert kv_pair.key_tokens.shape == (batch_size, 10)
+    assert kv_pair.value_tokens.shape == (batch_size, 10)
     assert kv_pair.key_embedding.shape == (batch_size, embedding_dim)
     
     # Test with invalid inputs (e.g., wrong shape)
     with pytest.raises(AssertionError):
         invalid_kv_pair = KeyValuePair(
-            key_tokens=torch.randint(0, 1000, (batch_size, 10)),  # Wrong shape
+            key_tokens=torch.randint(0, 1000, (batch_size, 15)),  # Wrong shape (15 instead of 10)
             value_tokens=value_tokens,
             key_embedding=key_embedding,
             key_text=key_text,
@@ -226,22 +224,6 @@ def test_tokenize_text(mock_from_pretrained):
     
     # Check that the function returned the tokenized texts
     assert result == [[1, 2, 3], [4, 5, 6]]
-
-
-def test_format_prompt_with_kv_pairs():
-    """Test formatting key-value pairs into a prompt."""
-    # Create sample key-value pairs
-    pairs = [
-        ("key1", "value1"),
-        ("key2", "value2"),
-    ]
-    
-    # Call the function
-    prompt = format_prompt_with_kv_pairs(pairs)
-    
-    # Check the result
-    expected_prompt = " Query: key1 Response: value1 Query: key2 Response: value2"
-    assert prompt == expected_prompt
 
 
 @patch("src.data.iter_wikipedia_articles")
@@ -310,9 +292,9 @@ def test_iter_key_value_pairs(mock_get_tokenizer, mock_filter_articles_by_length
     assert isinstance(first_kv_pair, KeyValuePair)
     
     # Check that the shapes are correct
-    assert first_kv_pair.key_tokens.shape == (2, 20)  # batch_size, TOKENS_PER_KEY
-    assert first_kv_pair.value_tokens.shape == (2, 20)  # batch_size, TOKENS_PER_VALUE
-    assert first_kv_pair.key_embedding.shape == (2, embedding_dim)
+    assert first_kv_pair.key_tokens.shape == (2, 10)  # batch_size, TOKENS_PER_KEY
+    assert first_kv_pair.value_tokens.shape == (2, 10)  # batch_size, TOKENS_PER_VALUE
+    assert first_kv_pair.key_embedding.shape == (2, embedding_dim)  # batch_size, embedding_dim
     
     # Check that tokenizer's batch_decode was called
     assert mock_tokenizer.batch_decode.call_count >= 2
@@ -333,7 +315,7 @@ def test_create_key_value_pair_with_real_model(gpt2_model, gpt2_tokenizer):
         key_text, 
         return_tensors="pt",
         padding="max_length",
-        max_length=TOKENS_PER_KEY,
+        max_length=10,
         truncation=True
     ).input_ids.to(gpt2_model.device)
     
@@ -341,7 +323,7 @@ def test_create_key_value_pair_with_real_model(gpt2_model, gpt2_tokenizer):
         value_text,
         return_tensors="pt",
         padding="max_length",
-        max_length=TOKENS_PER_VALUE,
+        max_length=10,
         truncation=True
     ).input_ids.to(gpt2_model.device)
     
@@ -365,8 +347,8 @@ def test_create_key_value_pair_with_real_model(gpt2_model, gpt2_tokenizer):
     assert kv_pair.value_tokens.device == gpt2_model.device
     assert kv_pair.key_embedding.device == gpt2_model.device
     assert kv_pair.key_embedding.shape == (batch_size, gpt2_model.config.n_embd)
-    assert kv_pair.key_tokens.shape == (batch_size, TOKENS_PER_KEY)
-    assert kv_pair.value_tokens.shape == (batch_size, TOKENS_PER_VALUE)
+    assert kv_pair.key_tokens.shape == (batch_size, 10)
+    assert kv_pair.value_tokens.shape == (batch_size, 10)
 
 
 def test_real_model_data_pipeline(gpt2_model, gpt2_tokenizer):
@@ -400,18 +382,18 @@ def test_real_model_data_pipeline(gpt2_model, gpt2_tokenizer):
         # Pad or truncate key tokens
         padded_key_tokens = []
         for tokens in key_tokens_list:
-            if len(tokens) > TOKENS_PER_KEY:
-                padded_key_tokens.append(tokens[:TOKENS_PER_KEY])
+            if len(tokens) > 10:  # Using 10 instead of TOKENS_PER_KEY
+                padded_key_tokens.append(tokens[:10])
             else:
-                padded_key_tokens.append(tokens + [gpt2_tokenizer.pad_token_id] * (TOKENS_PER_KEY - len(tokens)))
+                padded_key_tokens.append(tokens + [gpt2_tokenizer.pad_token_id] * (10 - len(tokens)))
         
         # Pad or truncate value tokens
         padded_value_tokens = []
         for tokens in value_tokens_list:
-            if len(tokens) > TOKENS_PER_VALUE:
-                padded_value_tokens.append(tokens[:TOKENS_PER_VALUE])
+            if len(tokens) > 10:  # Using 10 instead of TOKENS_PER_VALUE
+                padded_value_tokens.append(tokens[:10])
             else:
-                padded_value_tokens.append(tokens + [gpt2_tokenizer.pad_token_id] * (TOKENS_PER_VALUE - len(tokens)))
+                padded_value_tokens.append(tokens + [gpt2_tokenizer.pad_token_id] * (10 - len(tokens)))
         
         # Convert to tensors
         key_tokens = torch.tensor(padded_key_tokens, device=device)
@@ -457,18 +439,18 @@ def test_real_model_data_pipeline(gpt2_model, gpt2_tokenizer):
         # Pad key tokens
         padded_mixed_key_tokens = []
         for tokens in mixed_key_tokens_list:
-            if len(tokens) > TOKENS_PER_KEY:
-                padded_mixed_key_tokens.append(tokens[:TOKENS_PER_KEY])
+            if len(tokens) > 10:  # Using 10 instead of TOKENS_PER_KEY
+                padded_mixed_key_tokens.append(tokens[:10])
             else:
-                padded_mixed_key_tokens.append(tokens + [gpt2_tokenizer.pad_token_id] * (TOKENS_PER_KEY - len(tokens)))
-                
+                padded_mixed_key_tokens.append(tokens + [gpt2_tokenizer.pad_token_id] * (10 - len(tokens)))
+        
         # Pad value tokens
         padded_mixed_value_tokens = []
         for tokens in mixed_value_tokens_list:
-            if len(tokens) > TOKENS_PER_VALUE:
-                padded_mixed_value_tokens.append(tokens[:TOKENS_PER_VALUE])
+            if len(tokens) > 10:  # Using 10 instead of TOKENS_PER_VALUE
+                padded_mixed_value_tokens.append(tokens[:10])
             else:
-                padded_mixed_value_tokens.append(tokens + [gpt2_tokenizer.pad_token_id] * (TOKENS_PER_VALUE - len(tokens)))
+                padded_mixed_value_tokens.append(tokens + [gpt2_tokenizer.pad_token_id] * (10 - len(tokens)))
         
         # Convert to tensors
         mixed_key_tokens = torch.tensor(padded_mixed_key_tokens, device=device)

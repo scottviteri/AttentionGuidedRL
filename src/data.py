@@ -17,16 +17,16 @@ from src.config import (
     TOKENS_PER_VALUE,
     NUM_KV_PAIRS,
     QUERY_PREFIX,
-    RESPONSE_PREFIX,
+    VALUE_PREFIX,
     DEVICE,
     KV_EVERY_N,
 )
 
 
 @dataclass
-class KeyValuePair:
+class QKVStep:
     """
-    Dataclass for a key-value pair optimized for batched processing.
+    Dataclass for a complete query-key-value step in the trajectory.
 
     Attributes:
         key_tokens: Tokenized keys [batch_size, TOKENS_PER_KEY]
@@ -34,6 +34,9 @@ class KeyValuePair:
         key_embedding: Precomputed embeddings for keys [batch_size, embedding_dim]
         key_text: Original text of keys (for logging/debugging)
         value_text: Original text of values (for logging/debugging)
+        query_text: Optional query text that led to selecting this key-value pair
+        query_tokens: Optional tokenized query that led to selecting this pair
+        query_embedding: Optional embeddings for the query [batch_size, embedding_dim]
     """
 
     key_tokens: torch.Tensor  # Shape: [batch_size, TOKENS_PER_KEY]
@@ -41,6 +44,9 @@ class KeyValuePair:
     key_embedding: torch.Tensor  # Shape: [batch_size, embedding_dim]
     key_text: List[str]  # For logging and debugging
     value_text: List[str]  # For logging and debugging
+    query_text: List[str] = None  # Optional query text that selected this pair
+    query_tokens: torch.Tensor = None  # Optional tokenized query
+    query_embedding: torch.Tensor = None  # Optional query embedding
 
     def __post_init__(self):
         """Validate tensor shapes and types."""
@@ -73,6 +79,19 @@ class KeyValuePair:
         assert (
             len(self.value_text) == batch_size
         ), f"value_text length should be {batch_size}"
+        
+        # Validate query_embedding if present
+        if self.query_embedding is not None:
+            assert isinstance(
+                self.query_embedding, torch.Tensor
+            ), "query_embedding must be a tensor"
+            assert (
+                self.query_embedding.shape[0] == batch_size
+            ), f"query_embedding first dimension should be {batch_size}"
+
+
+# Maintain KeyValuePair for backward compatibility
+KeyValuePair = QKVStep
 
 
 def get_tokenizer() -> PreTrainedTokenizer:
@@ -124,7 +143,7 @@ def format_prompt_with_kv_pairs(pairs: List[Tuple[str, str]]) -> str:
     """
     prompt = ""
     for key, value in pairs:
-        prompt += f"{QUERY_PREFIX}{key}{RESPONSE_PREFIX}{value}"
+        prompt += f"{QUERY_PREFIX}{key}{VALUE_PREFIX}{value}"
 
     return prompt
 
@@ -173,16 +192,16 @@ def filter_articles_by_length(tokenizer: PreTrainedTokenizer) -> Iterator[Dict]:
 
 def iter_key_value_pairs(
     batch_size: int = 1, embedding_fn=None
-) -> Iterator[KeyValuePair]:
+) -> Iterator[QKVStep]:
     """
-    Create an iterator that yields batches of key-value pairs.
+    Create an iterator that yields batches of query-key-value steps.
 
     Args:
         batch_size: Number of articles to process in each batch
         embedding_fn: Optional function to compute embeddings
 
     Returns:
-        Iterator[KeyValuePair]: Iterator yielding a batched KeyValuePair object
+        Iterator[QKVStep]: Iterator yielding a batched QKVStep object
     """
     tokenizer = get_tokenizer()
 
@@ -214,12 +233,13 @@ def iter_key_value_pairs(
             truncation=True,
             max_length=max_len,
             return_tensors="pt",
-        )["input_ids"]
+        )["input_ids"].to(DEVICE)  # Ensure tokens are on the correct device from the start
+        
         assert (
             batch_tokens.size(0) == batch_size
         ), f"Expected batch size {batch_size}, got {batch_tokens.size(0)}"
 
-        # Instead of aggregating all key-value pairs, yield a KeyValuePair for each chunk
+        # Instead of aggregating all key-value pairs, yield a QKVStep for each chunk
         for i in range(NUM_KV_PAIRS):
             j = i * KV_EVERY_N  # compute the starting index multiplier
             start_idx = j * chunk_size
@@ -227,8 +247,8 @@ def iter_key_value_pairs(
             value_end_idx = key_end_idx + TOKENS_PER_VALUE
 
             # Batched slicing: extract pair keys and values with shape (batch_size, TOKENS_PER_KEY) and (batch_size, TOKENS_PER_VALUE)
-            pair_keys = batch_tokens[:, start_idx:key_end_idx]
-            pair_values = batch_tokens[:, key_end_idx:value_end_idx]
+            pair_keys = batch_tokens[:, start_idx:key_end_idx]  # Already on the device
+            pair_values = batch_tokens[:, key_end_idx:value_end_idx]  # Already on the device
 
             # For logging, decode each row in the batch
             key_text_list = tokenizer.batch_decode(pair_keys.tolist(), clean_up_tokenization_spaces=False)
@@ -236,12 +256,13 @@ def iter_key_value_pairs(
 
             # Compute embeddings for the key tokens if embedding_fn is provided
             if embedding_fn is not None:
-                key_embedding = embedding_fn(pair_keys)
+                # embedding_fn should handle the device placement internally
+                key_embedding = embedding_fn(pair_keys)  
             else:
                 embedding_dim = 768  # Default embedding dimension
                 key_embedding = torch.zeros((batch_size, embedding_dim), device=DEVICE)
 
-            yield KeyValuePair(
+            yield QKVStep(
                 key_tokens=pair_keys,
                 value_tokens=pair_values,
                 key_embedding=key_embedding,

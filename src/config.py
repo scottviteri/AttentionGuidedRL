@@ -2,7 +2,7 @@
 Configuration parameters for the Attention-Guided RL project.
 """
 import torch
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoTokenizer
 
 # Determine device and choose model based on available GPU memory.
 if torch.cuda.is_available():
@@ -36,9 +36,34 @@ LORA_ALPHA = 16
 LORA_DROPOUT = 0.05
 
 # Data parameters
-TOKENS_PER_KEY = 20
-TOKENS_PER_VALUE = 20
+TOKENS_PER_QUERY = 10
+TOKENS_PER_KEY = 10
+TOKENS_PER_VALUE = 10
+
+# Prompt formatting
+QUERY_PREFIX = " Query: "
+KEY_PREFIX = " Key: "
+VALUE_PREFIX = " Value: "
+
+# Initialize tokenizer to calculate prefix lengths
+tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+
+# Calculate actual token lengths for the prefixes
+PREFIX_TOKENS_PER_QUERY = len(tokenizer.encode(QUERY_PREFIX, add_special_tokens=False))
+PREFIX_TOKENS_PER_KEY = len(tokenizer.encode(KEY_PREFIX, add_special_tokens=False))
+PREFIX_TOKENS_PER_VALUE = len(tokenizer.encode(VALUE_PREFIX, add_special_tokens=False))
 TOKENS_PER_KV_PAIR = TOKENS_PER_KEY + TOKENS_PER_VALUE
+
+# Calculate initial prompt token count
+INITIAL_PROMPT = f"I am learning to pick the order of my training data by producing a natural language query of {TOKENS_PER_QUERY} tokens which will be used to select similar keys in a key-value dataset within a Wikipedia article. The goal is to predict the values, which are consecutive tokens from the article, over the whole multi-turn trajectory. "
+INITIAL_PROMPT_TOKENS = len(tokenizer.encode(INITIAL_PROMPT, add_special_tokens=False))
+
+# Total tokens per round calculation
+TOKENS_PER_ROUND = (
+    PREFIX_TOKENS_PER_QUERY + TOKENS_PER_QUERY + 
+    PREFIX_TOKENS_PER_KEY + TOKENS_PER_KEY + 
+    PREFIX_TOKENS_PER_VALUE + TOKENS_PER_VALUE
+)
 
 KV_EVERY_N = 4
 
@@ -48,7 +73,9 @@ if MODEL_TYPE == "llama":
 else:
     context_length = model_config.n_positions
 
-NUM_KV_PAIRS = context_length // (TOKENS_PER_KV_PAIR * KV_EVERY_N)
+# Calculate max number of KV pairs that can fit in the context window
+available_context_length = context_length - INITIAL_PROMPT_TOKENS
+NUM_KV_PAIRS = available_context_length // (TOKENS_PER_ROUND * KV_EVERY_N)
 
 # Training parameters
 NUM_EPISODES = 10000
@@ -62,10 +89,6 @@ GENERATION_BATCH_SIZE = 64
 TRAINING_BATCH_SIZE = 16
 TEMPERATURE = 1.0
 TOP_P = 0.9
-
-# Prompt formatting
-QUERY_PREFIX = " Query: "
-RESPONSE_PREFIX = " Response: "
 
 # Checkpoint parameters
 CHECKPOINT_DIR = "checkpoints"

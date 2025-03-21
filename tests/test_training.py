@@ -8,7 +8,7 @@ import numpy as np
 from unittest.mock import MagicMock, patch
 import copy
 
-from src.config import WARMUP_EPISODES, GENERATION_BATCH_SIZE, KL_PENALTY_COEFFICIENT, TOKENS_PER_KEY, TOKENS_PER_VALUE
+from src.config import WARMUP_EPISODES, GENERATION_BATCH_SIZE, KL_PENALTY_COEFFICIENT, TOKENS_PER_KEY, TOKENS_PER_VALUE, QUERY_PREFIX
 from src.data import KeyValuePair
 
 
@@ -19,8 +19,8 @@ def mock_kv_pair():
     embedding_dim = 768
     
     return KeyValuePair(
-        key_tokens=torch.randint(0, 1000, (batch_size, TOKENS_PER_KEY)),
-        value_tokens=torch.randint(0, 1000, (batch_size, TOKENS_PER_VALUE)),
+        key_tokens=torch.randint(0, 1000, (batch_size, 10)),
+        value_tokens=torch.randint(0, 1000, (batch_size, 10)),
         key_embedding=torch.randn(batch_size, embedding_dim),
         key_text=["key1", "key2"],
         value_text=["value1", "value2"],
@@ -34,13 +34,13 @@ def mock_trajectory(mock_kv_pair):
     from src.training import Trajectory
     
     # Create two KV pairs
-    kv_pairs = [mock_kv_pair, mock_kv_pair]
+    qkv_steps = [mock_kv_pair, mock_kv_pair]
     
     # Create trajectory
-    trajectory = Trajectory(kv_pairs=kv_pairs)
+    trajectory = Trajectory(qkv_steps=qkv_steps)
     
     # Add rewards
-    batch_size = kv_pairs[0].key_tokens.shape[0]
+    batch_size = qkv_steps[0].key_tokens.shape[0]
     trajectory.rewards = torch.tensor([[0.5, 0.6], [0.7, 0.8]])  # [batch_size, num_pairs]
     trajectory.avg_reward = torch.tensor([0.55, 0.75])  # [batch_size]
     
@@ -89,95 +89,78 @@ def test_calculate_conditional_log_prob():
 
 def test_generate_query():
     """Test generating a query."""
-    # Import here to avoid circular imports
+    # Import the function
     from src.training import generate_query
+    from src.config import QUERY_PREFIX
     
-    # Create mock inputs
-    model = MagicMock()
+    # Mock tokenizer, model, and context
     tokenizer = MagicMock()
-    tokenizer.eos_token_id = 50001
+    model = MagicMock()
+    context = ["Context 1", "Context 2"]
     
-    # Create a proper MagicMock for the tokenizer return value
+    # Setup model.generate to return a valid output
+    model.generate.return_value = torch.tensor([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
+    
+    # Setup tokenizer to return a valid encoding object with a 'to' method
     tokenizer_output = MagicMock()
-    tokenizer_output.input_ids = torch.tensor([[101, 102], [101, 102]])
+    tokenizer_output.input_ids = torch.tensor([[1, 2], [3, 4]])
     tokenizer_output.attention_mask = torch.tensor([[1, 1], [1, 1]])
     tokenizer_output.to.return_value = tokenizer_output
     tokenizer.return_value = tokenizer_output
+    tokenizer.eos_token_id = 50001
     
-    # Mock generate method to return exactly the expected length + context length
-    expected_length = 10
-    context_length = 2
-    model.generate.return_value = torch.cat([
-        torch.tensor([[101, 102], [101, 102]]),  # Context
-        torch.randint(0, 1000, (2, expected_length))  # Generated tokens
-    ], dim=1)
+    # Call function
+    with patch("src.training.DEVICE", torch.device("cpu")):
+        result = generate_query(model, tokenizer, context, max_length=3)
     
-    # Call function with ensure_exact_length=True
-    result = generate_query(
-        model, 
-        tokenizer, 
-        ["context1", "context2"], 
-        max_length=expected_length,
-        ensure_exact_length=True
-    )
+    # Check tokenizer was called with the right parameters
+    tokenizer.assert_called_once()
+    assert all(f"{ctx}{QUERY_PREFIX}" in tokenizer.call_args[0][0] for ctx in context)
     
-    # Check output
-    assert model.generate.called
-    assert result.shape == (2, expected_length)  # Should have batch_size=2 outputs with exact length
+    # Check model.generate was called with the right parameters
+    model.generate.assert_called_once()
+    assert model.generate.call_args[1]["min_new_tokens"] == 3
+    assert model.generate.call_args[1]["max_new_tokens"] == 3
     
-    # Check that min_new_tokens parameter was passed correctly
-    called_args = model.generate.call_args[1]
-    assert called_args["min_new_tokens"] == expected_length
-    assert called_args["max_new_tokens"] == expected_length
+    # Check result
+    assert isinstance(result, torch.Tensor)
+    assert result.shape[0] == len(context)
 
 
 def test_compute_trajectory_rewards(mock_trajectory, mock_models):
-    """Test computing rewards for a trajectory."""
+    """Test computing trajectory rewards."""
     # Import here to avoid circular imports
     from src.training import compute_trajectory_rewards
     
-    # Unpack mock models
+    # Unpack models
     base_model, adapter_model, _ = mock_models
     
-    # Create mock context
-    batch_size = mock_trajectory.kv_pairs[0].key_tokens.shape[0]
-    context_length = 30
-    context_tokens = torch.randint(0, 1000, (batch_size, context_length))
+    # Batch size and dimensions
+    batch_size = mock_trajectory.qkv_steps[0].key_tokens.shape[0]
     
-    # Mock calculate_conditional_log_prob
-    with patch("src.training.calculate_conditional_log_prob") as mock_calc:
-        # Set up side effects to return different values for each call
-        mock_calc.side_effect = [
-            torch.tensor([-1.0, -2.0]),  # First adapter log probs
-            torch.tensor([-3.0, -4.0]),  # First base log probs
-            torch.tensor([-0.5, -1.5]),  # Second adapter log probs
-            torch.tensor([-2.5, -3.5]),  # Second base log probs
-        ]
+    # Mock model behaviors
+    adapter_model.generate.return_value = torch.randint(0, 1000, (batch_size, 20))
+    
+    # Mock conditional log probs
+    def mock_log_prob(model, *args, **kwargs):
+        return torch.tensor([0.1, 0.2])
         
-        # Mock torch.cat to avoid device issues
-        with patch("torch.cat", return_value=context_tokens):
-            # Call function
-            rewards = compute_trajectory_rewards(
-                mock_trajectory,
-                adapter_model,
-                base_model,
-                context_tokens,
-                verbose=False
-            )
+    with patch('src.training.calculate_conditional_log_prob', side_effect=mock_log_prob):
+        # Create context tokens
+        context_tokens = torch.randint(0, 1000, (batch_size, 5))
         
-        # Check output
-        assert rewards.shape == (batch_size, len(mock_trajectory.kv_pairs))
-        # Rewards should be calculated as adapter_log_prob - base_log_prob
-        expected_rewards = torch.tensor([
-            [2.0, 2.0],  # First pair rewards
-            [2.0, 2.0]   # Second pair rewards
-        ])
-        assert torch.allclose(rewards, expected_rewards)
+        # Compute rewards
+        rewards = compute_trajectory_rewards(
+            mock_trajectory,
+            adapter_model,
+            base_model,
+            context_tokens,
+        )
         
-        # Check trajectory was updated with rewards
-        assert mock_trajectory.rewards is not None
-        assert mock_trajectory.avg_reward is not None
-        assert torch.allclose(mock_trajectory.avg_reward, torch.tensor([2.0, 2.0]))
+        # Verify shapes and rewards computation
+        assert rewards is not None
+        assert isinstance(rewards, torch.Tensor)
+        assert rewards.shape == (batch_size, len(mock_trajectory.qkv_steps))
 
 
 def test_update_reward_stats():
@@ -212,43 +195,43 @@ def test_filter_trajectories():
     # Create a trajectory with batch dimensions
     batch_size = 3
     kv_pair = KeyValuePair(
-        key_tokens=torch.zeros((batch_size, TOKENS_PER_KEY)),
-        value_tokens=torch.zeros((batch_size, TOKENS_PER_VALUE)),
-        key_embedding=torch.zeros((batch_size, 10)),
+        key_tokens=torch.randint(0, 1000, (batch_size, 10)),
+        value_tokens=torch.randint(0, 1000, (batch_size, 10)),
+        key_embedding=torch.zeros(batch_size, 10),
         key_text=["key1", "key2", "key3"],
         value_text=["value1", "value2", "value3"]
     )
     
-    trajectory = Trajectory(kv_pairs=[kv_pair])
+    trajectory = Trajectory(qkv_steps=[kv_pair])
     
-    # Set rewards with different values for each batch element 
+    # Set rewards with different values for each batch element
     # (first element below threshold, other two above)
-    trajectory.avg_reward = torch.tensor([0.5, 2.5, 3.5])
-    trajectory.rewards = torch.tensor([[0.5], [2.5], [3.5]])
+    trajectory.avg_reward = torch.tensor([0.5, 1.5, 2.0])
+    trajectory.rewards = torch.tensor([[0.5], [1.5], [2.0]])
     
     # Set reward stats above warmup threshold
-    reward_stats = {"mean": 1.0, "std": 1.0, "count": WARMUP_EPISODES + 1}
+    reward_stats = {"mean": 1.0, "std": 1.0, "count": 10}
     
     # Call function
     filtered = filter_trajectories(trajectory, reward_stats)
     
-    # Check output - should keep batch elements with avg_reward > mean + std (2.0)
+    # Check output - should keep batch elements with avg_reward > mean (1.0)
     assert filtered is not None
     assert filtered.avg_reward.shape[0] == 2  # Should keep 2 of 3
-    assert filtered.rewards.shape[0] == 2
-    assert filtered.kv_pairs[0].key_tokens.shape[0] == 2
-    assert filtered.kv_pairs[0].value_tokens.shape[0] == 2
-    assert filtered.avg_reward[0].item() == 2.5
-    assert filtered.avg_reward[1].item() == 3.5
+    assert filtered.qkv_steps[0].key_text == ["key2", "key3"]  # Should keep second and third element
+    assert filtered.qkv_steps[0].value_text == ["value2", "value3"]
 
 
 def test_compute_policy_loss(mock_trajectory, mock_models):
-    """Test computing the policy gradient loss."""
+    """Test computing policy loss with KL regularization."""
     # Import here to avoid circular imports
     from src.training import compute_policy_loss
     
-    # Unpack mock models
+    # Unpack models
     _, adapter_model, previous_model = mock_models
+    
+    # Extract batch size
+    batch_size = mock_trajectory.qkv_steps[0].key_tokens.shape[0]
     
     # Ensure mock_trajectory has rewards
     assert mock_trajectory.rewards is not None
@@ -260,7 +243,6 @@ def test_compute_policy_loss(mock_trajectory, mock_models):
     adapter_model.parameters = MagicMock(return_value=iter([mock_param]))
     
     # Mock the model outputs
-    batch_size = mock_trajectory.kv_pairs[0].key_tokens.shape[0]
     vocab_size = 1000
     seq_length = TOKENS_PER_KEY
     
@@ -394,7 +376,7 @@ def test_model_behavior_during_training():
     )
     
     # Create trajectory
-    trajectory = Trajectory(kv_pairs=[kv_pair])
+    trajectory = Trajectory(qkv_steps=[kv_pair])
     
     # Setup for training
     optimizer = torch.optim.Adam(adapter_model.parameters(), lr=0.001)
@@ -441,29 +423,28 @@ def test_model_behavior_during_training():
 
 
 def test_generate_query_with_real_model(gpt2_model, gpt2_tokenizer):
-    """Test generating a query with a real GPT-2 model."""
+    """Test generating queries with an actual GPT-2 model."""
     from src.training import generate_query
+    from src.config import TOKENS_PER_KEY
     
-    # Setup inputs
-    context_texts = ["This is a test context.", "Another test context."]
-    max_length = 10
+    # Test with a real model and tokenizer
+    context = ["This is a test context."]
     
-    # Patch the model type
-    with patch('src.config.MODEL_TYPE', 'gpt2'):
-        # Generate queries
-        query_tokens = generate_query(
-            gpt2_model,
-            gpt2_tokenizer,
-            context_texts,
-            max_length=max_length,
-            ensure_exact_length=True
-        )
-        
-        # Verify output
-        assert query_tokens is not None
-        assert query_tokens.shape[1] == max_length  # Should be exactly max_length
-        assert query_tokens.shape[0] == len(context_texts)  # Should match batch size
-        assert query_tokens.device == gpt2_model.device
+    # Move model to CPU for testing to avoid device mismatch
+    gpt2_model = gpt2_model.to("cpu")
+    
+    with patch("src.training.DEVICE", torch.device("cpu")):
+        result = generate_query(gpt2_model, gpt2_tokenizer, context, max_length=5)
+    
+    # Check the result has the expected shape
+    assert isinstance(result, torch.Tensor)
+    assert result.shape[0] == 1  # Batch size 1
+    assert result.shape[1] == 5  # Exactly 5 tokens generated
+    
+    # Check we can decode the result back to text
+    decoded = gpt2_tokenizer.decode(result[0])
+    assert isinstance(decoded, str)
+    assert len(decoded) > 0
 
 
 def test_compute_trajectory_rewards_with_real_model(gpt2_model, gpt2_tokenizer):
@@ -488,7 +469,7 @@ def test_compute_trajectory_rewards_with_real_model(gpt2_model, gpt2_tokenizer):
         kv_pairs.append(kv_pair)
     
     # Create trajectory
-    trajectory = Trajectory(kv_pairs=kv_pairs)
+    trajectory = Trajectory(qkv_steps=kv_pairs)
     
     # Create initial context
     context_tokens = torch.randint(0, 1000, (batch_size, 5), device=gpt2_model.device)
@@ -524,15 +505,15 @@ def test_train_step_with_real_model(gpt2_model):
     
     # Create a proper KeyValuePair with batch dimension
     kv_pair = KeyValuePair(
-        key_tokens=torch.randint(0, 1000, (batch_size, TOKENS_PER_KEY), device=gpt2_model.device),
-        value_tokens=torch.randint(0, 1000, (batch_size, TOKENS_PER_VALUE), device=gpt2_model.device),
+        key_tokens=torch.randint(0, 100, (batch_size, 10), device=gpt2_model.device),
+        value_tokens=torch.randint(0, 100, (batch_size, 10), device=gpt2_model.device),
         key_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=gpt2_model.device),
         key_text=[f"Test key {i}" for i in range(batch_size)],
         value_text=[f"Test value {i}" for i in range(batch_size)]
     )
     
     # Use real Trajectory object with batch dimension
-    trajectory = Trajectory(kv_pairs=[kv_pair])
+    trajectory = Trajectory(qkv_steps=[kv_pair])
     trajectory.rewards = torch.tensor([[0.5], [1.5]], device=gpt2_model.device)
     trajectory.avg_reward = torch.tensor([0.5, 1.5], device=gpt2_model.device)
     

@@ -65,10 +65,10 @@ def get_target_modules():
     """
     if MODEL_TYPE == "llama":
         # For Llama models, target the attention projection layers
-        return ["q_proj", "k_proj", "v_proj", "o_proj"]
+        return ["q_proj", "k_proj", "v_proj"]
     elif MODEL_TYPE == "gpt2":
         # For GPT-2, target the attention layers
-        return ["c_attn", "c_proj"]
+        return ["c_attn"]
     else:
         raise ValueError(f"Unsupported model type: {MODEL_TYPE}")
 
