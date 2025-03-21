@@ -1,0 +1,2 @@
+I am not sure that current_trajectory_rewards is including "Query", "Key", and "Value" prefixes
+ also not adding the query

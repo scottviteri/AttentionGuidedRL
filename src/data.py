@@ -84,6 +84,7 @@ def get_tokenizer() -> PreTrainedTokenizer:
     """
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
     tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = 'left'  # Set padding side to left for decoder-only models
     return tokenizer
 
 

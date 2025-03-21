@@ -19,6 +19,7 @@ from src.config import (
     MODEL_NAME,
     TOKENS_PER_KEY,
     TOKENS_PER_VALUE,
+    TOKENS_PER_KV_PAIR,
     NUM_KV_PAIRS,
     CHECKPOINT_DIR,
     CHECKPOINT_INTERVAL,
@@ -92,7 +93,7 @@ def generate_trajectory(
     hook_remover,
     available_kv_pairs: List,
     batch_size: int,
-    trajectory_length: int = 3,
+    verbose: bool = False,
 ) -> Trajectory:
     """
     Generate a single trajectory by sequentially selecting key-value pairs.
@@ -106,7 +107,7 @@ def generate_trajectory(
         hook_remover: Function to remove hooks
         available_kv_pairs: List of available key-value pairs
         batch_size: Batch size
-        trajectory_length: Number of key-value pairs to select (default: 3)
+        verbose: Flag to enable verbose logging
         
     Returns:
         Trajectory: The generated trajectory
@@ -115,11 +116,19 @@ def generate_trajectory(
     current_context = context_tokens
     context_text = tokenizer.batch_decode(current_context)
     
+    if verbose:
+        print("\n=== Starting New Trajectory ===")
+        print(f"Initial context: {context_text[0][:50]}...")
+        print(f"Available key-value pairs: {len(available_kv_pairs)}")
+    
     # Initialize selected pair list
     selected_pairs = []
     
     # Loop until we've selected a fixed number of key-value pairs
-    for _ in range(trajectory_length):
+    for step_idx in range(NUM_KV_PAIRS):
+        if verbose:
+            print(f"\n--- Step {step_idx + 1}/{NUM_KV_PAIRS} ---")
+        
         # Generate query
         query_tokens = generate_query(
             adapter_model,
@@ -129,14 +138,46 @@ def generate_trajectory(
             ensure_exact_length=True,
         )
         
+        # Ensure query_tokens is on the same device as context_tokens
+        query_tokens = query_tokens.to(current_context.device)
+        
+        # Decode query for logging
+        query_text = tokenizer.batch_decode(query_tokens)
+        
+        if verbose:
+            print(f"Generated query: {query_text[0]}")
+        
         # Extract query embeddings
         query_embeddings = extract_embeddings(adapter_model, query_tokens, embeddings_dict)
         
-        # Get key embeddings from available pairs
-        key_embeddings = torch.stack([kv_pair.key_embedding for kv_pair in available_kv_pairs])
+        if verbose:
+            print(f"Query embedding shape: {query_embeddings.shape}")
+        
+        # Extract key embeddings from available pairs using extract_embeddings
+        key_embs = []
+        for kv_pair in available_kv_pairs:
+            # Move key_tokens to the same device as context_tokens
+            key_tokens = kv_pair.key_tokens.to(current_context.device)
+            key_emb = extract_embeddings(adapter_model, key_tokens, embeddings_dict)
+            key_embs.append(key_emb)
+            
+        # Stack key embeddings with shape [batch_size, num_keys, hidden_size]
+        key_embeddings = torch.stack(key_embs, dim=1)
+        
+        if verbose:
+            print(f"Key embeddings shape: {key_embeddings.shape}")
         
         # Compute similarity scores
         similarity_scores = compute_similarity(query_embeddings, key_embeddings, adapter_model)
+        
+        if verbose:
+            print(f"Similarity scores shape: {similarity_scores.shape}")
+            if similarity_scores.shape[1] <= 5:  # Only show all scores if there are few pairs left
+                print(f"Similarity scores: {similarity_scores[0].tolist()}")
+            else:
+                # Show top 5 scores with their indices
+                top_scores, top_indices = torch.topk(similarity_scores[0], min(5, similarity_scores.shape[1]))
+                print(f"Top 5 similarity scores: {list(zip(top_indices.tolist(), top_scores.tolist()))}")
         
         # Sample next key-value pair
         available_indices = list(range(len(available_kv_pairs)))
@@ -150,6 +191,10 @@ def generate_trajectory(
         selected_idx = sampled_indices[0]
         selected_pair = available_kv_pairs[selected_idx]
         
+        if verbose:
+            print(f"Selected key: {selected_pair.key_text[0]}")
+            print(f"Selected value: {selected_pair.value_text[0]}")
+        
         # Add selected pair to the list
         selected_pairs.append(selected_pair)
         
@@ -157,12 +202,9 @@ def generate_trajectory(
         available_kv_pairs.pop(selected_idx)
         
         # Update context for next iteration
-        # Add key and value tokens to context
-        key_tokens = selected_pair.key_tokens
-        value_tokens = selected_pair.value_tokens
-        
-        # Decode for logging
-        query_text = tokenizer.batch_decode(query_tokens)
+        # Add key and value tokens to context - ensure correct device
+        key_tokens = selected_pair.key_tokens.to(current_context.device)
+        value_tokens = selected_pair.value_tokens.to(current_context.device)
         
         # Update context tokens
         current_context = torch.cat([
@@ -173,12 +215,16 @@ def generate_trajectory(
         
         # Update context text
         context_text = tokenizer.batch_decode(current_context)
+        
+        if verbose:
+            print(f"Updated context length: {current_context.shape[1]} tokens")
+            print(f"Remaining key-value pairs: {len(available_kv_pairs)}")
     
-    # Create trajectory
+    if verbose:
+        print("\n=== Trajectory Complete ===\n")
+    
+    # Create trajectory object
     trajectory = Trajectory(kv_pairs=selected_pairs)
-    
-    # Compute rewards for the trajectory
-    compute_trajectory_rewards(trajectory, adapter_model, base_model, context_tokens)
     
     return trajectory
 
@@ -189,8 +235,8 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size for training")
     parser.add_argument("--resume", action="store_true", help="Resume training from checkpoint")
     parser.add_argument("--episodes", type=int, default=NUM_EPISODES, help="Number of episodes to train")
-    parser.add_argument("--trajectory-length", type=int, default=3, help="Length of each trajectory (# of KV pairs)")
     parser.add_argument("--log-interval", type=int, default=10, help="Logging interval")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose trajectory logging")
     return parser.parse_args()
 
 
@@ -198,6 +244,10 @@ def main():
     """Main training function."""
     # Parse arguments
     args = parse_args()
+    
+    # Suppress warnings
+    import warnings
+    warnings.filterwarnings("ignore", message="Token indices sequence length is longer than the specified maximum sequence length")
     
     # Set up logging
     log_dir = setup_logging(args)
@@ -217,6 +267,18 @@ def main():
         # Initialize reward stats
         reward_stats = {"mean": 0.0, "std": 1.0, "count": 0}
         
+        # Track initial model weights for verification
+        initial_base_weights = {}
+        for name, param in base_model.named_parameters():
+            if 'lora' not in name:  # Only track non-LoRA parameters
+                initial_base_weights[name] = param.data.clone()
+        
+        # Store adapter weights from previous episode for verification
+        previous_adapter_weights = {}
+        for name, param in adapter_model.named_parameters():
+            if 'lora' in name:  # Only track LoRA parameters
+                previous_adapter_weights[name] = param.data.clone()
+        
         # Try to load checkpoint if resume is specified
         start_episode = 0
         if args.resume:
@@ -230,7 +292,7 @@ def main():
         logging.info("Setting up data loader...")
         kv_pair_generator = iter_key_value_pairs(
             batch_size=args.batch_size, 
-            embedding_fn=lambda x: extract_embeddings(base_model, x, embeddings_dict)
+            embedding_fn=lambda x: extract_embeddings(adapter_model, x, embeddings_dict)
         )
         
         # Training loop
@@ -239,16 +301,29 @@ def main():
         progress_bar = tqdm(episodes_range)
         
         for episode in progress_bar:
+            if args.verbose:
+                print(f"\n\n======== EPISODE {episode}/{args.episodes} ========")
+            
             # Get a batch of key-value pairs
             available_kv_pairs = [next(kv_pair_generator) for _ in range(20)]  # Get a pool of KV pairs
             
-            # Create initial context (empty for now)
+            if args.verbose:
+                print(f"Generated pool of {len(available_kv_pairs)} key-value pairs")
+            
+            # Create initial context with a prompt explaining the task
             batch_size = args.batch_size
-            context_tokens = torch.zeros((batch_size, 1), dtype=torch.long, device=DEVICE)
+            initial_prompt = "I need to find information to answer questions effectively. "
+            
+            # Tokenize the initial prompt
+            initial_tokens = tokenizer(
+                [initial_prompt] * batch_size, 
+                return_tensors="pt", 
+                padding=True
+            ).input_ids.to(DEVICE)
             
             # Generate a trajectory
             trajectory = generate_trajectory(
-                context_tokens,
+                initial_tokens,
                 adapter_model,
                 base_model,
                 tokenizer,
@@ -256,54 +331,106 @@ def main():
                 hook_remover,
                 available_kv_pairs,
                 batch_size,
-                trajectory_length=args.trajectory_length,
+                verbose=args.verbose,
             )
             
-            # Create a copy of the current model for KL divergence computation
+            # Compute trajectory rewards
+            compute_trajectory_rewards(
+                trajectory, 
+                adapter_model, 
+                base_model, 
+                initial_tokens,
+                verbose=args.verbose
+            )
+            
+            # Create a deep copy of the current adapter model for KL divergence computation
+            # This is important to ensure the reference model doesn't change during training
             previous_model = create_model_copy(adapter_model)
             
             # Update reward stats
             if trajectory.avg_reward is not None:
                 reward_stats = update_reward_stats(reward_stats, trajectory.avg_reward)
+                
+                if args.verbose:
+                    print(f"\nUpdated reward stats:")
+                    print(f"  Mean: {reward_stats['mean']:.4f}")
+                    print(f"  Std: {reward_stats['std']:.4f}")
+                    print(f"  Count: {reward_stats['count']}")
             
             # Perform training step
             loss, num_filtered = train_step(
-                [trajectory],
+                trajectory,
                 adapter_model,
                 base_model,
-                previous_model,
+                previous_model,  # Use the deep copy for KL divergence
                 optimizer,
                 reward_stats,
                 KL_PENALTY_COEFFICIENT,
+                verbose=args.verbose
             )
             
             # Update progress bar
             progress_bar.set_description(
                 f"Episode {episode}/{args.episodes}, "
                 f"Loss: {loss:.4f}, "
+                f"Filtered: {num_filtered}/{trajectory.avg_reward.shape[0]}, "
                 f"Reward: {trajectory.avg_reward[0].item():.4f}, "
-                f"Reward Threshold: {reward_stats['mean'] + reward_stats['std']:.4f}"
+                f"Threshold: {reward_stats['mean'] + reward_stats['std']:.4f}"
             )
+            
+            # Periodically verify weight changes (every 5 episodes)
+            if (episode + 1) % 5 == 0:
+                # Check that base model weights are unchanged
+                base_weights_changed = False
+                for name, param in base_model.named_parameters():
+                    if 'lora' not in name and name in initial_base_weights:
+                        if not torch.allclose(initial_base_weights[name], param.data):
+                            base_weights_changed = True
+                            logging.warning(f"Base model weights changed for parameter {name}")
+                            break
+                
+                if not base_weights_changed:
+                    logging.info("Base model weights verification: UNCHANGED (correct)")
+                
+                # Check that adapter model weights are changing
+                adapter_weights_changed = False
+                for name, param in adapter_model.named_parameters():
+                    if 'lora' in name and name in previous_adapter_weights:
+                        if not torch.allclose(previous_adapter_weights[name], param.data):
+                            adapter_weights_changed = True
+                            break
+                
+                if adapter_weights_changed:
+                    logging.info("Adapter model weights verification: CHANGED (correct)")
+                else:
+                    logging.warning("Adapter model weights are NOT changing! This may indicate a training issue.")
+                
+                # Update previous adapter weights for next check
+                for name, param in adapter_model.named_parameters():
+                    if 'lora' in name:
+                        previous_adapter_weights[name] = param.data.clone()
+            
+            # Save checkpoint if needed
+            if episode > 0 and episode % CHECKPOINT_INTERVAL == 0:
+                save_checkpoint(adapter_model, episode)
+                if args.verbose:
+                    print(f"\nCheckpoint saved at episode {episode}")
             
             # Log statistics
             if episode % args.log_interval == 0:
                 logging.info(
                     f"Episode {episode}/{args.episodes}, "
                     f"Loss: {loss:.4f}, "
+                    f"Filtered: {num_filtered}/{trajectory.avg_reward.shape[0]}, "
                     f"Reward: {trajectory.avg_reward[0].item():.4f}, "
                     f"Reward Mean: {reward_stats['mean']:.4f}, "
-                    f"Reward Std: {reward_stats['std']:.4f}, "
-                    f"Num Filtered: {num_filtered}"
+                    f"Reward Std: {reward_stats['std']:.4f}"
                 )
             
-            # Save checkpoint
-            if episode % CHECKPOINT_INTERVAL == 0:
-                save_checkpoint(adapter_model, episode)
-        
         # Save final checkpoint
         save_checkpoint(adapter_model, args.episodes)
         logging.info("Training complete!")
-        
+    
     finally:
         # Remove hook
         hook_remover()

@@ -17,6 +17,7 @@ from src.embeddings import (
     sample_key_value,
 )
 from src.config import MODEL_TYPE
+from src.model import apply_lora_adapter
 
 
 class MockLlamaAttention:
@@ -171,11 +172,11 @@ def test_get_attention_params_gpt2():
     """Test getting attention parameters for GPT2"""
     with patch('src.embeddings.MODEL_TYPE', 'gpt2'):
         model = MockGPT2(n_head=12, n_embd=768)
-        num_heads, num_groups, head_dim = get_attention_params(model)
+    num_heads, num_groups, head_dim = get_attention_params(model)
     
-        assert num_heads == 12
-        assert num_groups == 12  # For GPT2, num_groups == num_heads
-        assert head_dim == 64  # 768 / 12
+    assert num_heads == 12
+    assert num_groups == 12  # For GPT2, num_groups == num_heads
+    assert head_dim == 64  # 768 / 12
 
 
 def test_compute_similarity_llama_gqa():
@@ -900,3 +901,72 @@ def test_sample_key_value_real_gpt2(gpt2_model):
         # Verify sampled indices are in the available keys
         for b in range(batch_size):
             assert sampled_indices[b] in limited_available_keys[b] 
+
+
+def test_extract_embeddings_difference_with_lora(gpt2_model, gpt2_tokenizer):
+    """
+    Test that extract_embeddings produces different results for base model vs LoRA adapter model.
+    This verifies that the LoRA adapter's weights are making a difference in the model's behavior.
+    """
+    import torch
+    from src.model import apply_lora_adapter
+    from src.embeddings import register_embedding_hook, extract_embeddings
+    
+    # Get the device from the model
+    device = next(gpt2_model.parameters()).device
+    
+    # Create input tokens
+    input_text = ["Hello world", "Testing GPT-2"]
+    inputs = gpt2_tokenizer(input_text, return_tensors="pt", padding=True)
+    input_ids = inputs["input_ids"].to(device)
+    
+    # Apply LoRA adapter with patch for GPT-2
+    with patch("src.model.MODEL_TYPE", "gpt2"):
+        adapter_model = apply_lora_adapter(gpt2_model)
+    
+    # Extract embeddings from base model
+    base_embeddings_dict, remove_hook_base = register_embedding_hook(gpt2_model, embed_type="query")
+    base_embeddings = extract_embeddings(gpt2_model, input_ids, base_embeddings_dict)
+    remove_hook_base()
+    
+    # Extract embeddings from adapter model
+    adapter_embeddings_dict, remove_hook_adapter = register_embedding_hook(adapter_model, embed_type="query")
+    adapter_embeddings = extract_embeddings(adapter_model, input_ids, adapter_embeddings_dict)
+    remove_hook_adapter()
+    
+    # Check shapes
+    assert base_embeddings.shape == adapter_embeddings.shape, "Embeddings shape mismatch"
+    
+    # Calculate difference between embeddings
+    diff = torch.abs(base_embeddings - adapter_embeddings).sum()
+    
+    print(f"Base model embeddings shape: {base_embeddings.shape}")
+    print(f"Adapter model embeddings shape: {adapter_embeddings.shape}")
+    print(f"Base embeddings sum: {base_embeddings.sum()}")
+    print(f"Adapter embeddings sum: {adapter_embeddings.sum()}")
+    print(f"Absolute difference between embeddings: {diff}")
+    
+    # The embeddings should be different due to LoRA weights
+    assert diff > 0, "LoRA weights should produce different embeddings than the base model"
+    
+    # Test log probabilities are different
+    test_inputs = ["What is the capital of France?", "How does a computer work?"]
+    encoded = gpt2_tokenizer(test_inputs, return_tensors="pt", padding=True)
+    input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
+    
+    with torch.no_grad():
+        base_outputs = gpt2_model(input_ids=input_ids, attention_mask=attention_mask)
+        adapter_outputs = adapter_model(input_ids=input_ids, attention_mask=attention_mask)
+    
+    base_logits = base_outputs.logits
+    adapter_logits = adapter_outputs.logits
+    
+    logit_diff = torch.abs(base_logits - adapter_logits).sum()
+    print(f"Base model logits shape: {base_logits.shape}")
+    print(f"Adapter model logits shape: {adapter_logits.shape}")
+    print(f"Base model logits sum: {base_logits.sum()}")
+    print(f"Adapter model logits sum: {adapter_logits.sum()}")
+    print(f"Absolute difference between logits: {logit_diff}")
+    
+    assert logit_diff > 0, "LoRA should produce different logits than the base model" 

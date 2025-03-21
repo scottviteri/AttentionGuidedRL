@@ -58,17 +58,15 @@ def calculate_conditional_log_prob(
     """
     batch_size = tokens.shape[0]
     
-    # Forward pass to get logits
-    with torch.no_grad():
-        outputs = model(context)
+    # Concatenate context and tokens to create the full sequence
+    full_sequence = torch.cat([context, tokens], dim=1)
     
-    # Get logits for the tokens positions we want to evaluate
-    # If context is longer than tokens, we only look at the last tokens.shape[1] positions
-    if outputs.logits.size(1) >= tokens.shape[1]:
-        logits = outputs.logits[:, -tokens.shape[1]:, :]  # [batch_size, seq_length, vocab_size]
-    else:
-        # Handle case where context is shorter than tokens (shouldn't happen normally)
-        raise ValueError(f"Context length {outputs.logits.size(1)} is shorter than token length {tokens.shape[1]}")
+    # Forward pass to get logits (use the full sequence)
+    with torch.no_grad():
+        outputs = model(full_sequence)
+    
+    # Get logits for only the token positions (last part of the sequence)
+    logits = outputs.logits[:, -tokens.shape[1]:, :]  # [batch_size, seq_length, vocab_size]
     
     # Get log probabilities
     log_probs = F.log_softmax(logits, dim=-1)
@@ -81,7 +79,7 @@ def calculate_conditional_log_prob(
     ).squeeze(-1)  # [batch_size, seq_length]
     
     # Sum over sequence length
-    sequence_log_probs = token_log_probs.sum(dim=1)  # [batch_size]
+    sequence_log_probs = token_log_probs.mean(dim=1)  # [batch_size]
     
     return sequence_log_probs
 
@@ -151,6 +149,7 @@ def compute_trajectory_rewards(
     adapter_model: torch.nn.Module,
     base_model: torch.nn.Module,
     context_tokens: torch.Tensor,
+    verbose: bool = False,
 ) -> torch.Tensor:
     """
     Compute rewards for all key-value pairs in a trajectory.
@@ -160,12 +159,18 @@ def compute_trajectory_rewards(
         adapter_model: The model with LoRA adapter
         base_model: The base model without LoRA
         context_tokens: Initial context tokens [batch_size, context_length]
+        verbose: Flag to enable verbose logging
         
     Returns:
         torch.Tensor: Rewards for each key-value pair [batch_size, num_pairs]
     """
     batch_size = context_tokens.shape[0]
     num_pairs = len(trajectory.kv_pairs)
+    
+    if verbose:
+        print("\n=== Computing Trajectory Rewards ===")
+        print(f"Batch size: {batch_size}")
+        print(f"Number of key-value pairs: {num_pairs}")
     
     # Ensure context_tokens is on the correct device
     device = context_tokens.device
@@ -177,6 +182,12 @@ def compute_trajectory_rewards(
     current_context = context_tokens
     
     for i, kv_pair in enumerate(trajectory.kv_pairs):
+        if verbose:
+            print(f"\n--- Reward Calculation for Pair {i+1}/{num_pairs} ---")
+            print(f"Key: {kv_pair.key_text[0]}")
+            print(f"Value: {kv_pair.value_text[0]}")
+            print(f"Current context length: {current_context.shape[1]} tokens")
+        
         # Get value tokens and ensure they're on the same device as context
         value_tokens = kv_pair.value_tokens.to(device)
         
@@ -197,6 +208,11 @@ def compute_trajectory_rewards(
         # Calculate reward as improvement over base model
         rewards[:, i] = adapter_log_prob - base_log_prob
         
+        if verbose:
+            print(f"Adapter model log prob: {adapter_log_prob[0].item():.4f}")
+            print(f"Base model log prob: {base_log_prob[0].item():.4f}")
+            print(f"Reward: {rewards[0, i].item():.4f}")
+        
         # Update context for next iteration
         # Append key and value tokens to context, ensuring same device
         current_context = torch.cat([
@@ -208,9 +224,13 @@ def compute_trajectory_rewards(
     # Compute average reward
     avg_reward = rewards.mean(dim=1)
     
-    # Update trajectory with computed rewards
-    trajectory.rewards = rewards.detach().clone()
-    trajectory.avg_reward = avg_reward.detach().clone()
+    if verbose:
+        print("\n=== Trajectory Summary ===")
+        print(f"Average reward: {avg_reward[0].item():.4f}")
+    
+    # Store rewards in the trajectory object
+    trajectory.rewards = rewards
+    trajectory.avg_reward = avg_reward
     
     return rewards
 
@@ -253,47 +273,67 @@ def update_reward_stats(
 
 
 def filter_trajectories(
-    trajectories: List[Trajectory],
+    trajectory: Trajectory,
     reward_stats: Dict[str, float],
-) -> List[Trajectory]:
+) -> Trajectory:
     """
-    Filter trajectories based on reward.
+    Filter batch elements within a trajectory based on reward.
     
     Args:
-        trajectories: List of trajectories
+        trajectory: A trajectory with batch dimension
         reward_stats: Reward statistics for filtering
         
     Returns:
-        List[Trajectory]: Filtered trajectories
+        Trajectory: Filtered trajectory with potentially reduced batch size
+                   (None if no batch elements pass the filter)
     """
     # Only filter if we've collected enough data
     if reward_stats["count"] <= WARMUP_EPISODES:
-        return trajectories
+        return trajectory
     
     # Calculate threshold for filtering (mean + std)
     threshold = reward_stats["mean"] + reward_stats["std"]
     
-    # Filter trajectories with average reward exceeding the threshold
-    # Check only the first element of avg_reward (per batch)
-    filtered_trajectories = [
-        traj for traj in trajectories
-        if traj.avg_reward is not None and traj.avg_reward[0].item() > threshold
-    ]
+    # No rewards yet
+    if trajectory.avg_reward is None:
+        return None
     
-    # If no trajectories meet the threshold, keep the best one
-    if not filtered_trajectories and trajectories:
-        # Find trajectory with highest avg_reward[0]
-        best_trajectory = max(
-            trajectories, 
-            key=lambda t: t.avg_reward[0].item() if t.avg_reward is not None else float('-inf')
+    # Get batch indices where reward exceeds threshold
+    batch_mask = trajectory.avg_reward > threshold
+    
+    # If no batch elements pass the threshold, return None
+    if not torch.any(batch_mask):
+        return None
+    
+    # Create a new trajectory with only the filtered batch elements
+    filtered_kv_pairs = []
+    
+    for kv_pair in trajectory.kv_pairs:
+        # Select the filtered batch elements for each tensor
+        filtered_kv_pair = KeyValuePair(
+            key_tokens=kv_pair.key_tokens[batch_mask],
+            value_tokens=kv_pair.value_tokens[batch_mask],
+            key_embedding=kv_pair.key_embedding[batch_mask],
+            key_text=[kv_pair.key_text[i] for i in range(len(kv_pair.key_text)) if batch_mask[i]],
+            value_text=[kv_pair.value_text[i] for i in range(len(kv_pair.value_text)) if batch_mask[i]]
         )
-        filtered_trajectories = [best_trajectory]
+        filtered_kv_pairs.append(filtered_kv_pair)
     
-    return filtered_trajectories
+    # Create new trajectory with filtered elements
+    filtered_trajectory = Trajectory(kv_pairs=filtered_kv_pairs)
+    
+    # Copy over rewards, filtering to keep only selected batch elements
+    if trajectory.rewards is not None:
+        filtered_trajectory.rewards = trajectory.rewards[batch_mask]
+    
+    if trajectory.avg_reward is not None:
+        filtered_trajectory.avg_reward = trajectory.avg_reward[batch_mask]
+    
+    return filtered_trajectory
 
 
 def compute_policy_loss(
-    trajectories: List[Trajectory],
+    trajectory: Trajectory,
     adapter_model: torch.nn.Module,
     previous_model: Any,
     kl_penalty_coef: float
@@ -302,7 +342,7 @@ def compute_policy_loss(
     Compute the policy gradient loss with KL penalty.
     
     Args:
-        trajectories: List of trajectories to train on
+        trajectory: The trajectory to train on
         adapter_model: The language model with LoRA adapter
         previous_model: The model state before update
         kl_penalty_coef: KL penalty coefficient (beta)
@@ -317,56 +357,54 @@ def compute_policy_loss(
     # Determine device to use
     device = next(adapter_model.parameters()).device if hasattr(adapter_model, 'parameters') else DEVICE
     
-    # Process each trajectory
-    for trajectory in trajectories:
-        # Ensure trajectory has rewards
-        if trajectory.rewards is None or trajectory.avg_reward is None:
-            raise ValueError("Trajectory must have rewards computed before policy loss")
+    # Ensure trajectory has rewards
+    if trajectory.rewards is None or trajectory.avg_reward is None:
+        raise ValueError("Trajectory must have rewards computed before policy loss")
+    
+    # Get all queries from the trajectory's KVPairs
+    for kv_pair in trajectory.kv_pairs:
+        # Get query tokens (key_tokens in KVPair) and ensure consistent device
+        query_tokens = kv_pair.key_tokens.to(device)
         
-        # Get all queries from the trajectory's KVPairs
-        for kv_pair in trajectory.kv_pairs:
-            # Get query tokens (key_tokens in KVPair) and ensure consistent device
-            query_tokens = kv_pair.key_tokens.to(device)
-            
-            # Use the average reward for the trajectory
-            rewards = trajectory.avg_reward.to(device)
-            
-            # Forward pass with current model to compute log probabilities
-            outputs_current = adapter_model(query_tokens)
-            current_logits = outputs_current.logits
-            
-            # Forward pass with previous model
-            with torch.no_grad():
-                outputs_previous = previous_model(query_tokens)
-                previous_logits = outputs_previous.logits
-            
-            # Compute log probabilities
-            log_probs_current = F.log_softmax(current_logits, dim=-1)
-            log_probs_previous = F.log_softmax(previous_logits, dim=-1)
-            
-            # Gather log probabilities of the actual tokens, skipping the first token
-            # which is used as input
-            token_indices = query_tokens[:, 1:].unsqueeze(-1)
-            token_log_probs = torch.gather(
-                log_probs_current[:, :-1, :], 
-                dim=-1, 
-                index=token_indices
-            ).squeeze(-1)  # [batch_size, seq_length-1]
-            
-            # Compute policy gradient loss
-            batch_policy_loss = -(token_log_probs.sum(dim=-1) * rewards).mean()
-            policy_loss += batch_policy_loss
-            
-            # Compute KL divergence loss (regularization)
-            batch_kl_loss = F.kl_div(
-                log_probs_current.reshape(-1, log_probs_current.size(-1)),
-                log_probs_previous.reshape(-1, log_probs_previous.size(-1)),
-                reduction="batchmean",
-                log_target=True
-            )
-            kl_loss += batch_kl_loss
-            
-            count += 1
+        # Use the average reward for the trajectory
+        rewards = trajectory.avg_reward.to(device)
+        
+        # Forward pass with current model to compute log probabilities
+        outputs_current = adapter_model(query_tokens)
+        current_logits = outputs_current.logits
+        
+        # Forward pass with previous model
+        with torch.no_grad():
+            outputs_previous = previous_model(query_tokens)
+            previous_logits = outputs_previous.logits
+        
+        # Compute log probabilities
+        log_probs_current = F.log_softmax(current_logits, dim=-1)
+        log_probs_previous = F.log_softmax(previous_logits, dim=-1)
+        
+        # Gather log probabilities of the actual tokens, skipping the first token
+        # which is used as input
+        token_indices = query_tokens[:, 1:].unsqueeze(-1)
+        token_log_probs = torch.gather(
+            log_probs_current[:, :-1, :], 
+            dim=-1, 
+            index=token_indices
+        ).squeeze(-1)  # [batch_size, seq_length-1]
+        
+        # Compute policy gradient loss
+        batch_policy_loss = -(token_log_probs.sum(dim=-1) * rewards).mean()
+        policy_loss += batch_policy_loss
+        
+        # Compute KL divergence loss (regularization)
+        batch_kl_loss = F.kl_div(
+            log_probs_current.reshape(-1, log_probs_current.size(-1)),
+            log_probs_previous.reshape(-1, log_probs_previous.size(-1)),
+            reduction="batchmean",
+            log_target=True
+        )
+        kl_loss += batch_kl_loss
+        
+        count += 1
     
     # Return average loss if there were trajectories, otherwise zero
     if count > 0:
@@ -379,54 +417,93 @@ def compute_policy_loss(
 
 
 def train_step(
-    trajectories: List[Trajectory],
+    trajectory: Trajectory,
     adapter_model: torch.nn.Module,
     base_model: torch.nn.Module,
     previous_model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     reward_stats: Dict[str, float],
-    kl_penalty_coef: float
+    kl_penalty_coef: float,
+    verbose: bool = False,
 ) -> Tuple[float, int]:
     """
     Perform a single training step.
     
     Args:
-        trajectories: List of trajectories
+        trajectory: The trajectory to train on
         adapter_model: The language model with LoRA adapter
         base_model: The base language model without LoRA
         previous_model: The model before update (for KL divergence)
         optimizer: The optimizer
         reward_stats: Reward statistics for filtering
         kl_penalty_coef: KL penalty coefficient (beta)
+        verbose: Flag to enable verbose logging
         
     Returns:
-        Tuple[float, int]: Loss value and number of filtered trajectories
+        Tuple[float, int]: Loss value and number of filtered batch elements
     """
-    # Filter trajectories based on reward
-    filtered_trajectories = filter_trajectories(trajectories, reward_stats)
+    # Import WARMUP_EPISODES only
+    from src.config import WARMUP_EPISODES
     
-    # Skip update if no trajectories meet the criteria
-    if not filtered_trajectories:
+    if verbose:
+        print("\n=== Training Step ===")
+        
+        if trajectory.avg_reward is not None:
+            batch_size = trajectory.avg_reward.shape[0]
+            print(f"Input trajectory batch size: {batch_size}")
+            print(f"Reward stats: mean={reward_stats['mean']:.4f}, std={reward_stats['std']:.4f}, count={reward_stats['count']}")
+            
+            # Print individual batch element rewards
+            if batch_size > 0:
+                rewards = [f"{i}: {reward.item():.4f}" for i, reward in enumerate(trajectory.avg_reward)]
+                print(f"Batch element rewards: {', '.join(rewards)}")
+    
+    # Filter trajectory based on reward
+    filtered_trajectory = filter_trajectories(trajectory, reward_stats)
+    
+    # Skip update if no batch elements meet the criteria
+    if filtered_trajectory is None:
+        if verbose:
+            print("No batch elements meet filtering criteria. Skipping update.")
         return 0.0, 0
+    
+    # Get the number of batch elements that passed filtering
+    filtered_batch_size = filtered_trajectory.avg_reward.shape[0]
+    
+    if verbose:
+        print(f"Filtered batch size: {filtered_batch_size}/{trajectory.avg_reward.shape[0]}")
+        if reward_stats["count"] > WARMUP_EPISODES:
+            threshold = reward_stats["mean"] + reward_stats["std"]
+            print(f"Filtering threshold: {threshold:.4f}")
     
     # Zero gradients
     optimizer.zero_grad()
     
     # Compute policy loss
     loss = compute_policy_loss(
-        filtered_trajectories,
+        filtered_trajectory,
         adapter_model,
         previous_model,
         kl_penalty_coef
     )
     
+    if verbose:
+        print(f"Policy loss: {loss.item():.4f}")
+    
     # Backpropagate loss
     loss.backward()
     
-    # Clip gradients
-    torch.nn.utils.clip_grad_norm_(adapter_model.parameters(), GRADIENT_CLIP_NORM)
+    # Get gradient norm for logging
+    grad_norm = torch.nn.utils.clip_grad_norm_(adapter_model.parameters(), GRADIENT_CLIP_NORM)
+    
+    if verbose:
+        print(f"Gradient norm (before clipping): {grad_norm:.4f}")
     
     # Update parameters
     optimizer.step()
     
-    return loss.item(), len(filtered_trajectories) 
+    if verbose:
+        print("Parameters updated.")
+        print(f"=== Training Step Complete ===\n")
+    
+    return loss.item(), filtered_batch_size 

@@ -83,6 +83,9 @@ def apply_lora_adapter(model):
     Returns:
         The model with LoRA adapter applied
     """
+    # Create a deep copy of the model to avoid modifying the original
+    model_copy = copy.deepcopy(model)
+    
     # Configure LoRA
     lora_config = LoraConfig(
         r=LORA_RANK,
@@ -91,12 +94,23 @@ def apply_lora_adapter(model):
         lora_dropout=LORA_DROPOUT,
         bias="none",
         task_type="CAUSAL_LM",
+        init_lora_weights="gaussian",  # Use Gaussian initialization for more randomness
     )
     
-    # Apply LoRA adapter
-    model = get_peft_model(model, lora_config)
+    # Apply LoRA adapter to the copy
+    model_copy = get_peft_model(model_copy, lora_config)
     
-    return model
+    # Initialize lora_B weights with random values since default "gaussian" only initializes lora_A
+    # This ensures both parts of the LoRA decomposition are randomly initialized
+    with torch.no_grad():
+        for name, module in model_copy.named_modules():
+            if hasattr(module, 'lora_B'):
+                # Access all lora_B weights in the module
+                for key in module.lora_B.keys():
+                    # Initialize with small random values (scaled by 0.01)
+                    module.lora_B[key].weight.normal_(mean=0.0, std=0.01)
+    
+    return model_copy
 
 
 def save_model_adapter(model, path):
@@ -118,23 +132,25 @@ def load_model_adapter(model, path):
     Args:
         model: The model with LoRA adapter
         path: Path to load the state from
+        
+    Returns:
+        The model with loaded adapter state
     """
     state_dict = torch.load(path)
     model.load_state_dict(state_dict)
-
+    return model
 
 def create_model_copy(model):
     """
-    Create a deep copy of the model's adapter parameters.
+    Create a deep copy of the model with adapter parameters.
     
     Args:
         model: The model with LoRA adapter
         
     Returns:
-        A copy of the model's state
+        A copy of the model with the same parameters
     """
-    return copy.deepcopy(model.state_dict())
-
+    return copy.deepcopy(model)
 
 def setup_model_and_tokenizer():
     """
@@ -152,6 +168,7 @@ def setup_model_and_tokenizer():
     # Load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
     tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = 'left'  # Set padding side to left for decoder-only models
     
     return base_model, adapter_model, tokenizer
 

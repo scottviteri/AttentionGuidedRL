@@ -79,27 +79,54 @@ def test_load_base_model_gpt2(mock_from_pretrained, mock_pretrained_model_for_gp
 
 @patch("src.model.LoraConfig")
 @patch("src.model.get_peft_model")
-def test_apply_lora_adapter(mock_get_peft_model, mock_lora_config):
+@patch("src.model.copy.deepcopy")
+@patch("torch.no_grad")
+def test_apply_lora_adapter(mock_no_grad, mock_deepcopy, mock_get_peft_model, mock_lora_config):
     """Test applying LoRA adapter to a model."""
     # Import here to avoid circular imports
     from src.model import apply_lora_adapter
     
     # Setup mocks
     mock_model = MagicMock()
+    mock_model_copy = MagicMock()
+    mock_peft_model = MagicMock()
+    
+    # Setup return values
+    mock_deepcopy.return_value = mock_model_copy
     mock_lora_config.return_value = "lora_config"
-    mock_get_peft_model.return_value = "peft_model"
+    mock_get_peft_model.return_value = mock_peft_model
+    
+    # Setup mock modules for lora_B initialization
+    mock_lora_module = MagicMock()
+    mock_lora_module.lora_B = {"default": MagicMock()}
+    mock_lora_module.lora_B["default"].weight = MagicMock()
+    
+    # Mock the named_modules method to return some modules with lora_B
+    mock_peft_model.named_modules.return_value = [
+        ("module1", mock_lora_module),
+        ("module2", MagicMock())  # module without lora_B
+    ]
     
     # Call the function
     result = apply_lora_adapter(mock_model)
     
-    # Check that LoraConfig was created
+    # Check that the model was deep-copied
+    mock_deepcopy.assert_called_once_with(mock_model)
+    
+    # Check that LoraConfig was created with the expected parameters
     mock_lora_config.assert_called_once()
     
     # Check that get_peft_model was called with the right parameters
-    mock_get_peft_model.assert_called_with(mock_model, "lora_config")
+    mock_get_peft_model.assert_called_with(mock_model_copy, "lora_config")
+    
+    # Check that named_modules was called for the LoRA initialization
+    mock_peft_model.named_modules.assert_called()
+    
+    # Check that we normalized weights for modules with lora_B
+    mock_lora_module.lora_B["default"].weight.normal_.assert_called_once()
     
     # Check that we got the peft model
-    assert result == "peft_model"
+    assert result == mock_peft_model
 
 
 @patch("src.model.MODEL_TYPE", "llama")
@@ -245,4 +272,123 @@ def test_real_gpt2_model_setup(gpt2_model, gpt2_tokenizer):
     decoded = gpt2_tokenizer.batch_decode(generated, skip_special_tokens=True)
     assert len(decoded) == batch_size
     assert all(isinstance(text, str) for text in decoded)
-    assert all(len(text) > 0 for text in decoded) 
+    assert all(len(text) > 0 for text in decoded)
+
+
+def test_base_model_unchanged_after_lora(gpt2_model):
+    """
+    Test that the base model remains unchanged after applying LoRA adapter.
+    
+    This test verifies that applying LoRA adapter to a model does not modify the 
+    original model in place, which could cause unexpected behavior in training.
+    """
+    import copy
+    from src.model import apply_lora_adapter
+    
+    # Create a deep copy of the model architecture for comparison
+    # We can't directly compare model parameters because the model includes non-leaf tensors
+    base_model_architecture = str(gpt2_model)
+    
+    # Store the original structure of c_attn layers (before LoRA)
+    original_c_attn_layers = []
+    for block_idx, block in enumerate(gpt2_model.transformer.h):
+        original_c_attn_layers.append(str(block.attn.c_attn))
+    
+    # Verify that the base model doesn't have LoRA modules already
+    for block_idx, block in enumerate(gpt2_model.transformer.h):
+        assert "lora" not in str(block.attn.c_attn).lower(), f"Base model already has LoRA modules: {block.attn.c_attn}"
+    
+    # Apply LoRA adapter with patch for GPT-2
+    with patch("src.model.MODEL_TYPE", "gpt2"):
+        adapter_model = apply_lora_adapter(gpt2_model)
+    
+    # Verify that adapter model now has LoRA modules
+    for block_idx, block in enumerate(adapter_model.transformer.h):
+        assert "lora" in str(block.attn.c_attn).lower(), f"Adapter model missing LoRA modules: {block.attn.c_attn}"
+    
+    # If the base model is also changed, this means apply_lora_adapter is modifying it in-place
+    for block_idx, block in enumerate(gpt2_model.transformer.h):
+        current_c_attn = str(block.attn.c_attn)
+        assert "lora" not in current_c_attn.lower(), (
+            f"Base model was modified after applying LoRA adapter. Block {block_idx}, "
+            f"Original: {original_c_attn_layers[block_idx]}, Current: {current_c_attn}"
+        )
+    
+    # Verify overall model architecture hasn't changed
+    assert base_model_architecture == str(gpt2_model), "Base model architecture changed after applying LoRA"
+
+
+def test_lora_weight_initialization(gpt2_model):
+    """
+    Test that both lora_A and lora_B weights are properly initialized with non-zero values.
+    """
+    import torch
+    from src.model import apply_lora_adapter
+    
+    # Apply LoRA adapter with patch for GPT-2
+    with patch("src.model.MODEL_TYPE", "gpt2"):
+        adapter_model = apply_lora_adapter(gpt2_model)
+    
+    # Check that lora_A and lora_B weights exist and are not zero
+    lora_a_nonzero = False
+    lora_b_nonzero = False
+    
+    # Iterate through all modules to find LoRA layers
+    for name, module in adapter_model.named_modules():
+        # Check lora_A weights
+        if hasattr(module, 'lora_A'):
+            for key in module.lora_A.keys():
+                # Check if weights are non-zero (at least some of them)
+                weights = module.lora_A[key].weight
+                if torch.abs(weights).sum() > 0:
+                    lora_a_nonzero = True
+                    
+        # Check lora_B weights
+        if hasattr(module, 'lora_B'):
+            for key in module.lora_B.keys():
+                # Check if weights are non-zero (at least some of them)
+                weights = module.lora_B[key].weight
+                if torch.abs(weights).sum() > 0:
+                    lora_b_nonzero = True
+    
+    # Both lora_A and lora_B should have non-zero weights
+    assert lora_a_nonzero, "LoRA A weights are all zeros"
+    assert lora_b_nonzero, "LoRA B weights are all zeros"
+    
+    # Print statistics about LoRA weights for debugging
+    lora_a_stats = []
+    lora_b_stats = []
+    
+    for name, module in adapter_model.named_modules():
+        if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+            for key in module.lora_A.keys():
+                a_weights = module.lora_A[key].weight
+                b_weights = module.lora_B[key].weight
+                
+                lora_a_stats.append({
+                    'mean': torch.mean(a_weights).item(),
+                    'std': torch.std(a_weights).item(),
+                    'min': torch.min(a_weights).item(),
+                    'max': torch.max(a_weights).item(),
+                    'nonzero': (torch.abs(a_weights) > 1e-10).float().mean().item() * 100
+                })
+                
+                lora_b_stats.append({
+                    'mean': torch.mean(b_weights).item(),
+                    'std': torch.std(b_weights).item(),
+                    'min': torch.min(b_weights).item(),
+                    'max': torch.max(b_weights).item(),
+                    'nonzero': (torch.abs(b_weights) > 1e-10).float().mean().item() * 100
+                })
+                
+    # Average statistics
+    a_mean_stats = {k: sum(stat[k] for stat in lora_a_stats) / len(lora_a_stats) for k in lora_a_stats[0]}
+    b_mean_stats = {k: sum(stat[k] for stat in lora_b_stats) / len(lora_b_stats) for k in lora_b_stats[0]}
+    
+    print(f"LoRA A stats: {a_mean_stats}")
+    print(f"LoRA B stats: {b_mean_stats}")
+    
+    # Check that the statistics are reasonable
+    assert abs(a_mean_stats['mean']) < 0.1, "LoRA A weights have unexpectedly large mean"
+    assert a_mean_stats['std'] > 0, "LoRA A weights have zero standard deviation"
+    assert b_mean_stats['std'] > 0, "LoRA B weights have zero standard deviation" 

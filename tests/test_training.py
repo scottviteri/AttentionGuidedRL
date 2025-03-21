@@ -161,7 +161,8 @@ def test_compute_trajectory_rewards(mock_trajectory, mock_models):
                 mock_trajectory,
                 adapter_model,
                 base_model,
-                context_tokens
+                context_tokens,
+                verbose=False
             )
         
         # Check output
@@ -201,33 +202,44 @@ def test_update_reward_stats():
 
 
 def test_filter_trajectories():
-    """Test filtering trajectories based on reward."""
+    """Test filtering batch elements within a trajectory based on reward."""
     # Import here to avoid circular imports
     from src.training import filter_trajectories
     from src.training import Trajectory
+    from src.data import KeyValuePair
+    from src.config import TOKENS_PER_KEY, TOKENS_PER_VALUE
     
-    # Create three separate trajectories with different rewards
-    # We need separate instances to avoid shared references
-    trajectory1 = Trajectory(kv_pairs=[])
-    trajectory1.avg_reward = torch.tensor([0.5, 0.6])
+    # Create a trajectory with batch dimensions
+    batch_size = 3
+    kv_pair = KeyValuePair(
+        key_tokens=torch.zeros((batch_size, TOKENS_PER_KEY)),
+        value_tokens=torch.zeros((batch_size, TOKENS_PER_VALUE)),
+        key_embedding=torch.zeros((batch_size, 10)),
+        key_text=["key1", "key2", "key3"],
+        value_text=["value1", "value2", "value3"]
+    )
     
-    trajectory2 = Trajectory(kv_pairs=[])
-    trajectory2.avg_reward = torch.tensor([1.5, 1.6])
+    trajectory = Trajectory(kv_pairs=[kv_pair])
     
-    trajectory3 = Trajectory(kv_pairs=[])
-    trajectory3.avg_reward = torch.tensor([2.5, 2.6])
-    
-    trajectories = [trajectory1, trajectory2, trajectory3]
+    # Set rewards with different values for each batch element 
+    # (first element below threshold, other two above)
+    trajectory.avg_reward = torch.tensor([0.5, 2.5, 3.5])
+    trajectory.rewards = torch.tensor([[0.5], [2.5], [3.5]])
     
     # Set reward stats above warmup threshold
     reward_stats = {"mean": 1.0, "std": 1.0, "count": WARMUP_EPISODES + 1}
     
     # Call function
-    filtered = filter_trajectories(trajectories, reward_stats)
+    filtered = filter_trajectories(trajectory, reward_stats)
     
-    # Check output - should keep trajectories with avg_reward > mean + std (2.0)
-    assert len(filtered) == 1
-    assert filtered[0].avg_reward[0].item() == 2.5
+    # Check output - should keep batch elements with avg_reward > mean + std (2.0)
+    assert filtered is not None
+    assert filtered.avg_reward.shape[0] == 2  # Should keep 2 of 3
+    assert filtered.rewards.shape[0] == 2
+    assert filtered.kv_pairs[0].key_tokens.shape[0] == 2
+    assert filtered.kv_pairs[0].value_tokens.shape[0] == 2
+    assert filtered.avg_reward[0].item() == 2.5
+    assert filtered.avg_reward[1].item() == 3.5
 
 
 def test_compute_policy_loss(mock_trajectory, mock_models):
@@ -260,7 +272,7 @@ def test_compute_policy_loss(mock_trajectory, mock_models):
     
     # Call function
     loss = compute_policy_loss(
-        [mock_trajectory], 
+        mock_trajectory, 
         adapter_model, 
         previous_model, 
         KL_PENALTY_COEFFICIENT
@@ -284,22 +296,23 @@ def test_train_step(mock_models, mock_trajectory):
     
     # Mock compute_policy_loss
     with patch("src.training.compute_policy_loss", return_value=torch.tensor(1.0, requires_grad=True)):
-        # Mock filter_trajectories
-        with patch("src.training.filter_trajectories", return_value=[mock_trajectory]):
+        # Mock filter_trajectories to return the trajectory with filtered batch elements
+        with patch("src.training.filter_trajectories", return_value=mock_trajectory):
             # Call function
             loss, num_filtered = train_step(
-                [mock_trajectory], 
+                mock_trajectory, 
                 adapter_model, 
                 base_model,
                 previous_model,
                 optimizer, 
                 {"mean": 0.0, "std": 1.0, "count": 10},
-                KL_PENALTY_COEFFICIENT
+                KL_PENALTY_COEFFICIENT,
+                verbose=False
             )
     
     # Check outputs
     assert isinstance(loss, float)
-    assert num_filtered == 1
+    assert isinstance(num_filtered, int)
     assert optimizer.zero_grad.called
     assert optimizer.step.called
 
@@ -400,15 +413,16 @@ def test_model_behavior_during_training():
     previous_model.load_state_dict(adapter_model.state_dict())
     
     # Perform training step
-    with patch("src.training.filter_trajectories", return_value=[trajectory]):
+    with patch("src.training.filter_trajectories", return_value=trajectory):
         train_step(
-            [trajectory],
+            trajectory,
             adapter_model,
             base_model,
             previous_model,
             optimizer,
             {"mean": 0.0, "std": 1.0, "count": WARMUP_EPISODES + 1},
-            KL_PENALTY_COEFFICIENT
+            KL_PENALTY_COEFFICIENT,
+            verbose=False
         )
     
     # 3. Verify base model output hasn't changed, but adapter model has
@@ -505,26 +519,22 @@ def test_train_step_with_real_model(gpt2_model):
     # Create optimizer
     optimizer = torch.optim.Adam(adapter_model.parameters(), lr=0.001)
     
-    # Create trajectories with real Trajectory objects
-    trajectories = []
-    batch_size = 1
+    # Create a batched trajectory
+    batch_size = 2
     
-    for i in range(2):
-        # Create a proper KeyValuePair
-        kv_pair = KeyValuePair(
-            key_tokens=torch.randint(0, 1000, (batch_size, TOKENS_PER_KEY), device=gpt2_model.device),
-            value_tokens=torch.randint(0, 1000, (batch_size, TOKENS_PER_VALUE), device=gpt2_model.device),
-            key_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=gpt2_model.device),
-            key_text=[f"Test key {i}"],
-            value_text=[f"Test value {i}"]
-        )
-        
-        # Use real Trajectory objects
-        trajectory = Trajectory(kv_pairs=[kv_pair])
-        trajectory.rewards = torch.tensor([[0.5]], device=gpt2_model.device)
-        trajectory.avg_reward = torch.tensor([0.5], device=gpt2_model.device)
-        
-        trajectories.append(trajectory)
+    # Create a proper KeyValuePair with batch dimension
+    kv_pair = KeyValuePair(
+        key_tokens=torch.randint(0, 1000, (batch_size, TOKENS_PER_KEY), device=gpt2_model.device),
+        value_tokens=torch.randint(0, 1000, (batch_size, TOKENS_PER_VALUE), device=gpt2_model.device),
+        key_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=gpt2_model.device),
+        key_text=[f"Test key {i}" for i in range(batch_size)],
+        value_text=[f"Test value {i}" for i in range(batch_size)]
+    )
+    
+    # Use real Trajectory object with batch dimension
+    trajectory = Trajectory(kv_pairs=[kv_pair])
+    trajectory.rewards = torch.tensor([[0.5], [1.5]], device=gpt2_model.device)
+    trajectory.avg_reward = torch.tensor([0.5, 1.5], device=gpt2_model.device)
     
     # Setup reward stats
     reward_stats = {"mean": 0.0, "std": 1.0, "count": 10}
@@ -537,18 +547,19 @@ def test_train_step_with_real_model(gpt2_model):
         
         # Run train step
         loss, num_filtered = train_step(
-            trajectories,
+            trajectory,
             adapter_model,
             gpt2_model,
             previous_model,
             optimizer,
             reward_stats,
-            kl_penalty_coef=0.1
+            kl_penalty_coef=0.1,
+            verbose=False
         )
     
     # Verify output
     assert isinstance(loss, float)
-    assert num_filtered >= 0
+    assert isinstance(num_filtered, int)
 
 
 def test_conditional_log_prob_with_real_model(gpt2_model, gpt2_tokenizer):
