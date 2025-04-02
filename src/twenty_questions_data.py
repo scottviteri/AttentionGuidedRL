@@ -9,7 +9,7 @@ import os
 import json
 import torch
 import random
-from typing import Dict, Iterator, List, Tuple, Optional, Any
+from typing import Dict, Iterator, List, Tuple, Optional, Any, Callable
 from dataclasses import dataclass
 
 from transformers import PreTrainedTokenizer
@@ -106,7 +106,7 @@ def generate_object_trajectory(
     object_data: Dict,
     questions: List[str],
     tokenizer: PreTrainedTokenizer,
-    embedding_fn: Any,
+    embedding_fn: Callable,
     num_questions: int = 5
 ) -> List[QKVStep]:
     """
@@ -193,7 +193,7 @@ def create_twenty_questions_context(
 
 def iter_twenty_questions_batches(
     batch_size: int = 1,
-    embedding_fn: Any = None,
+    embedding_fn: Callable = None,
     tokenizer: PreTrainedTokenizer = None,
     dataset_path: str = None,
     num_questions_per_trajectory: int = 5,
@@ -259,7 +259,7 @@ def get_twenty_questions_pool(
     object_data: Dict,
     questions: List[str],
     tokenizer: PreTrainedTokenizer,
-    embedding_fn: Any,
+    embedding_fn: Callable,
 ) -> List[QKVStep]:
     """
     Get a pool of all question-answer pairs for a given object.

@@ -38,7 +38,11 @@ from src.model import (
     load_checkpoint,
     create_model_copy,
 )
-from src.embeddings import ExtractEmbeddings
+from src.embeddings import (
+    register_embedding_hook,
+    extract_embeddings,
+    compute_similarity,
+)
 from src.training import (
     Trajectory,
     generate_query,
@@ -51,7 +55,7 @@ from src.training import (
 def sample_twenty_questions_step(
     model: torch.nn.Module,
     tokenizer: Any,
-    embedding_extractor: ExtractEmbeddings,
+    embeddings_dict: Dict,
     context: torch.Tensor,
     context_text: str,
     available_pool: List[QKVStep],
@@ -63,7 +67,7 @@ def sample_twenty_questions_step(
     Args:
         model: The language model
         tokenizer: The tokenizer
-        embedding_extractor: Embedding extraction utility
+        embeddings_dict: Dictionary to store embeddings from hook
         context: Current context tokens [batch_size, context_length]
         context_text: Current context as text
         available_pool: Pool of available QKVStep objects
@@ -77,8 +81,10 @@ def sample_twenty_questions_step(
     query_text = tokenizer.decode(query_tokens[0])
     
     # Extract query embedding
-    query_embedding = embedding_extractor.extract_embeddings(
-        query_tokens.to(DEVICE)
+    query_embedding = extract_embeddings(
+        model, 
+        query_tokens.to(DEVICE),
+        embeddings_dict
     ).detach()
     
     # Compute similarity with all keys in the pool
@@ -117,7 +123,7 @@ def sample_twenty_questions_step(
 def build_twenty_questions_trajectory(
     model: torch.nn.Module,
     tokenizer: Any,
-    embedding_extractor: ExtractEmbeddings,
+    embeddings_dict: Dict,
     object_data: Dict,
     questions: List[str],
     trajectory_length: int = 5,
@@ -129,7 +135,7 @@ def build_twenty_questions_trajectory(
     Args:
         model: The language model
         tokenizer: The tokenizer
-        embedding_extractor: Embedding extraction utility
+        embeddings_dict: Dictionary to store embeddings from hook
         object_data: The object data containing name and answers
         questions: List of all available questions
         trajectory_length: Number of steps in the trajectory
@@ -142,9 +148,12 @@ def build_twenty_questions_trajectory(
     context_tokens = create_twenty_questions_context(tokenizer)
     context_text = "I am thinking of an object. You are trying to guess what it is by asking yes/no questions. Please ask a question that would help you identify the object."
     
+    # Define an embedding extraction function
+    extract_fn = lambda x: extract_embeddings(model, x, embeddings_dict)
+    
     # Get all question-answer pairs for this object
     available_pool = get_twenty_questions_pool(
-        object_data, questions, tokenizer, embedding_extractor.extract_embeddings
+        object_data, questions, tokenizer, extract_fn
     )
     
     # Limit trajectory length if fewer questions are available
@@ -159,7 +168,7 @@ def build_twenty_questions_trajectory(
             
         # Sample a step based on query similarity
         step = sample_twenty_questions_step(
-            model, tokenizer, embedding_extractor, context_tokens, context_text,
+            model, tokenizer, embeddings_dict, context_tokens, context_text,
             available_pool, temperature
         )
         
@@ -179,7 +188,8 @@ def train_twenty_questions(
     adapter_model: torch.nn.Module,
     base_model: torch.nn.Module,
     tokenizer: Any,
-    embedding_extractor: ExtractEmbeddings,
+    embeddings_dict: Dict,
+    hook_remover: Any,
     dataset_path: str = None,
     num_episodes: int = 1000,
     trajectory_length: int = 5,
@@ -197,7 +207,8 @@ def train_twenty_questions(
         adapter_model: The model with LoRA adapter
         base_model: The base model without LoRA
         tokenizer: The tokenizer
-        embedding_extractor: Embedding extraction utility
+        embeddings_dict: Dictionary to store embeddings from hook
+        hook_remover: Function to remove the hook 
         dataset_path: Path to the dataset
         num_episodes: Number of episodes to train for
         trajectory_length: Number of steps in each trajectory
@@ -257,7 +268,7 @@ def train_twenty_questions(
         
         # Build a trajectory for this object
         trajectory, context_tokens = build_twenty_questions_trajectory(
-            adapter_model, tokenizer, embedding_extractor,
+            adapter_model, tokenizer, embeddings_dict,
             object_data, questions, trajectory_length
         )
         
@@ -333,27 +344,32 @@ def main():
     # Set up models and tokenizer
     base_model, adapter_model, tokenizer = setup_model_and_tokenizer()
     
-    # Initialize embedding extractor
-    embedding_extractor = ExtractEmbeddings(adapter_model)
+    # Register embedding hooks
+    embeddings_dict, hook_remover = register_embedding_hook(adapter_model)
     
     # Create checkpoint directory
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     
-    # Train the model
-    train_twenty_questions(
-        adapter_model=adapter_model,
-        base_model=base_model,
-        tokenizer=tokenizer,
-        embedding_extractor=embedding_extractor,
-        dataset_path=args.dataset,
-        num_episodes=args.episodes,
-        trajectory_length=args.trajectory_length,
-        batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        kl_penalty_coef=args.kl_penalty,
-        log_interval=args.log_interval,
-        resume=args.resume,
-    )
+    try:
+        # Train the model
+        train_twenty_questions(
+            adapter_model=adapter_model,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            embeddings_dict=embeddings_dict,
+            hook_remover=hook_remover,
+            dataset_path=args.dataset,
+            num_episodes=args.episodes,
+            trajectory_length=args.trajectory_length,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            kl_penalty_coef=args.kl_penalty,
+            log_interval=args.log_interval,
+            resume=args.resume,
+        )
+    finally:
+        # Make sure to remove the hook
+        hook_remover()
 
 
 if __name__ == "__main__":
