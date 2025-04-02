@@ -43,7 +43,7 @@ python -m pytest
 
 ## Usage
 
-### Training
+### Training with Wikipedia
 
 Run the training with default parameters:
 ```bash
@@ -55,13 +55,24 @@ With custom parameters:
 python -m src.main --batch-size 4 --trajectory-length 5 --episodes 1000
 ```
 
-### Command-line Arguments
+### Training with Twenty Questions Dataset
 
-- `--batch-size`: Number of examples to process in parallel (default: 2)
-- `--resume`: Resume training from the latest checkpoint
+The repository includes a modified training procedure that uses the twenty questions dataset with a different reinforcement learning task:
+
+```bash
+python -m src.twenty_questions_train --trajectory-length 10 --episodes 2000
+```
+
+#### Command-line Arguments for Twenty Questions Training
+
+- `--dataset`: Path to the dataset file (default: uses data/20q_dataset.json)
 - `--episodes`: Number of episodes to train for (default: 1000)
-- `--trajectory-length`: Number of key-value pairs in each trajectory (default: 3)
-- `--log-interval`: Interval for logging statistics (default: 10)
+- `--batch-size`: Batch size for training (default: 1)
+- `--trajectory-length`: Number of question-answer pairs in each trajectory (default: 5)
+- `--learning-rate`: Learning rate for optimization (default: from config)
+- `--kl-penalty`: KL penalty coefficient (default: from config)
+- `--log-interval`: Interval for logging statistics (default: from config)
+- `--resume`: Resume training from the latest checkpoint
 
 ### Dataset Generation
 
@@ -71,6 +82,14 @@ The repository includes scripts for generating a dataset for the 20 Questions ga
 python scripts/twenty_questions/generate_20q_dataset.py
 ```
 
+For analyzing the generated dataset:
+
+```bash
+python scripts/twenty_questions/analyze_20q_dataset.py --visualize
+```
+
+See `scripts/twenty_questions/README.md` for more details.
+
 ## Project Structure
 
 ```
@@ -78,25 +97,27 @@ attention-guided-rl/
 ├── README.md
 ├── requirements.txt
 ├── src/
-│   ├── main.py              # Entry point for training
-│   ├── model.py             # Model setup with LoRA adaptation
-│   ├── embeddings.py        # Embedding extraction and similarity computation
-│   ├── data.py              # Functional iterator-based dataloader
-│   ├── training.py          # RL training loop and policy optimization
-│   └── config.py            # Configuration parameters
+│   ├── main.py                 # Entry point for Wikipedia training
+│   ├── model.py                # Model setup with LoRA adaptation
+│   ├── embeddings.py           # Embedding extraction and similarity computation
+│   ├── data.py                 # Functional iterator-based dataloader
+│   ├── training.py             # RL training loop and policy optimization
+│   ├── config.py               # Configuration parameters
+│   ├── twenty_questions_data.py  # Data handling for 20Q dataset
+│   └── twenty_questions_train.py # Training script for 20Q dataset
 ├── scripts/
-│   └── twenty_questions/    # 20 Questions dataset generation
+│   └── twenty_questions/       # 20 Questions dataset generation
 │       ├── generate_20q_dataset.py
 │       ├── analyze_20q_dataset.py
 │       └── README.md
-├── data/                    # Generated datasets
-├── visualizations/          # Analysis visualizations
+├── data/                       # Generated datasets
+├── visualizations/             # Analysis visualizations
 └── tests/
-    ├── test_model.py        # Tests for model setup
-    ├── test_embeddings.py   # Tests for embedding extraction
-    ├── test_data.py         # Tests for data loading
-    ├── test_training.py     # Tests for training loop
-    └── test_main.py         # Tests for main entry point
+    ├── test_model.py           # Tests for model setup
+    ├── test_embeddings.py      # Tests for embedding extraction
+    ├── test_data.py            # Tests for data loading
+    ├── test_training.py        # Tests for training loop
+    └── test_main.py            # Tests for main entry point
 ```
 
 ## Implementation Details
@@ -115,6 +136,21 @@ Embeddings are extracted from the last attention layer of the model, with differ
 6. Repeat to build a trajectory
 7. Compute rewards by comparing log probabilities
 8. Update the policy using REINFORCE with KL regularization
+
+### Twenty Questions Training
+
+The twenty questions training procedure follows the same general reinforcement learning approach, but adapted to simulate a 20 questions game:
+
+1. Start with a generic prompt that doesn't reveal the object ("I am thinking of an object...")
+2. Generate a question based on current context
+3. Use attention to select the most relevant predefined question from the dataset
+4. Retrieve the corresponding YES/NO answer for the selected question
+5. Add the question and its answer to the context
+6. Repeat to build a trajectory of question-answer pairs
+7. Compute rewards based on improvement in predicting answers
+8. Update the policy using REINFORCE with KL regularization
+
+The model learns to ask effective questions that efficiently narrow down the possible objects. The reward function encourages the model to select questions that provide the most information gain about the hidden object.
 
 ### Checkpointing
 

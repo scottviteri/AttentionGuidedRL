@@ -164,22 +164,20 @@ def generate_object_trajectory(
     return trajectory
 
 
-def encode_object_as_context(
-    object_name: str,
+def create_twenty_questions_context(
     tokenizer: PreTrainedTokenizer
 ) -> torch.Tensor:
     """
-    Encode an object name as initial context.
+    Create an initial context for the 20 questions game without revealing the object.
 
     Args:
-        object_name: The name of the object
         tokenizer: The tokenizer to use
 
     Returns:
-        torch.Tensor: The encoded object name [1, seq_length]
+        torch.Tensor: The encoded context [1, seq_length]
     """
-    # Create a prompt with the object name
-    prompt = f"Object: {object_name}"
+    # Create a prompt for playing 20 questions
+    prompt = "I am thinking of an object. You are trying to guess what it is by asking yes/no questions. Please ask a question that would help you identify the object."
     
     # Encode the prompt
     context_ids = tokenizer.encode(
@@ -246,8 +244,8 @@ def iter_twenty_questions_batches(
                 num_questions_per_trajectory
             )
             
-            # Encode object name as context
-            context_tokens = encode_object_as_context(obj_data["object"], tokenizer)
+            # Create a generic 20 questions context (without revealing the object)
+            context_tokens = create_twenty_questions_context(tokenizer)
             
             batch_trajectories.append(trajectory)
             batch_contexts.append(context_tokens)
