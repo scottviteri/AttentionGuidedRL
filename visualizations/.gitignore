@@ -1,0 +1,10 @@
+# Visualization output files
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.pdf
+
+# Except for example visualizations
+!example_*.png

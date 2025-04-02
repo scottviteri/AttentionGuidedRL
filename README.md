@@ -12,6 +12,7 @@ Key features:
 - Parameter-efficient training using LoRA adapters
 - Self-directed curriculum learning via reinforcement learning
 - Extensive test coverage for reliability
+- 20 Questions dataset generation for training and evaluation
 
 ## Requirements
 
@@ -62,6 +63,14 @@ python -m src.main --batch-size 4 --trajectory-length 5 --episodes 1000
 - `--trajectory-length`: Number of key-value pairs in each trajectory (default: 3)
 - `--log-interval`: Interval for logging statistics (default: 10)
 
+### Dataset Generation
+
+The repository includes scripts for generating a dataset for the 20 Questions game using Claude API:
+
+```bash
+python scripts/twenty_questions/generate_20q_dataset.py
+```
+
 ## Project Structure
 
 ```
@@ -75,6 +84,13 @@ attention-guided-rl/
 │   ├── data.py              # Functional iterator-based dataloader
 │   ├── training.py          # RL training loop and policy optimization
 │   └── config.py            # Configuration parameters
+├── scripts/
+│   └── twenty_questions/    # 20 Questions dataset generation
+│       ├── generate_20q_dataset.py
+│       ├── analyze_20q_dataset.py
+│       └── README.md
+├── data/                    # Generated datasets
+├── visualizations/          # Analysis visualizations
 └── tests/
     ├── test_model.py        # Tests for model setup
     ├── test_embeddings.py   # Tests for embedding extraction

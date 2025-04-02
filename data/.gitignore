@@ -1,0 +1,5 @@
+# 20 Questions dataset files
+*.json
+
+# Except for small example files
+!example_*.json
