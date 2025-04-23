@@ -176,8 +176,12 @@ def create_twenty_questions_context(
     Returns:
         torch.Tensor: The encoded context [1, seq_length]
     """
-    # Create a prompt for playing 20 questions
-    prompt = "I am thinking of an object. You are trying to guess what it is by asking yes/no questions. Please ask a question that would help you identify the object."
+    # Create a prompt for playing 20 questions with detailed instructions
+    prompt = (
+        "I am thinking of an object. You are playing 20 questions to guess what it is. "
+        "You need to ask yes/no questions that will help you identify the object efficiently. "
+        "Try to ask questions that will divide the space of possible objects in half with each question."
+    )
     
     # Encode the prompt
     context_ids = tokenizer.encode(

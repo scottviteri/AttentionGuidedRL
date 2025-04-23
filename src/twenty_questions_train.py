@@ -62,7 +62,7 @@ def sample_twenty_questions_step(
     temperature: float = 1.0,
 ) -> QKVStep:
     """
-    Sample a question-answer step from the available pool based on query similarity.
+    Sample a question-answer step from the available pool based on the context embedding similarity.
 
     Args:
         model: The language model
@@ -76,14 +76,13 @@ def sample_twenty_questions_step(
     Returns:
         QKVStep: The sampled step
     """
-    # Generate a query based on the current context
-    query_tokens = generate_query(model, tokenizer, [context_text])
-    query_text = tokenizer.decode(query_tokens[0])
+    # Instead of generating a query, we'll directly compute the similarity between
+    # the context embedding and all available questions
     
-    # Extract query embedding
-    query_embedding = extract_embeddings(
+    # Extract context embedding
+    context_embedding = extract_embeddings(
         model, 
-        query_tokens.to(DEVICE),
+        context.to(DEVICE),
         embeddings_dict
     ).detach()
     
@@ -92,9 +91,9 @@ def sample_twenty_questions_step(
     for step in available_pool:
         key_embedding = step.key_embedding
         
-        # Calculate cosine similarity between query and key
+        # Calculate cosine similarity between context and key
         similarity = torch.nn.functional.cosine_similarity(
-            query_embedding, key_embedding, dim=-1
+            context_embedding, key_embedding, dim=-1
         )
         
         similarities.append(similarity.item())
@@ -109,13 +108,36 @@ def sample_twenty_questions_step(
     # Get the selected step
     selected_step = available_pool[index]
     
+    # The query text is just the selected question
+    query_text = selected_step.key_text[0]
+    
+    # Create query tokens
+    query_tokens = tokenizer(
+        [query_text],
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        add_special_tokens=False
+    ).input_ids.to(DEVICE)
+    
+    # Get query embedding
+    query_embedding = extract_embeddings(
+        model, 
+        query_tokens,
+        embeddings_dict
+    ).detach()
+    
     # Add query information to the step
     selected_step.query_text = [query_text]
-    selected_step.query_tokens = query_tokens.to(DEVICE)
+    selected_step.query_tokens = query_tokens
     selected_step.query_embedding = query_embedding
     
     # Remove the selected step from the pool to avoid repetition
     available_pool.pop(index)
+    
+    # Print debug info about the selected question
+    print(f"Selected question: {query_text}")
+    print(f"Answer: {selected_step.value_text[0]}")
     
     return selected_step
 
@@ -146,7 +168,16 @@ def build_twenty_questions_trajectory(
     """
     # Create initial context for the 20 questions game (without revealing the object)
     context_tokens = create_twenty_questions_context(tokenizer)
-    context_text = "I am thinking of an object. You are trying to guess what it is by asking yes/no questions. Please ask a question that would help you identify the object."
+    
+    # Use a more detailed context description to guide the model
+    context_text = (
+        "I am thinking of an object. You are playing 20 questions to guess what it is. "
+        "You need to ask yes/no questions that will help you identify the object efficiently. "
+        "Try to ask questions that will divide the space of possible objects in half with each question."
+    )
+    
+    # Display the object being used (for debugging)
+    print(f"\nBuilding trajectory for object: {object_data['object']}")
     
     # Define an embedding extraction function
     extract_fn = lambda x: extract_embeddings(model, x, embeddings_dict)
@@ -161,7 +192,9 @@ def build_twenty_questions_trajectory(
     
     # Sample steps to build the trajectory
     qkv_steps = []
-    for _ in range(trajectory_length):
+    history = []  # Track question-answer history for display only
+    
+    for step_idx in range(trajectory_length):
         # Break if pool is empty
         if not available_pool:
             break
@@ -174,9 +207,14 @@ def build_twenty_questions_trajectory(
         
         qkv_steps.append(step)
         
-        # Update context text for the next iteration
-        context_text += f" {step.query_text[0]}" if step.query_text else ""
-        context_text += f" {step.key_text[0]} {step.value_text[0]}"
+        # Add to history for tracking (not used for generation)
+        history.append(f"Q{step_idx+1}: {step.query_text[0]} A: {step.value_text[0]}")
+    
+    # Display the full question-answer history
+    print("\nFull Q&A history:")
+    for entry in history:
+        print(f"  {entry}")
+    print()
     
     # Create the trajectory
     trajectory = Trajectory(qkv_steps=qkv_steps)
