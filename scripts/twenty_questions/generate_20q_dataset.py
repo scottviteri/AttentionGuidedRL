@@ -127,6 +127,33 @@ def load_existing_dataset(output_file):
             print(f"Warning: Could not parse existing file {output_file}, starting fresh.")
     return None
 
+def generate_objects_in_batches(total_needed, batch_size=50):
+    """Generate objects in smaller batches to avoid API limitations."""
+    all_objects = []
+    remaining = total_needed
+    
+    while remaining > 0:
+        current_batch = min(batch_size, remaining)
+        print(f"Generating batch of {current_batch} objects...")
+        
+        try:
+            batch_objects = generate_objects(current_batch)
+            all_objects.extend(batch_objects)
+            remaining -= current_batch
+            print(f"Successfully generated {len(batch_objects)} objects. {remaining} remaining.")
+            
+            # Add a small delay between batches
+            if remaining > 0:
+                time.sleep(1.0)
+                
+        except Exception as e:
+            print(f"Error generating batch: {str(e)}")
+            print(f"Retrying with smaller batch size...")
+            # If we fail, try with half the batch size, but minimum 5
+            batch_size = max(5, batch_size // 2)
+    
+    return all_objects
+
 def create_dataset(num_questions=20, num_objects=100, output_file=os.path.join(DATA_DIR, "20q_dataset.json"), resume=False):
     """Create a dataset for the 20 questions game."""
     
@@ -142,31 +169,61 @@ def create_dataset(num_questions=20, num_objects=100, output_file=os.path.join(D
         
         # Find which objects are already processed
         processed_objects = set(item["object"] for item in dataset["data"])
+        num_already_processed = len(processed_objects)
         
         # If we have the full object list in the dataset
         if "all_objects" in dataset:
-            objects = dataset["all_objects"]
+            existing_objects = dataset["all_objects"]
+            
+            # Check if we need to generate more objects
+            if num_objects > len(existing_objects):
+                print(f"Existing dataset has {len(existing_objects)} objects, but {num_objects} requested.")
+                additional_needed = num_objects - len(existing_objects)
+                print(f"Generating {additional_needed} additional objects in batches...")
+                
+                # Generate objects in smaller batches
+                additional_objects = generate_objects_in_batches(additional_needed)
+                
+                # Add new objects to the list, avoiding duplicates
+                existing_object_set = set(existing_objects)
+                unique_new_objects = [obj for obj in additional_objects if obj not in existing_object_set]
+                
+                # Update the full object list
+                objects = existing_objects + unique_new_objects
+                print(f"Added {len(unique_new_objects)} new unique objects. Total objects: {len(objects)}")
+                dataset["all_objects"] = objects
+                
+                # Save immediately after adding objects in case of later errors
+                with open(output_file, "w") as f:
+                    json.dump(dataset, f, indent=2)
+            else:
+                objects = existing_objects
+                print(f"Found {len(objects)} total objects, {len(processed_objects)} already processed.")
+            
             # Filter out objects that have already been processed
             objects_to_process = [obj for obj in objects if obj not in processed_objects]
-            print(f"Found {len(objects)} total objects, {len(processed_objects)} already processed.")
             print(f"Continuing with remaining {len(objects_to_process)} objects.")
         else:
             # Generate new objects if we don't have the full list
-            print(f"Generating {num_objects} new objects...")
-            objects = generate_objects(num_objects)
+            print(f"Generating {num_objects} new objects in batches...")
+            objects = generate_objects_in_batches(num_objects)
             # Store the full object list for future resuming
             dataset["all_objects"] = objects
             objects_to_process = [obj for obj in objects if obj not in processed_objects]
             print(f"Generated {len(objects)} objects, {len(processed_objects)} already processed.")
             print(f"Continuing with remaining {len(objects_to_process)} objects.")
+            
+            # Save immediately after generating objects
+            with open(output_file, "w") as f:
+                json.dump(dataset, f, indent=2)
     else:
         # Start fresh
         print(f"Generating {num_questions} questions...")
         questions = generate_questions(num_questions)
         print("Questions generated.")
         
-        print(f"Generating {num_objects} objects...")
-        objects = generate_objects(num_objects)
+        print(f"Generating {num_objects} new objects in batches...")
+        objects = generate_objects_in_batches(num_objects)
         print("Objects generated.")
         
         dataset = {
@@ -176,7 +233,12 @@ def create_dataset(num_questions=20, num_objects=100, output_file=os.path.join(D
         }
         
         processed_objects = set()
+        num_already_processed = 0
         objects_to_process = objects
+        
+        # Save immediately after initial generation
+        with open(output_file, "w") as f:
+            json.dump(dataset, f, indent=2)
     
     # Process objects
     print("Getting answers for each object...")
@@ -185,7 +247,8 @@ def create_dataset(num_questions=20, num_objects=100, output_file=os.path.join(D
         if obj in processed_objects:
             continue
             
-        print(f"Processing object {i+1}/{len(objects_to_process)} ({len(processed_objects)+1}/{len(objects)}): {obj}")
+        current_processed = num_already_processed + i
+        print(f"Processing object {i+1}/{len(objects_to_process)} ({current_processed+1}/{len(objects)}): {obj}")
         
         try:
             answers = get_answers_for_object(obj, questions)
@@ -195,6 +258,9 @@ def create_dataset(num_questions=20, num_objects=100, output_file=os.path.join(D
                 "object": obj,
                 "answers": answers
             })
+            
+            # Update processed objects set
+            processed_objects.add(obj)
             
             # Save progress after each object in case of interruption
             with open(output_file, "w") as f:
@@ -211,6 +277,7 @@ def create_dataset(num_questions=20, num_objects=100, output_file=os.path.join(D
                 json.dump(dataset, f, indent=2)
     
     print(f"Dataset created and saved to {output_file}")
+    print(f"Total objects: {len(objects)}, Processed objects: {len(processed_objects)}")
     return dataset
 
 if __name__ == "__main__":

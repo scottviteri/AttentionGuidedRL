@@ -303,13 +303,14 @@ def update_reward_stats(
     return {"mean": new_mean, "std": new_std, "count": new_count}
 
 
-def filter_trajectories(trajectory: Trajectory, reward_stats: Dict[str, float]) -> Optional[Trajectory]:
+def filter_trajectories(trajectory: Trajectory, reward_stats: Dict[str, float], percentile: float = 90.0) -> Optional[Trajectory]:
     """
     Filter a batch of trajectories based on rewards, keeping only those that exceed a certain threshold.
     
     Args:
         trajectory: The batch of trajectories to filter
         reward_stats: Statistics about rewards used for normalization
+        percentile: Percentile threshold (0-100) to keep the top X% of datapoints (e.g., 90 for top 10%)
         
     Returns:
         Filtered trajectory, or None if no trajectories pass the filter
@@ -318,11 +319,28 @@ def filter_trajectories(trajectory: Trajectory, reward_stats: Dict[str, float]) 
         # Not enough data to filter meaningfully
         return trajectory
     
-    # Calculate threshold as mean reward
-    threshold = reward_stats["mean"]
+    # Get batch rewards
+    batch_rewards = trajectory.avg_reward
     
-    # Get batch indices where reward exceeds threshold
-    batch_mask = trajectory.avg_reward > threshold
+    # If batch size is 1, always keep it during early training
+    if batch_rewards.shape[0] == 1:
+        return trajectory
+    
+    # Calculate percentile threshold - we need to sort the rewards
+    # Get the value at the specified percentile (e.g., 90th percentile for top 10%)
+    sorted_rewards, _ = torch.sort(batch_rewards)
+    threshold_idx = max(0, int(len(sorted_rewards) * (1 - percentile / 100.0)) - 1)
+    
+    # If threshold_idx is negative or beyond the array bounds, use the minimum value
+    # This ensures we keep at least one element
+    if threshold_idx < 0 or threshold_idx >= len(sorted_rewards):
+        threshold_idx = 0
+    
+    # Get the threshold value
+    threshold = sorted_rewards[threshold_idx]
+    
+    # Get batch indices where reward exceeds or equals threshold
+    batch_mask = trajectory.avg_reward >= threshold
     
     # If no batch elements pass the threshold, return None
     if not torch.any(batch_mask):
@@ -448,7 +466,7 @@ def compute_policy_loss(
         ).squeeze(-1)  # [batch_size, seq_length-1]
         
         # Compute policy gradient loss
-        batch_policy_loss = -(token_log_probs.sum(dim=-1) * rewards).mean()
+        batch_policy_loss = -(token_log_probs.mean(dim=-1) * rewards).mean()
         policy_loss += batch_policy_loss
         
         # Compute KL divergence loss (regularization)
@@ -493,6 +511,7 @@ def train_step(
     reward_stats: Dict[str, float],
     kl_penalty_coef: float,
     verbose: bool = False,
+    percentile: float = 90.0,  # Default to top 10%
 ) -> Tuple[float, int, float, float]:
     """
     Perform a single training step.
@@ -506,6 +525,7 @@ def train_step(
         reward_stats: Reward statistics for filtering
         kl_penalty_coef: KL penalty coefficient (beta)
         verbose: Flag to enable verbose logging
+        percentile: Percentile to use for threshold (e.g., 90.0 means top 10% are kept)
         
     Returns:
         Tuple[float, int, float, float]: 
@@ -531,7 +551,7 @@ def train_step(
                 print(f"Batch element rewards: {', '.join(rewards)}")
     
     # Filter trajectory based on reward
-    filtered_trajectory = filter_trajectories(trajectory, reward_stats)
+    filtered_trajectory = filter_trajectories(trajectory, reward_stats, percentile)
     
     # Skip update if no batch elements meet the criteria
     if filtered_trajectory is None:
@@ -545,8 +565,14 @@ def train_step(
     if verbose:
         print(f"Filtered batch size: {filtered_batch_size}/{trajectory.avg_reward.shape[0]}")
         if reward_stats["count"] > WARMUP_EPISODES:
-            threshold = reward_stats["mean"] + reward_stats["std"]
-            print(f"Filtering threshold: {threshold:.4f}")
+            # If we have batch rewards, calculate the actual threshold used
+            if trajectory.avg_reward is not None and trajectory.avg_reward.shape[0] > 1:
+                sorted_rewards, _ = torch.sort(trajectory.avg_reward)
+                threshold_idx = max(0, int(len(sorted_rewards) * (1 - percentile / 100.0)) - 1)
+                threshold = sorted_rewards[threshold_idx].item()
+                print(f"Using top {100-percentile:.1f}% filtering - threshold: {threshold:.4f}")
+            else:
+                print(f"Using top {100-percentile:.1f}% filtering - all datapoints kept with small batch")
     
     # Zero gradients
     optimizer.zero_grad()

@@ -266,6 +266,8 @@ def parse_args():
     parser.add_argument("--verbose", action="store_true", help="Enable verbose trajectory logging")
     parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE, help="Learning rate for training")
     parser.add_argument("--run-name", type=str, default=None, help="Name for this training run")
+    parser.add_argument("--training-percentile", type=float, default=90.0,
+                        help="Percentile threshold for training (e.g., 90.0 means train on top 10%% of datapoints)")
     return parser.parse_args()
 
 
@@ -410,6 +412,9 @@ def main():
                     print(f"  Std: {reward_stats['std']:.4f}")
                     print(f"  Count: {reward_stats['count']}")
             
+            # Log the training percentile setting
+            logging.info(f"Training on top {100-args.training_percentile:.1f}% of datapoints (percentile threshold: {args.training_percentile})")
+            
             # Perform training step
             total_loss, num_filtered, policy_loss, kl_loss = train_step(
                 trajectory,
@@ -419,7 +424,8 @@ def main():
                 optimizer,
                 reward_stats,
                 KL_PENALTY_COEFFICIENT,
-                verbose=args.verbose
+                verbose=args.verbose,
+                percentile=args.training_percentile  # Pass the percentile parameter
             )
             
             # Calculate average reward across the batch
