@@ -16,14 +16,16 @@ from src.config import DEVICE, MODEL_TYPE
 
 def register_embedding_hook(
     model, 
-    embed_type: str = "query"
+    embed_type: str = "query",
+    layer_idx: int = -1
 ) -> Tuple[Dict, Callable]:
     """
-    Register a hook to extract embeddings from the last attention layer.
+    Register a hook to extract embeddings from an attention layer.
     
     Args:
         model: The language model to extract embeddings from
         embed_type: Type of embedding to extract, either "query" or "key"
+        layer_idx: Which layer to extract from (negative indexing supported, default: -1 for last layer)
         
     Returns:
         Tuple[Dict, Callable]: A dictionary to store the embeddings and a function to remove the hook
@@ -32,10 +34,10 @@ def register_embedding_hook(
     embeddings_dict = {"embeddings": None}
     
     if MODEL_TYPE == "llama":
-        return register_llama_embedding_hook(model, embeddings_dict, embed_type)
+        return register_llama_embedding_hook(model, embeddings_dict, embed_type, layer_idx)
     elif MODEL_TYPE == "gpt2":
         # For GPT-2, we'll need to handle this differently as it uses a combined QKV projection
-        return register_gpt2_embedding_hook(model, embeddings_dict, embed_type)
+        return register_gpt2_embedding_hook(model, embeddings_dict, embed_type, layer_idx)
     else:
         raise ValueError(f"Unsupported model type: {MODEL_TYPE}")
 
@@ -43,7 +45,8 @@ def register_embedding_hook(
 def register_llama_embedding_hook(
     model, 
     embeddings_dict: Dict,
-    embed_type: str = "query"
+    embed_type: str = "query",
+    layer_idx: int = -1
 ) -> Tuple[Dict, Callable]:
     """
     Register a hook for Llama models.
@@ -52,15 +55,20 @@ def register_llama_embedding_hook(
         model: The Llama language model
         embeddings_dict: Dictionary to store embeddings
         embed_type: Type of embedding to extract, either "query" or "key"
+        layer_idx: Which layer to extract from (negative indexing supported)
         
     Returns:
         Tuple[Dict, Callable]: The embeddings dictionary and hook removal function
     """
+    # Handle negative indexing
+    if layer_idx < 0:
+        layer_idx = len(model.model.model.layers) + layer_idx
+    
     # Get the target module based on embed_type
     if embed_type.lower() == "query":
-        target_module = model.model.model.layers[-1].self_attn.q_proj
+        target_module = model.model.model.layers[layer_idx].self_attn.q_proj
     elif embed_type.lower() == "key":
-        target_module = model.model.model.layers[-1].self_attn.k_proj
+        target_module = model.model.model.layers[layer_idx].self_attn.k_proj
     else:
         raise ValueError(f"Unsupported embed_type: {embed_type}. Must be 'query' or 'key'")
     
@@ -79,7 +87,8 @@ def register_llama_embedding_hook(
 def register_gpt2_embedding_hook(
     model, 
     embeddings_dict: Dict,
-    embed_type: str = "query"
+    embed_type: str = "query",
+    layer_idx: int = -1
 ) -> Tuple[Dict, Callable]:
     """
     Register a hook for GPT-2 models.
@@ -88,12 +97,17 @@ def register_gpt2_embedding_hook(
         model: The GPT-2 language model
         embeddings_dict: Dictionary to store embeddings
         embed_type: Type of embedding to extract ("query" or "key")
+        layer_idx: Which layer to extract from (negative indexing supported)
         
     Returns:
         Tuple[Dict, Callable]: The embeddings dictionary and hook removal function
     """
-    # Get the target module (last attention layer's combined QKV projection)
-    target_module = model.transformer.h[-1].attn.c_attn
+    # Handle negative indexing
+    if layer_idx < 0:
+        layer_idx = len(model.transformer.h) + layer_idx
+        
+    # Get the target module (attention layer's combined QKV projection)
+    target_module = model.transformer.h[layer_idx].attn.c_attn
     
     # Define the hook function
     def hook_fn(module, input_tensor, output_tensor):
@@ -327,54 +341,6 @@ def compute_similarity(
     
     return probabilities
 
-
-def register_intermediate_layer_hook(
-    model, 
-    layer_idx: int = -2
-) -> Tuple[Dict, Callable]:
-    """
-    Register a hook to extract embeddings from an intermediate layer.
-    
-    Args:
-        model: The language model to extract embeddings from
-        layer_idx: Which layer to extract from (negative indexing supported)
-        
-    Returns:
-        Tuple[Dict, Callable]: A dictionary to store the embeddings and a function to remove the hook
-    """
-    # Dictionary to store the embeddings
-    embeddings_dict = {"embeddings": None}
-    
-    if MODEL_TYPE == "llama":
-        # Get the specific layer
-        if layer_idx < 0:
-            layer_idx = len(model.model.model.layers) + layer_idx
-        target_layer = model.model.model.layers[layer_idx]
-        
-        # Hook on the layer output (after attention and MLP)
-        def hook_fn(module, input_tensor, output_tensor):
-            # For Llama, the output is just the hidden states
-            embeddings_dict["embeddings"] = output_tensor[0].detach()
-        
-        hook = target_layer.register_forward_hook(hook_fn)
-        
-    elif MODEL_TYPE == "gpt2":
-        # Get the specific layer
-        if layer_idx < 0:
-            layer_idx = len(model.transformer.h) + layer_idx
-        target_layer = model.transformer.h[layer_idx]
-        
-        # Hook on the layer output
-        def hook_fn(module, input_tensor, output_tensor):
-            # For GPT-2, the output is a tuple, first element is hidden states
-            embeddings_dict["embeddings"] = output_tensor[0].detach()
-        
-        hook = target_layer.register_forward_hook(hook_fn)
-        
-    else:
-        raise ValueError(f"Unsupported model type: {MODEL_TYPE}")
-    
-    return embeddings_dict, hook.remove
 
 
 def sample_key_value(

@@ -138,7 +138,7 @@ def generate_query_vector(
     layer_idx: int = -2
 ) -> torch.Tensor:
     """
-    Generate a single query vector by appending QUERY_VEC_TOKEN and extracting embeddings.
+    Generate a single query vector by appending QUERY_VEC_TOKEN and extracting query embeddings.
     
     Args:
         model: The language model
@@ -147,17 +147,17 @@ def generate_query_vector(
         layer_idx: Which layer to extract from (default: -2 for second-to-last)
         
     Returns:
-        torch.Tensor: Query vector [batch_size, hidden_dim]
+        torch.Tensor: Query vector [batch_size, query_dim]
     """
     from src.config import QUERY_VEC_TOKEN
-    from src.embeddings import register_intermediate_layer_hook
+    from src.embeddings import register_embedding_hook, extract_embeddings
     
     # Get device from context tokens
     device = context_tokens.device
     batch_size = context_tokens.shape[0]
     
-    # Register hook for intermediate layer
-    embeddings_dict, hook_remover = register_intermediate_layer_hook(model, layer_idx)
+    # Register hook for query embeddings from specified layer
+    embeddings_dict, hook_remover = register_embedding_hook(model, embed_type="query", layer_idx=layer_idx)
     
     try:
         # Tokenize the QUERY_VEC_TOKEN
@@ -170,25 +170,9 @@ def generate_query_vector(
         # Append QUERY_VEC_TOKEN to context
         input_tokens = torch.cat([context_tokens, query_vec_token_ids], dim=1)
         
-        # Forward pass to populate embeddings_dict
-        with torch.no_grad():
-            _ = model(input_tokens)
-        
-        # Extract embeddings for the QUERY_VEC_TOKEN position
-        # The embeddings_dict should contain embeddings from all positions
-        # We want the last position (where QUERY_VEC_TOKEN is)
-        if "embeddings" in embeddings_dict and embeddings_dict["embeddings"] is not None:
-            all_embeddings = embeddings_dict["embeddings"]
-            # Get embeddings from the specified layer
-            # For GPT-2, embeddings shape is [batch_size, seq_len, hidden_dim]
-            # For Llama with hook on specific layer, it should be similar
-            if len(all_embeddings.shape) == 3:
-                # Extract the last position (QUERY_VEC_TOKEN)
-                query_vectors = all_embeddings[:, -1, :]  # [batch_size, hidden_dim]
-            else:
-                raise ValueError(f"Unexpected embeddings shape: {all_embeddings.shape}")
-        else:
-            raise ValueError("No embeddings captured in embeddings_dict")
+        # Use extract_embeddings which handles the forward pass and extraction
+        # This will give us the query embeddings from the attention layer
+        query_vectors = extract_embeddings(model, input_tokens, embeddings_dict)
         
         return query_vectors
         

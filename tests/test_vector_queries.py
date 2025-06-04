@@ -108,7 +108,8 @@ def test_generate_query_vector(gpt2_model, gpt2_tokenizer):
     assert query_vector is not None
     assert isinstance(query_vector, torch.Tensor)
     assert query_vector.shape[0] == 1  # batch size
-    assert query_vector.shape[1] == gpt2_model.config.n_embd  # hidden dimension
+    # The dimension should be the hidden dimension (which is the same as query dimension for GPT-2)
+    assert query_vector.shape[1] == gpt2_model.config.n_embd  # query projection dimension
 
 
 def test_query_vector_vs_query_tokens(gpt2_model, gpt2_tokenizer):
@@ -148,4 +149,61 @@ def test_query_vector_vs_query_tokens(gpt2_model, gpt2_tokenizer):
         gpt2_tokenizer,
         context_tokens
     )
-    assert query_vector.shape == (1, gpt2_model.config.n_embd) 
+    assert query_vector.shape == (1, gpt2_model.config.n_embd)
+
+
+def test_query_vector_layer_selection(gpt2_model, gpt2_tokenizer):
+    """Test that query vectors can be extracted from different layers."""
+    from src.training import generate_query_vector
+    
+    # Add the special token to the tokenizer
+    special_tokens_dict = {'additional_special_tokens': [QUERY_VEC_TOKEN]}
+    gpt2_tokenizer.add_special_tokens(special_tokens_dict)
+    gpt2_model.resize_token_embeddings(len(gpt2_tokenizer))
+    
+    # Create context
+    context_text = ["This is a test context"]
+    device = next(gpt2_model.parameters()).device
+    context_tokens = gpt2_tokenizer(
+        context_text,
+        return_tensors="pt",
+        padding=True,
+        truncation=True
+    ).input_ids.to(device)
+    
+    # Test extracting from different layers
+    num_layers = len(gpt2_model.transformer.h)
+    
+    # Extract from second-to-last layer
+    query_vector_n2 = generate_query_vector(
+        gpt2_model,
+        gpt2_tokenizer,
+        context_tokens,
+        layer_idx=-2
+    )
+    
+    # Extract from last layer
+    query_vector_n1 = generate_query_vector(
+        gpt2_model,
+        gpt2_tokenizer,
+        context_tokens,
+        layer_idx=-1
+    )
+    
+    # Extract from first layer
+    query_vector_0 = generate_query_vector(
+        gpt2_model,
+        gpt2_tokenizer,
+        context_tokens,
+        layer_idx=0
+    )
+    
+    # All should have correct shape
+    assert query_vector_n2.shape == (1, gpt2_model.config.n_embd)
+    assert query_vector_n1.shape == (1, gpt2_model.config.n_embd)
+    assert query_vector_0.shape == (1, gpt2_model.config.n_embd)
+    
+    # Vectors from different layers should be different
+    assert not torch.allclose(query_vector_n2, query_vector_n1)
+    assert not torch.allclose(query_vector_n2, query_vector_0)
+    assert not torch.allclose(query_vector_n1, query_vector_0) 
