@@ -5,6 +5,7 @@ Test script to verify the optimized data processing pipeline.
 import torch
 import pytest
 from unittest.mock import MagicMock, patch
+import itertools
 
 from src.data import (
     iter_key_value_pairs,
@@ -77,26 +78,12 @@ def test_tokenize_text():
     assert batch_tokens.shape[0] == len(texts)
 
 
-@pytest.mark.skip(reason="Requires Wikipedia dataset files which may not be available")
-@patch("src.data.iter_wikipedia_articles")
-@patch("src.data.get_tokenizer")
-def test_data_iterator(mock_get_tokenizer, mock_iter_wikipedia_articles):
-    """Test the optimized data iterator."""
-    print("Testing optimized data processing pipeline...")
-
-    # Set up mock tokenizer
-    mock_tokenizer = MagicMock()
-    mock_tokenizer.batch_decode.return_value = ["Decoded text 1", "Decoded text 2"]
-    mock_get_tokenizer.return_value = mock_tokenizer
+def test_data_iterator():
+    """Test the data iterator."""
+    print("Testing data processing pipeline...")
 
     # Set up mock articles
-    mock_iter_wikipedia_articles.return_value = [
-        {"text": "Article 1 text with enough content to extract key-value pairs from Wikipedia."},
-        {"text": "Article 2 text with enough content for testing purposes and extraction of pairs."}
-    ]
-
-    # Test with small batch size
-    batch_size = 1
+    batch_size = 2
 
     # Get the iterator
     iterator = iter_key_value_pairs(batch_size=batch_size)
@@ -168,129 +155,66 @@ def test_keyvaluepair_validation():
         )
 
 
-@patch("src.data.AutoTokenizer.from_pretrained")
-def test_get_tokenizer(mock_from_pretrained):
-    """Test getting the tokenizer."""
-    # Mock the tokenizer
-    mock_tokenizer = MagicMock()
-    mock_from_pretrained.return_value = mock_tokenizer
-    
-    # Call the function
+def test_get_tokenizer_real():
+    """Test ``get_tokenizer`` without mocks using the actual implementation."""
+    tokenizer = get_tokenizer()
+
+    # The tokenizer should have its ``pad_token`` set to the EOS token by ``get_tokenizer``.
+    assert tokenizer.pad_token == tokenizer.eos_token
+
+    # Sanity-check that the tokenizer can encode some text.
+    sample_ids = tokenizer.encode("Hello world", add_special_tokens=False)
+    assert isinstance(sample_ids, list) and len(sample_ids) > 0
+
+
+def test_filter_articles_by_length():
+    """Test filtering articles by length."""
+    # Use the real tokenizer
     tokenizer = get_tokenizer()
     
-    # Check that from_pretrained was called
-    mock_from_pretrained.assert_called_once()
+    # Get the filtered articles using the actual function, limit to first 10 for testing
+    filtered_articles = list(itertools.islice(filter_articles_by_length(tokenizer), 10))
     
-    # Check that pad_token was set to eos_token
-    assert mock_tokenizer.pad_token == mock_tokenizer.eos_token
+    # Basic assertion to check if articles are returned
+    assert len(filtered_articles) > 0, "No articles were returned after filtering."
     
-    # Check that the function returned the tokenizer
-    assert tokenizer == mock_tokenizer
+    # Additional checks can be added based on expected dataset properties
+    for article in filtered_articles:
+        assert "text" in article, "Article does not contain 'text' key."
+        # Optionally, check if the article text meets a minimum length requirement
+        tokenized_text = tokenize_text([article["text"]], tokenizer)
+        # tokenize_text returns List[List[int]], so we check len(tokenized_text[0])
+        assert len(tokenized_text[0]) >= 10, f"Article text too short: {article['text'][:50]}..."
 
 
-@patch("src.data.AutoTokenizer.from_pretrained")
-def test_tokenize_text(mock_from_pretrained):
-    """Test tokenizing text."""
-    # Mock the tokenizer
-    mock_tokenizer = MagicMock()
-    mock_tokenizer.encode.return_value = [1, 2, 3, 4]
-    mock_tokenizer.return_value = {"input_ids": [[1, 2, 3], [4, 5, 6]]}
-    mock_from_pretrained.return_value = mock_tokenizer
-    
-    # Single string
-    single_text = "Test text"
-    result = tokenize_text(single_text, mock_tokenizer)
-    
-    # Check that encode was called with the right parameters
-    mock_tokenizer.encode.assert_called_with(single_text, add_special_tokens=False)
-    
-    # Check that the function returned the tokenized text
-    assert result == [1, 2, 3, 4]
-    
-    # List of strings
-    texts = ["Text 1", "Text 2"]
-    result = tokenize_text(texts, mock_tokenizer)
-    
-    # Check that the tokenizer was called with the right parameters
-    mock_tokenizer.assert_called_with(
-        texts, add_special_tokens=False, padding=False, truncation=True
-    )
-    
-    # Check that the function returned the tokenized texts
-    assert result == [[1, 2, 3], [4, 5, 6]]
-
-
-@pytest.mark.skip(reason="Requires Wikipedia dataset files which may not be available")
-@patch("src.data.iter_wikipedia_articles")
-@patch("src.data.tokenize_text")
-def test_filter_articles_by_length(mock_tokenize_text, mock_iter_wikipedia_articles):
-    """Test filtering articles by length."""
-    # Mock article iterator
-    articles = [
-        {"text": "This article is very short"},
-        {"text": "This article should pass the length filter"},
-        {"text": "This article should also pass the length filter"},
-    ]
-    mock_iter_wikipedia_articles.return_value = iter(articles)
-    
-    # Mock tokenize_text to return different lengths for different articles
-    def mock_tokenize_side_effect(text, _):
-        if "very short" in text:
-            # Return a short tokenized text that will be filtered out
-            return torch.zeros((1, 5))
-        else:
-            # Return a longer tokenized text that should pass the filter
-            return torch.zeros((1, 200))
-    
-    mock_tokenize_text.side_effect = mock_tokenize_side_effect
-    
-    # Get the filtered articles
-    filtered_articles = list(filter_articles_by_length(MagicMock()))
-    
-    # Should have filtered out the short article
-    assert len(filtered_articles) == 2
-    assert "very short" not in filtered_articles[0]["text"]
-    assert "very short" not in filtered_articles[1]["text"]
-
-
-@patch("src.data.filter_articles_by_length")
-@patch("src.data.get_tokenizer")
-def test_iter_key_value_pairs(mock_get_tokenizer, mock_filter_articles_by_length):
+def test_iter_key_value_pairs():
     """Test iterating over key-value pairs."""
-    # Mock tokenizer
-    mock_tokenizer = MagicMock()
-    mock_tokenizer.batch_decode.return_value = ["key text", "value text"]
-    mock_tokenizer.return_value = {
-        "input_ids": torch.randint(0, 1000, (2, 2000))  # 2 articles, 2000 tokens each
-    }
-    mock_get_tokenizer.return_value = mock_tokenizer
+    # Use the real tokenizer
+    tokenizer = get_tokenizer()
+
+    # Define a real embedding function (assuming a model is available for testing)
+    # For this test, we'll use a dummy embedding function if a model isn't set up
+    def dummy_embedding_fn(tokens):
+        batch_size = tokens.shape[0]
+        embedding_dim = 768  # Typical embedding dimension
+        return torch.randn(batch_size, embedding_dim, device=tokens.device)
     
-    # Mock filter_articles_by_length
-    articles = [
-        {"text": "Article 1"},
-        {"text": "Article 2"},
-    ]
-    mock_filter_articles_by_length.return_value = iter(articles)
-    
-    # Mock embedding function
-    embedding_fn = MagicMock()
-    embedding_dim = 768
-    embedding_fn.return_value = torch.randn(2, embedding_dim)  # 2 embeddings (batch_size)
-    
-    # Call the function and get the first result
-    kv_pair_iterator = iter_key_value_pairs(batch_size=2, embedding_fn=embedding_fn)
+    # Call the function and get the first result using the actual data pipeline
+    kv_pair_iterator = iter_key_value_pairs(batch_size=2, embedding_fn=dummy_embedding_fn)
     first_kv_pair = next(kv_pair_iterator)
     
     # Check that the result is a KeyValuePair
     assert isinstance(first_kv_pair, KeyValuePair)
     
     # Check that the shapes are correct
-    assert first_kv_pair.key_tokens.shape == (2, 10)  # batch_size, TOKENS_PER_KEY
-    assert first_kv_pair.value_tokens.shape == (2, 10)  # batch_size, TOKENS_PER_VALUE
-    assert first_kv_pair.key_embedding.shape == (2, embedding_dim)  # batch_size, embedding_dim
+    assert first_kv_pair.key_tokens.shape == (2, TOKENS_PER_KEY)  # batch_size, TOKENS_PER_KEY
+    assert first_kv_pair.value_tokens.shape == (2, TOKENS_PER_VALUE)  # batch_size, TOKENS_PER_VALUE
+    assert first_kv_pair.key_embedding.shape[0] == 2  # batch_size
+    assert first_kv_pair.key_embedding.shape[1] > 0  # embedding_dim should be positive
     
-    # Check that tokenizer's batch_decode was called
-    assert mock_tokenizer.batch_decode.call_count >= 2
+    # Ensure token text lists match batch size
+    assert len(first_kv_pair.key_text) == 2
+    assert len(first_kv_pair.value_text) == 2
 
 
 def test_create_key_value_pair_with_real_model(gpt2_model, gpt2_tokenizer):
@@ -469,3 +393,129 @@ def test_real_model_data_pipeline(gpt2_model, gpt2_tokenizer):
 if __name__ == "__main__":
     # Run the tests manually
     test_data_iterator()
+
+
+def test_load_twenty_questions_dataset():
+    """Test loading the twenty questions dataset."""
+    from src.data import load_twenty_questions_dataset
+    
+    # Load the dataset
+    dataset = load_twenty_questions_dataset()
+    
+    # Check the structure
+    assert isinstance(dataset, dict), "Dataset should be a dictionary"
+    assert 'questions' in dataset, "Dataset should have 'questions' key"
+    assert 'all_objects' in dataset, "Dataset should have 'all_objects' key"
+    assert 'data' in dataset, "Dataset should have 'data' key"
+    
+    # Check data types
+    assert isinstance(dataset['questions'], list), "Questions should be a list"
+    assert isinstance(dataset['all_objects'], list), "Objects should be a list"
+    assert isinstance(dataset['data'], list), "Data should be a list"
+    
+    # Check that we have data
+    assert len(dataset['questions']) > 0, "Should have at least one question"
+    assert len(dataset['all_objects']) > 0, "Should have at least one object"
+    assert len(dataset['data']) > 0, "Should have at least one game"
+    
+    # Check the structure of a game
+    first_game = dataset['data'][0]
+    assert 'object' in first_game, "Game should have 'object' key"
+    assert 'answers' in first_game, "Game should have 'answers' key"
+    assert isinstance(first_game['answers'], list), "Answers should be a list"
+    assert len(first_game['answers']) == len(dataset['questions']), "Should have answers for all questions"
+
+
+def test_iter_twenty_questions():
+    """Test iterating over twenty questions games."""
+    from src.data import iter_twenty_questions
+    
+    # Get a few games
+    games = list(itertools.islice(iter_twenty_questions(), 5))
+    
+    # Check that we got games
+    assert len(games) > 0, "Should have at least one game"
+    
+    # Check game structure
+    for game in games:
+        assert isinstance(game, dict), "Game should be a dictionary"
+        assert 'object' in game, "Game should have 'object' key"
+        assert 'answers' in game, "Game should have 'answers' key"
+        assert all(answer in ['YES', 'NO'] for answer in game['answers']), "Answers should be YES or NO"
+
+
+def test_iter_twenty_questions_pairs():
+    """Test iterating over twenty questions key-value pairs."""
+    from src.data import iter_twenty_questions_pairs, KeyValuePair
+    
+    batch_size = 2
+    
+    # Define a dummy embedding function
+    def dummy_embedding_fn(tokens):
+        batch_size = tokens.shape[0]
+        embedding_dim = 768
+        return torch.randn(batch_size, embedding_dim, device=tokens.device)
+    
+    # Get the iterator
+    iterator = iter_twenty_questions_pairs(batch_size=batch_size, embedding_fn=dummy_embedding_fn)
+    
+    # Get a few pairs
+    pairs = list(itertools.islice(iterator, 5))
+    
+    # Check that we got pairs
+    assert len(pairs) > 0, "Should have at least one pair"
+    
+    # Check pair structure
+    for pair in pairs:
+        assert isinstance(pair, KeyValuePair), "Should be a KeyValuePair instance"
+        assert pair.key_tokens.shape == (batch_size, TOKENS_PER_KEY)
+        assert pair.value_tokens.shape == (batch_size, TOKENS_PER_VALUE)
+        assert pair.key_embedding.shape[0] == batch_size
+        assert len(pair.key_text) == batch_size
+        assert len(pair.value_text) == batch_size
+        
+        # Check that values are YES or NO
+        for value in pair.value_text:
+            assert value in ['YES', 'NO'], f"Value should be YES or NO, got {value}"
+
+
+def test_iter_key_value_pairs_unified():
+    """Test the unified iterator for different datasets."""
+    from src.data import iter_key_value_pairs_unified, KeyValuePair
+    
+    batch_size = 2
+    
+    # Define a dummy embedding function
+    def dummy_embedding_fn(tokens):
+        batch_size = tokens.shape[0]
+        embedding_dim = 768
+        return torch.randn(batch_size, embedding_dim, device=tokens.device)
+    
+    # Test with Wikipedia dataset
+    wiki_iterator = iter_key_value_pairs_unified(
+        dataset_name="wikipedia",
+        batch_size=batch_size,
+        embedding_fn=dummy_embedding_fn
+    )
+    wiki_pair = next(wiki_iterator)
+    assert isinstance(wiki_pair, KeyValuePair), "Should return KeyValuePair for Wikipedia"
+    assert wiki_pair.key_tokens.shape == (batch_size, TOKENS_PER_KEY)
+    
+    # Test with Twenty Questions dataset  
+    tq_iterator = iter_key_value_pairs_unified(
+        dataset_name="twenty_questions", 
+        batch_size=batch_size,
+        embedding_fn=dummy_embedding_fn
+    )
+    tq_pair = next(tq_iterator)
+    assert isinstance(tq_pair, KeyValuePair), "Should return KeyValuePair for Twenty Questions"
+    assert tq_pair.key_tokens.shape == (batch_size, TOKENS_PER_KEY)
+    
+    # Test with invalid dataset name
+    with pytest.raises(ValueError) as excinfo:
+        iter_key_value_pairs_unified(
+            dataset_name="invalid_dataset",
+            batch_size=batch_size,
+            embedding_fn=dummy_embedding_fn
+        )
+    assert "Unknown dataset" in str(excinfo.value)

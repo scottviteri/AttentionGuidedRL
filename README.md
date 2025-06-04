@@ -11,8 +11,8 @@ Key features:
 - Support for both Llama and GPT-2 architectures with seamless switching based on available GPU resources
 - Parameter-efficient training using LoRA adapters
 - Self-directed curriculum learning via reinforcement learning
-- Extensive test coverage for reliability
-- 20 Questions dataset generation for training and evaluation
+- Extensive test coverage for reliability (66 tests covering all components)
+- Support for multiple datasets (Wikipedia and Twenty Questions)
 
 ## Requirements
 
@@ -45,50 +45,28 @@ python -m pytest
 
 ### Training with Wikipedia
 
-Run the training with default parameters:
+Run the training with default parameters (Wikipedia dataset):
 ```bash
 python -m src.main
 ```
 
-With custom parameters:
-```bash
-python -m src.main --batch-size 4 --trajectory-length 5 --episodes 1000
-```
-
 ### Training with Twenty Questions Dataset
 
-The repository includes a modified training procedure that uses the twenty questions dataset with a different reinforcement learning task:
-
+Run training with the Twenty Questions dataset:
 ```bash
-python -m src.twenty_questions_train --trajectory-length 10 --episodes 2000
+python -m src.main --dataset twenty_questions
 ```
 
-#### Command-line Arguments for Twenty Questions Training
+### Custom Parameters
 
-- `--dataset`: Path to the dataset file (default: uses data/20q_dataset.json)
-- `--episodes`: Number of episodes to train for (default: 1000)
-- `--batch-size`: Batch size for training (default: 1)
-- `--trajectory-length`: Number of question-answer pairs in each trajectory (default: 5)
-- `--learning-rate`: Learning rate for optimization (default: from config)
-- `--kl-penalty`: KL penalty coefficient (default: from config)
-- `--log-interval`: Interval for logging statistics (default: from config)
-- `--resume`: Resume training from the latest checkpoint
-
-### Dataset Generation
-
-The repository includes scripts for generating a dataset for the 20 Questions game using Claude API:
-
+With custom parameters:
 ```bash
-python scripts/twenty_questions/generate_20q_dataset.py
+python -m src.main --batch-size 4 --episodes 1000 --dataset wikipedia
 ```
 
-For analyzing the generated dataset:
-
-```bash
-python scripts/twenty_questions/analyze_20q_dataset.py --visualize
-```
-
-See `scripts/twenty_questions/README.md` for more details.
+Available dataset options:
+- `wikipedia` (default): Uses Wikipedia articles split into key-value pairs
+- `twenty_questions`: Uses a structured 20 questions game dataset
 
 ## Project Structure
 
@@ -102,14 +80,7 @@ attention-guided-rl/
 │   ├── embeddings.py           # Embedding extraction and similarity computation
 │   ├── data.py                 # Functional iterator-based dataloader
 │   ├── training.py             # RL training loop and policy optimization
-│   ├── config.py               # Configuration parameters
-│   ├── twenty_questions_data.py  # Data handling for 20Q dataset
-│   └── twenty_questions_train.py # Training script for 20Q dataset
-├── scripts/
-│   └── twenty_questions/       # 20 Questions dataset generation
-│       ├── generate_20q_dataset.py
-│       ├── analyze_20q_dataset.py
-│       └── README.md
+│   └── config.py               # Configuration parameters
 ├── data/                       # Generated datasets
 ├── visualizations/             # Analysis visualizations
 └── tests/
@@ -136,21 +107,6 @@ Embeddings are extracted from the last attention layer of the model, with differ
 6. Repeat to build a trajectory
 7. Compute rewards by comparing log probabilities
 8. Update the policy using REINFORCE with KL regularization
-
-### Twenty Questions Training
-
-The twenty questions training procedure follows the same general reinforcement learning approach, but adapted to simulate a 20 questions game:
-
-1. Start with a generic prompt that doesn't reveal the object ("I am thinking of an object...")
-2. Generate a question based on current context
-3. Use attention to select the most relevant predefined question from the dataset
-4. Retrieve the corresponding YES/NO answer for the selected question
-5. Add the question and its answer to the context
-6. Repeat to build a trajectory of question-answer pairs
-7. Compute rewards based on improvement in predicting answers
-8. Update the policy using REINFORCE with KL regularization
-
-The model learns to ask effective questions that efficiently narrow down the possible objects. The reward function encourages the model to select questions that provide the most information gain about the hidden object.
 
 ### Checkpointing
 

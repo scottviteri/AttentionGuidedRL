@@ -35,7 +35,7 @@ from src.config import (
     LOG_INTERVAL,
 )
 from src.model import setup_model_and_tokenizer, save_checkpoint, load_checkpoint, create_model_copy, get_checkpoint_path
-from src.data import iter_key_value_pairs, QKVStep
+from src.data import iter_key_value_pairs, iter_key_value_pairs_unified, QKVStep
 from src.embeddings import register_embedding_hook, extract_embeddings, compute_similarity, sample_key_value
 from src.training import (
     Trajectory,
@@ -94,6 +94,7 @@ def setup_logging(args):
     logging.info(f"Starting training run with configuration:")
     logging.info(f"  Model: {MODEL_NAME}")
     logging.info(f"  Device: {DEVICE}")
+    logging.info(f"  Dataset: {args.dataset}")
     logging.info(f"  Batch size: {args.batch_size}")
     logging.info(f"  Learning rate: {LEARNING_RATE}")
     logging.info(f"  Episodes: {NUM_EPISODES}")
@@ -268,6 +269,9 @@ def parse_args():
     parser.add_argument("--run-name", type=str, default=None, help="Name for this training run")
     parser.add_argument("--training-percentile", type=float, default=90.0,
                         help="Percentile threshold for training (e.g., 90.0 means train on top 10%% of datapoints)")
+    parser.add_argument("--dataset", type=str, default="wikipedia", 
+                        choices=["wikipedia", "twenty_questions"],
+                        help="Dataset to use for training")
     return parser.parse_args()
 
 
@@ -340,14 +344,16 @@ def main():
                         break
         
         # Set up data loader
-        logging.info("Setting up data loader...")
-        kv_pair_generator = iter_key_value_pairs(
+        logging.info(f"Setting up data loader for {args.dataset} dataset...")
+        kv_pair_generator = iter_key_value_pairs_unified(
+            dataset_name=args.dataset,
             batch_size=args.batch_size, 
             embedding_fn=lambda x: extract_embeddings(adapter_model, x, embeddings_dict)
         )
         
         # Training loop
         logging.info("Starting training...")
+        logging.info(f"Training on top {100-args.training_percentile:.1f}% of datapoints (percentile threshold: {args.training_percentile})")
         episodes_range = range(start_episode, args.episodes)
         progress_bar = tqdm(episodes_range)
         
@@ -411,9 +417,6 @@ def main():
                     print(f"  Mean: {reward_stats['mean']:.4f}")
                     print(f"  Std: {reward_stats['std']:.4f}")
                     print(f"  Count: {reward_stats['count']}")
-            
-            # Log the training percentile setting
-            logging.info(f"Training on top {100-args.training_percentile:.1f}% of datapoints (percentile threshold: {args.training_percentile})")
             
             # Perform training step
             total_loss, num_filtered, policy_loss, kl_loss = train_step(
@@ -539,7 +542,7 @@ def main():
 
 def plot_metrics(log_dir, step=None):
     """
-    Create and save plots of training metrics.
+    Create and save detailed plots of training metrics.
     
     Args:
         log_dir: Directory where logs and plots are saved
@@ -556,27 +559,65 @@ def plot_metrics(log_dir, step=None):
     cpu_kl_losses = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in kl_losses]
     cpu_avg_rewards = [reward.item() if isinstance(reward, torch.Tensor) else reward for reward in avg_rewards]
     
-    plt.figure(figsize=(12, 8))
+    # Calculate KL penalty term for visualization
+    cpu_kl_penalty_terms = [kl * KL_PENALTY_COEFFICIENT for kl in cpu_kl_losses]
     
-    # Loss plots in the first subplot
-    plt.subplot(2, 1, 1)
-    plt.plot(cpu_training_steps, cpu_total_losses, label='Total Loss', color='blue')
-    plt.plot(cpu_training_steps, cpu_policy_losses, label='Policy Loss', color='green')
-    plt.plot(cpu_training_steps, cpu_kl_losses, label='KL Loss', color='red')
-    plt.xlabel('Training Step')
-    plt.ylabel('Loss')
-    plt.title('Loss Components During Training')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    # Create a figure with 2x2 subplots for more detailed visualization
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
     
-    # Reward plot in the second subplot
-    plt.subplot(2, 1, 2)
-    plt.plot(cpu_training_steps, cpu_avg_rewards, label='Avg Reward', color='purple')
-    plt.xlabel('Training Step')
-    plt.ylabel('Average Reward')
-    plt.title('Average Reward During Training')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    # 1. Loss components plot
+    ax1.plot(cpu_training_steps, cpu_total_losses, 'b-', label='Total Loss', linewidth=2)
+    ax1.plot(cpu_training_steps, cpu_policy_losses, 'g--', label='Policy Loss', linewidth=1.5)
+    ax1.plot(cpu_training_steps, cpu_kl_penalty_terms, 'r:', label=f'KL Penalty (β={KL_PENALTY_COEFFICIENT})', linewidth=1.5)
+    ax1.set_xlabel('Training Step')
+    ax1.set_ylabel('Loss')
+    ax1.set_title('Loss Components During Training')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # 2. Reward plot
+    ax2.plot(cpu_training_steps, cpu_avg_rewards, 'purple', linewidth=2)
+    ax2.set_xlabel('Training Step')
+    ax2.set_ylabel('Average Reward')
+    ax2.set_title('Average Reward During Training')
+    ax2.grid(True, alpha=0.3)
+    
+    # Add a trend line if we have enough data points
+    if len(cpu_training_steps) > 10:
+        z = np.polyfit(cpu_training_steps, cpu_avg_rewards, 1)
+        p = np.poly1d(z)
+        ax2.plot(cpu_training_steps, p(cpu_training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
+        ax2.legend()
+    
+    # 3. Loss breakdown pie chart (for the most recent step)
+    if len(cpu_policy_losses) > 0 and len(cpu_kl_penalty_terms) > 0:
+        latest_policy_loss = abs(cpu_policy_losses[-1])
+        latest_kl_penalty = abs(cpu_kl_penalty_terms[-1])
+        
+        # Only create pie chart if both components are positive
+        if latest_policy_loss > 0 or latest_kl_penalty > 0:
+            sizes = [latest_policy_loss, latest_kl_penalty]
+            labels = ['Policy Loss', 'KL Penalty']
+            colors = ['green', 'red']
+            
+            ax3.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+            ax3.set_title('Loss Breakdown (Latest Step)')
+    else:
+        ax3.text(0.5, 0.5, 'No data available', ha='center', va='center', transform=ax3.transAxes)
+        ax3.set_title('Loss Breakdown (Latest Step)')
+    
+    # 4. KL Divergence over time
+    ax4.plot(cpu_training_steps, cpu_kl_losses, 'darkred', linewidth=2)
+    ax4.set_xlabel('Training Step')
+    ax4.set_ylabel('KL Divergence')
+    ax4.set_title('KL Divergence Between Current and Previous Policy')
+    ax4.grid(True, alpha=0.3)
+    
+    # Add horizontal line for typical KL divergence scale
+    if len(cpu_kl_losses) > 0:
+        mean_kl = np.mean(cpu_kl_losses)
+        ax4.axhline(y=mean_kl, color='gray', linestyle='--', alpha=0.5, label=f'Mean: {mean_kl:.4f}')
+        ax4.legend()
     
     plt.tight_layout()
     
@@ -584,11 +625,37 @@ def plot_metrics(log_dir, step=None):
     plt.savefig(f"{plots_dir}/training_metrics.png", dpi=150)
     plt.close()
     
-    # If wandb is enabled, log the plot
+    # If we have enough data, create an additional detailed loss breakdown over time
+    if len(cpu_training_steps) > 20:
+        plt.figure(figsize=(12, 6))
+        
+        # Stack plot showing loss composition over time
+        plt.stackplot(cpu_training_steps, 
+                     cpu_policy_losses, 
+                     cpu_kl_penalty_terms,
+                     labels=['Policy Loss', 'KL Penalty'],
+                     colors=['green', 'red'],
+                     alpha=0.7)
+        
+        plt.plot(cpu_training_steps, cpu_total_losses, 'b-', label='Total Loss', linewidth=2)
+        plt.xlabel('Training Step')
+        plt.ylabel('Loss')
+        plt.title('Loss Composition Over Time')
+        plt.legend(loc='upper right')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        plt.savefig(f"{plots_dir}/loss_breakdown.png", dpi=150)
+        plt.close()
+    
+    # If wandb is enabled, log the plots
     if ENABLE_WANDB:
-        wandb.log({
+        wandb_images = {
             "training_metrics_plot": wandb.Image(f"{plots_dir}/training_metrics.png")
-        })
+        }
+        if os.path.exists(f"{plots_dir}/loss_breakdown.png"):
+            wandb_images["loss_breakdown_plot"] = wandb.Image(f"{plots_dir}/loss_breakdown.png")
+        wandb.log(wandb_images)
 
 
 if __name__ == "__main__":

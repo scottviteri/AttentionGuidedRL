@@ -970,3 +970,90 @@ def test_extract_embeddings_difference_with_lora(gpt2_model, gpt2_tokenizer):
     print(f"Absolute difference between logits: {logit_diff}")
     
     assert logit_diff > 0, "LoRA should produce different logits than the base model" 
+
+
+def test_gpt2_projection_structure():
+    """Test that GPT-2's attention projection structure is correctly understood.
+    
+    This validates our understanding of how GPT-2 splits its c_attn layer into
+    query, key, and value projections.
+    """
+    from transformers import GPT2Model
+    import torch
+    
+    # Load GPT-2 model
+    model = GPT2Model.from_pretrained('gpt2')
+    hidden_size = model.config.hidden_size  # Should be 768 for GPT-2
+    
+    # Access the first transformer block's attention module
+    first_block = model.h[0]
+    attn = first_block.attn
+    c_attn = attn.c_attn
+    
+    # Test weight shapes
+    assert c_attn.weight.shape == (hidden_size, 3 * hidden_size), \
+        f"Expected c_attn weight shape ({hidden_size}, {3 * hidden_size}), got {c_attn.weight.shape}"
+    assert c_attn.bias.shape == (3 * hidden_size,), \
+        f"Expected c_attn bias shape ({3 * hidden_size},), got {c_attn.bias.shape}"
+    
+    # Test that weights can be split into three equal parts after transpose
+    weight_transposed = c_attn.weight.transpose(0, 1)
+    assert weight_transposed.shape[0] % 3 == 0, \
+        "The transposed c_attn weight's first dimension should be divisible by 3"
+    
+    # Split the weights and verify shapes
+    weight_splits = torch.split(weight_transposed, hidden_size, dim=0)
+    assert len(weight_splits) == 3, "Should have exactly 3 weight splits (query, key, value)"
+    for idx, w in enumerate(weight_splits):
+        assert w.shape == (hidden_size, hidden_size), \
+            f"Weight split {idx} should have shape ({hidden_size}, {hidden_size}), got {w.shape}"
+    
+    # Test bias splits
+    bias_splits = torch.split(c_attn.bias, hidden_size)
+    assert len(bias_splits) == 3, "Should have exactly 3 bias splits (query, key, value)"
+    for idx, b in enumerate(bias_splits):
+        assert b.shape == (hidden_size,), \
+            f"Bias split {idx} should have shape ({hidden_size},), got {b.shape}"
+    
+    # Test forward pass
+    batch_size = 1
+    seq_length = 10
+    dummy_input = torch.randn(batch_size, seq_length, hidden_size)
+    output = c_attn(dummy_input)
+    
+    assert output.shape == (batch_size, seq_length, 3 * hidden_size), \
+        f"Expected output shape ({batch_size}, {seq_length}, {3 * hidden_size}), got {output.shape}"
+    
+    # Test that output can be split into query, key, value
+    output_splits = torch.split(output, hidden_size, dim=-1)
+    assert len(output_splits) == 3, "Should have exactly 3 output splits"
+    for idx, out in enumerate(output_splits):
+        assert out.shape == (batch_size, seq_length, hidden_size), \
+            f"Output split {idx} should have shape ({batch_size}, {seq_length}, {hidden_size}), got {out.shape}"
+    
+    # Test full attention module forward pass
+    hidden_states = torch.randn(batch_size, seq_length, hidden_size)
+    attention_mask = torch.ones(batch_size, seq_length)
+    
+    # This should work without errors
+    attn_outputs = attn(
+        hidden_states,
+        attention_mask=attention_mask,
+        output_attentions=True
+    )
+    
+    # Verify outputs
+    assert len(attn_outputs) >= 2, "Attention should return at least output and attention weights"
+    attn_output = attn_outputs[0]
+    assert attn_output.shape == (batch_size, seq_length, hidden_size), \
+        f"Attention output should have shape ({batch_size}, {seq_length}, {hidden_size}), got {attn_output.shape}"
+    
+    if len(attn_outputs) > 1 and attn_outputs[1] is not None:
+        attention_weights = attn_outputs[1]
+        num_heads = model.config.n_head
+        assert attention_weights.shape == (batch_size, num_heads, seq_length, seq_length), \
+            f"Attention weights should have shape ({batch_size}, {num_heads}, {seq_length}, {seq_length}), got {attention_weights.shape}"
+
+
+if __name__ == "__main__":
+    pytest.main([__file__]) 

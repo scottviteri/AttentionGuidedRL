@@ -2,11 +2,15 @@
 Tests for the main module.
 """
 
+import os
 import pytest
 import torch
 import argparse
 from unittest.mock import MagicMock, patch
 import copy
+from unittest.mock import ANY
+import tempfile
+import shutil
 
 from src.data import KeyValuePair, QKVStep
 from src.training import Trajectory
@@ -22,6 +26,9 @@ class MockArgs:
         self.log_interval = 5
         self.verbose = False
         self.learning_rate = 0.001
+        self.training_percentile = 90.0
+        self.run_name = None
+        self.dataset = "wikipedia"  # Default dataset
 
 
 @pytest.fixture
@@ -188,7 +195,7 @@ class MockGenerator:
 @patch("src.main.setup_logging")
 @patch("src.main.setup_model_and_tokenizer")
 @patch("src.main.register_embedding_hook")
-@patch("src.main.iter_key_value_pairs")
+@patch("src.main.iter_key_value_pairs_unified")
 @patch("src.main.generate_trajectory")
 @patch("src.main.train_step")
 @patch("src.main.save_checkpoint")
@@ -200,7 +207,7 @@ def test_main(
     mock_save_checkpoint,
     mock_train_step,
     mock_generate_trajectory,
-    mock_iter_kv_pairs,
+    mock_iter_kv_pairs_unified,
     mock_register_hook,
     mock_setup_models,
     mock_setup_logging
@@ -250,7 +257,7 @@ def test_main(
                     
                     # Set up the mock generator that won't exhaust
                     mock_kv_generator = MockGenerator(mock_kv_pair)
-                    mock_iter_kv_pairs.return_value = mock_kv_generator
+                    mock_iter_kv_pairs_unified.return_value = mock_kv_generator
                     
                     # Create a mock trajectory and set the attributes we need
                     mock_trajectory = MagicMock()
@@ -629,3 +636,77 @@ def test_generate_trajectory_with_real_model(gpt2_model, gpt2_tokenizer):
         finally:
             # Clean up hook
             hook_remover() 
+
+
+def test_twenty_questions_integration_with_trajectory(gpt2_model, gpt2_tokenizer):
+    """Integration test for twenty questions dataset with trajectory generation."""
+    from src.main import generate_trajectory
+    from src.embeddings import register_embedding_hook
+    from src.data import iter_twenty_questions_pairs, iter_key_value_pairs_unified
+    from src.model import apply_lora_adapter
+    import torch
+    
+    # Create adapter model
+    adapter_model = apply_lora_adapter(gpt2_model)
+    base_model = gpt2_model
+    
+    # Register embedding hook
+    embeddings_dict, hook_remover = register_embedding_hook(adapter_model)
+    
+    try:
+        # Get twenty questions data
+        embedding_fn = lambda x: torch.randn(x.shape[0], 768)  # Simple embedding function for test
+        kv_pair_generator = iter_key_value_pairs_unified(
+            dataset_name="twenty_questions",
+            batch_size=1,
+            embedding_fn=embedding_fn
+        )
+        
+        # Get a batch of twenty questions key-value pairs
+        # We need enough pairs to generate a trajectory (NUM_KV_PAIRS will be selected)
+        from src.config import NUM_KV_PAIRS
+        available_qkv_steps = [next(kv_pair_generator) for _ in range(NUM_KV_PAIRS + 5)]  # Get extra pairs
+        
+        # Verify they are from twenty questions dataset
+        for step in available_qkv_steps:
+            assert step.key_text[0].endswith("?"), f"Expected question, got: {step.key_text[0]}"
+            assert step.value_text[0] in ["YES", "NO"], f"Expected YES/NO, got: {step.value_text[0]}"
+        
+        # Create initial context
+        device = next(adapter_model.parameters()).device
+        initial_tokens = gpt2_tokenizer(
+            ["Let's play twenty questions! "],  # Batch size 1
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False
+        ).input_ids.to(device)
+        
+        # Generate a trajectory using the twenty questions data
+        trajectory = generate_trajectory(
+            initial_tokens,
+            adapter_model,
+            base_model,
+            gpt2_tokenizer,
+            embeddings_dict,
+            hook_remover,
+            available_qkv_steps,
+            batch_size=1,
+            verbose=False,
+        )
+        
+        # Verify the trajectory was created with twenty questions data
+        assert len(trajectory.qkv_steps) > 0
+        
+        # Check that the selected steps are from twenty questions
+        for step in trajectory.qkv_steps:
+            assert hasattr(step, 'query_text')  # Query was generated
+            assert step.key_text[0].endswith("?"), f"Expected question in trajectory, got: {step.key_text[0]}"
+            assert step.value_text[0] in ["YES", "NO"], f"Expected YES/NO in trajectory, got: {step.value_text[0]}"
+            
+    finally:
+        # Clean up hook
+        hook_remover()
+
+
+if __name__ == "__main__":
+    pytest.main([__file__]) 

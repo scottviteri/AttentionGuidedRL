@@ -6,6 +6,9 @@ Contains data structures and utilities for loading, processing, and batching dat
 
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Tuple, Union
+import json
+import os
+import random
 
 import torch
 from datasets import load_dataset
@@ -269,3 +272,152 @@ def iter_key_value_pairs(
                 key_text=key_text_list,
                 value_text=value_text_list,
             )
+
+
+def load_twenty_questions_dataset(dataset_path: str = None) -> Dict:
+    """
+    Load the twenty questions dataset from a JSON file.
+
+    Args:
+        dataset_path: Path to the dataset JSON file
+
+    Returns:
+        Dict: The dataset as a dictionary with keys 'questions', 'all_objects', and 'data'
+    """
+    if dataset_path is None:
+        # Use default path relative to the project root
+        dataset_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data", "20q_dataset.json"
+        )
+
+    with open(dataset_path, 'r') as f:
+        dataset = json.load(f)
+
+    return dataset
+
+
+def iter_twenty_questions() -> Iterator[Dict]:
+    """
+    Create an iterator that yields twenty questions games.
+
+    Returns:
+        Iterator[Dict]: Iterator yielding game dictionaries with object and answers
+    """
+    dataset = load_twenty_questions_dataset()
+    
+    # The dataset has a 'data' key that contains the games
+    for game in dataset['data']:
+        yield game
+
+
+def iter_twenty_questions_pairs(
+    batch_size: int = 1, embedding_fn=None
+) -> Iterator[QKVStep]:
+    """
+    Create an iterator that yields batches of query-key-value steps from the twenty questions dataset.
+
+    Args:
+        batch_size: Number of games to process in each batch
+        embedding_fn: Optional function to compute embeddings
+
+    Returns:
+        Iterator[QKVStep]: Iterator yielding a batched QKVStep object
+    """
+    tokenizer = get_tokenizer()
+    dataset = load_twenty_questions_dataset()
+    questions = dataset['questions']
+    games = dataset['data']
+    
+    # Process games in chunks without wrapping
+    game_idx = 0
+    
+    while game_idx < len(games):
+        # Collect batch_size number of games
+        game_batch = []
+        for _ in range(batch_size):
+            if game_idx >= len(games):
+                # Not enough games to fill the batch, stop here
+                break
+            game_batch.append(games[game_idx])
+            game_idx += 1
+        
+        # Only process if we have a full batch or it's the last batch
+        if len(game_batch) == 0:
+            break
+            
+        # If it's not a full batch and we need exactly batch_size, skip this batch
+        if len(game_batch) < batch_size:
+            # For the last batch, we can either skip it or pad it
+            # Here we choose to skip incomplete batches
+            break
+        
+        # For each question index, yield a batch of question-answer pairs
+        for q_idx in range(min(len(questions), NUM_KV_PAIRS)):
+            # Prepare batch data
+            key_texts = []
+            value_texts = []
+            
+            for game in game_batch:
+                # The key is the question
+                key_texts.append(questions[q_idx])
+                # The value is the answer (YES/NO)
+                value_texts.append(game['answers'][q_idx])
+            
+            # Tokenize in batch
+            key_tokens = tokenizer(
+                key_texts,
+                add_special_tokens=False,
+                padding="max_length",
+                truncation=True,
+                max_length=TOKENS_PER_KEY,
+                return_tensors="pt",
+            )["input_ids"].to(DEVICE)
+            
+            value_tokens = tokenizer(
+                value_texts,
+                add_special_tokens=False,
+                padding="max_length",
+                truncation=True,
+                max_length=TOKENS_PER_VALUE,
+                return_tensors="pt",
+            )["input_ids"].to(DEVICE)
+            
+            # Compute embeddings for the key tokens if embedding_fn is provided
+            if embedding_fn is not None:
+                key_embedding = embedding_fn(key_tokens)
+            else:
+                embedding_dim = 768  # Default embedding dimension
+                key_embedding = torch.zeros((batch_size, embedding_dim), device=DEVICE)
+            
+            yield QKVStep(
+                key_tokens=key_tokens,
+                value_tokens=value_tokens,
+                key_embedding=key_embedding,
+                key_text=key_texts,
+                value_text=value_texts,
+            )
+
+
+def iter_key_value_pairs_unified(
+    dataset_name: str = "wikipedia",
+    batch_size: int = 1,
+    embedding_fn=None
+) -> Iterator[QKVStep]:
+    """
+    Unified iterator for different datasets.
+
+    Args:
+        dataset_name: Name of the dataset ('wikipedia' or 'twenty_questions')
+        batch_size: Number of items to process in each batch
+        embedding_fn: Optional function to compute embeddings
+
+    Returns:
+        Iterator[QKVStep]: Iterator yielding batched QKVStep objects
+    """
+    if dataset_name == "wikipedia":
+        return iter_key_value_pairs(batch_size, embedding_fn)
+    elif dataset_name == "twenty_questions":
+        return iter_twenty_questions_pairs(batch_size, embedding_fn)
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
