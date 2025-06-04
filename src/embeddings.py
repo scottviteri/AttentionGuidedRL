@@ -328,6 +328,55 @@ def compute_similarity(
     return probabilities
 
 
+def register_intermediate_layer_hook(
+    model, 
+    layer_idx: int = -2
+) -> Tuple[Dict, Callable]:
+    """
+    Register a hook to extract embeddings from an intermediate layer.
+    
+    Args:
+        model: The language model to extract embeddings from
+        layer_idx: Which layer to extract from (negative indexing supported)
+        
+    Returns:
+        Tuple[Dict, Callable]: A dictionary to store the embeddings and a function to remove the hook
+    """
+    # Dictionary to store the embeddings
+    embeddings_dict = {"embeddings": None}
+    
+    if MODEL_TYPE == "llama":
+        # Get the specific layer
+        if layer_idx < 0:
+            layer_idx = len(model.model.model.layers) + layer_idx
+        target_layer = model.model.model.layers[layer_idx]
+        
+        # Hook on the layer output (after attention and MLP)
+        def hook_fn(module, input_tensor, output_tensor):
+            # For Llama, the output is just the hidden states
+            embeddings_dict["embeddings"] = output_tensor[0].detach()
+        
+        hook = target_layer.register_forward_hook(hook_fn)
+        
+    elif MODEL_TYPE == "gpt2":
+        # Get the specific layer
+        if layer_idx < 0:
+            layer_idx = len(model.transformer.h) + layer_idx
+        target_layer = model.transformer.h[layer_idx]
+        
+        # Hook on the layer output
+        def hook_fn(module, input_tensor, output_tensor):
+            # For GPT-2, the output is a tuple, first element is hidden states
+            embeddings_dict["embeddings"] = output_tensor[0].detach()
+        
+        hook = target_layer.register_forward_hook(hook_fn)
+        
+    else:
+        raise ValueError(f"Unsupported model type: {MODEL_TYPE}")
+    
+    return embeddings_dict, hook.remove
+
+
 def sample_key_value(
     similarity_scores: torch.Tensor,  # Shape: [batch, num_keys]
     available_keys: List[List[int]],

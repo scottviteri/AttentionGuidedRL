@@ -74,4 +74,78 @@ def test_existing_functionality_unchanged(gpt2_model, gpt2_tokenizer):
             
             # Verify it returns tokens
             assert query_tokens is not None
-            assert isinstance(query_tokens, torch.Tensor) 
+            assert isinstance(query_tokens, torch.Tensor)
+
+
+def test_generate_query_vector(gpt2_model, gpt2_tokenizer):
+    """Test the generate_query_vector function."""
+    from src.training import generate_query_vector
+    
+    # Add the special token to the tokenizer
+    special_tokens_dict = {'additional_special_tokens': [QUERY_VEC_TOKEN]}
+    gpt2_tokenizer.add_special_tokens(special_tokens_dict)
+    gpt2_model.resize_token_embeddings(len(gpt2_tokenizer))
+    
+    # Create some context tokens
+    context_text = ["This is a test context"]
+    device = next(gpt2_model.parameters()).device
+    context_tokens = gpt2_tokenizer(
+        context_text,
+        return_tensors="pt",
+        padding=True,
+        truncation=True
+    ).input_ids.to(device)
+    
+    # Generate query vector
+    query_vector = generate_query_vector(
+        gpt2_model,
+        gpt2_tokenizer,
+        context_tokens,
+        layer_idx=-2
+    )
+    
+    # Verify the output
+    assert query_vector is not None
+    assert isinstance(query_vector, torch.Tensor)
+    assert query_vector.shape[0] == 1  # batch size
+    assert query_vector.shape[1] == gpt2_model.config.n_embd  # hidden dimension
+
+
+def test_query_vector_vs_query_tokens(gpt2_model, gpt2_tokenizer):
+    """Test that both query methods work independently."""
+    from src.training import generate_query, generate_query_vector
+    from src.config import TOKENS_PER_QUERY
+    
+    # Add the special token to the tokenizer
+    special_tokens_dict = {'additional_special_tokens': [QUERY_VEC_TOKEN]}
+    gpt2_tokenizer.add_special_tokens(special_tokens_dict)
+    gpt2_model.resize_token_embeddings(len(gpt2_tokenizer))
+    
+    # Create context
+    context_text = ["This is a test context"]
+    device = next(gpt2_model.parameters()).device
+    context_tokens = gpt2_tokenizer(
+        context_text,
+        return_tensors="pt",
+        padding=True,
+        truncation=True
+    ).input_ids.to(device)
+    
+    # Test token-based query generation
+    with patch('src.config.MODEL_TYPE', 'gpt2'):
+        # Mock the model generate method to return full sequence (input + generated)
+        # The generate function includes the input tokens in its output
+        input_length = len(gpt2_tokenizer.encode(context_text[0] + " Query: "))
+        mock_output = torch.randint(0, 1000, (1, input_length + TOKENS_PER_QUERY), device=device)
+        gpt2_model.generate = MagicMock(return_value=mock_output)
+        
+        query_tokens = generate_query(gpt2_model, gpt2_tokenizer, context_text)
+        assert query_tokens.shape == (1, TOKENS_PER_QUERY)
+    
+    # Test vector-based query generation
+    query_vector = generate_query_vector(
+        gpt2_model,
+        gpt2_tokenizer,
+        context_tokens
+    )
+    assert query_vector.shape == (1, gpt2_model.config.n_embd) 
