@@ -104,9 +104,16 @@ def get_tokenizer() -> PreTrainedTokenizer:
     Returns:
         PreTrainedTokenizer: The tokenizer
     """
+    from src.config import QUERY_VEC_TOKEN
+    
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'  # Set padding side to left for decoder-only models
+    
+    # Add the special query vector token
+    special_tokens_dict = {'additional_special_tokens': [QUERY_VEC_TOKEN]}
+    tokenizer.add_special_tokens(special_tokens_dict)
+    
     return tokenizer
 
 

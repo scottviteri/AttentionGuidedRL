@@ -96,4 +96,8 @@ CHECKPOINT_INTERVAL = 5
 
 # Logging
 ENABLE_WANDB = False
-LOG_INTERVAL = 10 
+LOG_INTERVAL = 10
+
+# Vector Query Parameters
+QUERY_VEC_TOKEN = "<QUERY_VEC>"
+USE_VECTOR_QUERIES = False  # Start with False to maintain backwards compatibility 

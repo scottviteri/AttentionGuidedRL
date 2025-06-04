@@ -159,6 +159,8 @@ def setup_model_and_tokenizer():
     Returns:
         Tuple of (base_model, adapter_model, tokenizer)
     """
+    from src.config import QUERY_VEC_TOKEN
+    
     # Load the base model
     base_model = load_base_model()
     
@@ -169,6 +171,15 @@ def setup_model_and_tokenizer():
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'  # Set padding side to left for decoder-only models
+    
+    # Add the special query vector token
+    special_tokens_dict = {'additional_special_tokens': [QUERY_VEC_TOKEN]}
+    num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
+    
+    # Resize model embeddings to account for new token
+    if num_added_toks > 0:
+        base_model.resize_token_embeddings(len(tokenizer))
+        adapter_model.resize_token_embeddings(len(tokenizer))
     
     return base_model, adapter_model, tokenizer
 
