@@ -8,29 +8,26 @@ import os
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-# Determine device and choose model based on available GPU memory
-if torch.cuda.is_available():
-    device = "cuda"
-    # Get CUDA device properties
-    gpu_props = torch.cuda.get_device_properties(0)
-    total_memory = gpu_props.total_memory  # in bytes
-    # 12 GB = 12 * 1024 * 1024 * 1024 bytes
-    if total_memory < 12 * 1024 * 1024 * 1024:
-        # Less than 12GB of GPU memory, use GPT-2
-        MODEL_NAME = "gpt2"
-        TOKENIZER_NAME = "gpt2"
-        MODEL_TYPE = "gpt2"
-    else:
-        # 12GB or more, can use larger models
-        MODEL_NAME = "meta-llama/Llama-3.2-3B"
-        TOKENIZER_NAME = "meta-llama/Llama-3.2-3B"
-        MODEL_TYPE = "llama"
-else:
-    device = "cpu"
-    # Use GPT-2 on CPU for resource reasons
+# Model configuration - manually configurable via environment variable
+# Set MODEL_TYPE environment variable to choose model:
+# - "gpt2": Use GPT-2 (default, works on smaller GPUs)
+# - "llama": Use Llama-3.2-3B (requires more GPU memory)
+MODEL_TYPE = os.environ.get("MODEL_TYPE", "gpt2").lower()
+
+if MODEL_TYPE == "llama":
+    MODEL_NAME = "meta-llama/Llama-3.2-3B"
+    TOKENIZER_NAME = "meta-llama/Llama-3.2-3B"
+elif MODEL_TYPE == "gpt2":
     MODEL_NAME = "gpt2"
     TOKENIZER_NAME = "gpt2"
-    MODEL_TYPE = "gpt2"
+else:
+    raise ValueError(f"Invalid MODEL_TYPE: {MODEL_TYPE}. Must be 'gpt2' or 'llama'")
+
+# Device configuration
+if torch.cuda.is_available():
+    device = "cuda"
+else:
+    device = "cpu"
 
 DEVICE = device
 DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
