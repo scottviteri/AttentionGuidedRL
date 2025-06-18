@@ -400,9 +400,9 @@ attention-guided-rl/
 
 This design document provides a comprehensive blueprint for implementing an RL-driven, self-directed language model training system using Wikipedia data. By integrating Llama-3.2-3B with LoRA, leveraging attention-guided embeddings with grouped query attention, ensuring tokenization consistency with spaces around prompts, filtering articles based on required token counts, and adopting a functional dataloading approach with iterators, the system achieves efficient and stable learning. Extensive testing and modularity ensure reliability and reproducibility. This standalone guide equips developers with a clear, detailed plan to construct a PyTorch-based software repository.
 
-# GPU Resource Selection and Parameter Mapping
+# Model Selection and Parameter Mapping
 
-Depending on on the available GPU resources, the repository dynamically selects a model variant. On systems with limited GPU memory, a smaller model (GPT-2) is chosen for its lower memory footprint, while systems with ample GPU resources can leverage larger models, such as LLaMA.
+The repository supports two model variants that can be manually selected via environment variable. The user can choose between GPT-2 for smaller GPU memory requirements or Llama-3.2-3B for systems with more GPU resources (typically 12GB+).
 
 One significant architectural difference lies in the attention mechanism implementations. LLaMA defines separate projection layers (e.g., `last_layer.self_attn.k_proj`, `last_layer.self_attn.v_proj`, and corresponding query projection) for its self-attention operations. In contrast, GPT-2 consolidates these projections into a single linear layer (typically found as part of the `h.<layer_index>.attn.c_attn` module) and then splits the output into query, key, and value components.
 

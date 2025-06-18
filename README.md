@@ -4,11 +4,11 @@ This repository implements an attention-guided reinforcement learning framework 
 
 ## Overview
 
-The system uses a base language model (Llama-3.2-3B or GPT-2 depending on available GPU resources) to generate queries, and an attention mechanism to select the most relevant key-value pairs from a pool of options. The model is then trained using reinforcement learning, with rewards based on the improvement in predicting values given the context and query.
+The system uses a base language model (Llama-3.2-3B or GPT-2, manually configurable) to generate queries, and an attention mechanism to select the most relevant key-value pairs from a pool of options. The model is then trained using reinforcement learning, with rewards based on the improvement in predicting values given the context and query.
 
 Key features:
 - Attention-guided selection of key-value pairs using embeddings from the model's last attention layer
-- Support for both Llama and GPT-2 architectures with seamless switching based on available GPU resources
+- Support for both Llama and GPT-2 architectures with manual configuration
 - Parameter-efficient training using LoRA adapters
 - Self-directed curriculum learning via reinforcement learning
 - Extensive test coverage for reliability (66 tests covering all components)
@@ -43,6 +43,22 @@ python -m pytest
 
 ## Usage
 
+### Model Selection
+
+Choose which model to use by setting the `MODEL_TYPE` environment variable:
+
+```bash
+# Use GPT-2 (default, works on smaller GPUs)
+export MODEL_TYPE=gpt2
+python -m src.main
+
+# Use Llama-3.2-3B (requires more GPU memory, typically 12GB+)
+export MODEL_TYPE=llama
+python -m src.main
+```
+
+If no `MODEL_TYPE` is specified, GPT-2 is used by default.
+
 ### Training with Wikipedia
 
 Run the training with default parameters (Wikipedia dataset):
@@ -62,6 +78,15 @@ python -m src.main --dataset twenty_questions
 With custom parameters:
 ```bash
 python -m src.main --batch-size 4 --episodes 1000 --dataset wikipedia
+```
+
+You can also combine model selection with custom parameters:
+```bash
+# Train Llama with Twenty Questions dataset
+MODEL_TYPE=llama python -m src.main --dataset twenty_questions --episodes 500
+
+# Train GPT-2 with custom batch size
+MODEL_TYPE=gpt2 python -m src.main --batch-size 8 --episodes 2000
 ```
 
 Available dataset options:
