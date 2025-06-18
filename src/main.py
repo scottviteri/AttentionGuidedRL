@@ -19,14 +19,11 @@ from copy import deepcopy
 from src.config import (
     DEVICE,
     MODEL_NAME,
-    TOKENS_PER_QUERY,
     NUM_KV_PAIRS,
     CHECKPOINT_INTERVAL,
     NUM_EPISODES,
-    GENERATION_BATCH_SIZE,
     LEARNING_RATE,
     KL_PENALTY_COEFFICIENT,
-    QUERY_PREFIX,
     KEY_PREFIX,
     VALUE_PREFIX,
     INITIAL_PROMPT,
@@ -39,10 +36,10 @@ from src.data import iter_key_value_pairs, iter_key_value_pairs_unified, QKVStep
 from src.embeddings import register_embedding_hook, extract_embeddings, compute_similarity, sample_key_value
 from src.training import (
     Trajectory,
-    generate_query,
     compute_trajectory_rewards,
     update_reward_stats,
     train_step,
+    generate_query_vector,
 )
 
 # Import wandb for logging
@@ -130,60 +127,64 @@ def generate_trajectory(
     verbose: bool = False,
 ) -> Trajectory:
     """
-    Generate a trajectory by selecting query-key-value steps.
+    Generate a single trajectory using vector queries.
     
     Args:
         context_tokens: Initial context tokens
-        adapter_model: The model with LoRA adapter
-        base_model: The base model without LoRA
+        adapter_model: The model with LoRA adapter for generation
+        base_model: The base model (unused but kept for interface compatibility)
         tokenizer: The tokenizer
-        embeddings_dict: Dictionary to store embeddings from hooks
+        embeddings_dict: Dictionary for storing embeddings from hooks
         hook_remover: Function to remove hooks
-        available_qkv_steps: List of available QKVStep objects
-        batch_size: Batch size
-        verbose: Flag to enable verbose logging
+        available_qkv_steps: List of available key-value pairs to choose from
+        batch_size: Number of trajectories to generate in parallel
+        verbose: Whether to enable verbose logging
         
     Returns:
-        Trajectory: The generated trajectory
+        Trajectory object containing the selected steps and rewards
     """
-    # Ensure context_tokens is on the correct device
+    # Ensure the context is on the same device as the model
     device = next(adapter_model.parameters()).device
     current_context = context_tokens.to(device)
-    context_text = tokenizer.batch_decode(current_context)
+    
+    # Decode initial context for logging
+    context_text = tokenizer.batch_decode(current_context, skip_special_tokens=True)
     
     if verbose:
         print("\n=== Starting New Trajectory ===")
         print(f"Initial context: {context_text[0][:50]}...")
         print(f"Available query-key-value steps: {len(available_qkv_steps)}")
-        print(f"Query token length: {TOKENS_PER_QUERY} tokens")
+        print(f"Query mode: Vector queries")
     
     # Initialize selected steps list
     selected_steps = []
     
+    # Save all key embeddings at the beginning to store at trajectory level
+    all_initial_key_embeddings = []
+    for qkv_step in available_qkv_steps:
+        key_emb = qkv_step.key_embedding.to(device)
+        all_initial_key_embeddings.append(key_emb)
+    trajectory_key_embeddings = torch.stack(all_initial_key_embeddings, dim=1)  # [batch_size, num_keys, embedding_dim]
+    
     # Loop until we've selected a fixed number of steps
     for step_idx in range(NUM_KV_PAIRS):
-        # Generate query
-        query_tokens = generate_query(
+        # Generate query vector (deterministic mean)
+        query_embeddings = generate_query_vector(
             adapter_model,
             tokenizer,
-            context_text
+            current_context
         )
         
-        # Ensure query_tokens is on the same device as context_tokens
-        query_tokens = query_tokens.to(device)
+        # For vector queries, we don't have query tokens or text
+        # We'll use placeholders for compatibility
+        query_tokens = torch.tensor([[]], device=device).long()  # Empty tensor
+        query_text = ["<VECTOR_QUERY>"] * batch_size
         
-        # Decode query for logging
-        query_text = tokenizer.batch_decode(query_tokens)
-        
-        # Extract query embeddings
-        query_embeddings = extract_embeddings(adapter_model, query_tokens, embeddings_dict)
-        
-        # Extract key embeddings from available steps using extract_embeddings
+        # Use pre-computed key embeddings from available steps
         key_embs = []
         for qkv_step in available_qkv_steps:
-            # Move key_tokens to the correct device
-            key_tokens = qkv_step.key_tokens.to(device)
-            key_emb = extract_embeddings(adapter_model, key_tokens, embeddings_dict)
+            # Use the pre-computed embedding, just move to device
+            key_emb = qkv_step.key_embedding.to(device)
             key_embs.append(key_emb)
             
         # Stack key embeddings with shape [batch_size, num_keys, hidden_size]
@@ -218,6 +219,11 @@ def generate_trajectory(
         device_selected_step.query_tokens = query_tokens
         device_selected_step.query_embedding = query_embeddings
         
+        # Store the softmax probabilities for policy gradient
+        # We'll compute log probabilities from the softmax distribution
+        device_selected_step.similarity_scores = similarity_scores
+        device_selected_step.selected_idx = selected_idx
+        
         # Add selected step to the list
         selected_steps.append(device_selected_step)
         
@@ -225,16 +231,13 @@ def generate_trajectory(
         available_qkv_steps.pop(selected_idx)
         
         # Update context for next iteration
-        # Add query, key and value tokens to context - already on the correct device
-        # Create prefix tensors with proper batch dimension
-        query_prefix_tokens = tokenizer([QUERY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        # For vector queries, we don't add query tokens to context
+        # Only add key and value tokens
         key_prefix_tokens = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
         value_prefix_tokens = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
         
         current_context = torch.cat([
             current_context,
-            query_prefix_tokens,
-            query_tokens,
             key_prefix_tokens, 
             device_selected_step.key_tokens,
             value_prefix_tokens,
@@ -251,24 +254,27 @@ def generate_trajectory(
         print(full_context)
         print("\n=== Trajectory Complete ===\n")
     
-    # Create trajectory object
-    trajectory = Trajectory(qkv_steps=selected_steps)
+    # Create trajectory object with the pre-saved key embeddings
+    trajectory = Trajectory(
+        qkv_steps=selected_steps,
+        all_key_embeddings=trajectory_key_embeddings
+    )
     
     return trajectory
 
 
 def parse_args():
     """Parse command-line arguments."""
+    from src.config import TRAINING_BATCH_SIZE
+    
     parser = argparse.ArgumentParser(description="Train a model using Attention-Guided RL")
-    parser.add_argument("--batch-size", type=int, default=2, help="Batch size for training")
+    parser.add_argument("--batch-size", type=int, default=TRAINING_BATCH_SIZE, help="Batch size for training")
     parser.add_argument("--resume", action="store_true", help="Resume training from checkpoint")
     parser.add_argument("--episodes", type=int, default=NUM_EPISODES, help="Number of episodes to train")
     parser.add_argument("--log-interval", type=int, default=10, help="Logging interval")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose trajectory logging")
     parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE, help="Learning rate for training")
     parser.add_argument("--run-name", type=str, default=None, help="Name for this training run")
-    parser.add_argument("--training-percentile", type=float, default=90.0,
-                        help="Percentile threshold for training (e.g., 90.0 means train on top 10%% of datapoints)")
     parser.add_argument("--dataset", type=str, default="wikipedia", 
                         choices=["wikipedia", "twenty_questions"],
                         help="Dataset to use for training")
@@ -287,6 +293,9 @@ def main():
     # Set up logging
     log_dir = setup_logging(args)
     
+    # Log query mode
+    logging.info("Query mode: Vector queries")
+    
     # Set up models and tokenizer
     logging.info("Setting up models and tokenizer...")
     base_model, adapter_model, tokenizer = setup_model_and_tokenizer()
@@ -294,7 +303,6 @@ def main():
     # Log the dynamically calculated token counts
     import src.config as config
     logging.info(f"Token count configuration:")
-    logging.info(f"  Query prefix tokens: {config.PREFIX_TOKENS_PER_QUERY}")
     logging.info(f"  Key prefix tokens: {config.PREFIX_TOKENS_PER_KEY}")
     logging.info(f"  Value prefix tokens: {config.PREFIX_TOKENS_PER_VALUE}")
     logging.info(f"  Total tokens per round: {config.TOKENS_PER_ROUND}")
@@ -345,15 +353,23 @@ def main():
         
         # Set up data loader
         logging.info(f"Setting up data loader for {args.dataset} dataset...")
+        
+        # Create a baseline model for both key embeddings and reward computation
+        # This is a deep copy of the initial adapter model that won't be updated frequently
+        baseline_model = create_model_copy(adapter_model)
+        
+        # Register embedding hook for the baseline model
+        baseline_embeddings_dict, baseline_hook_remover = register_embedding_hook(baseline_model)
+        
+        # Use baseline model for key embeddings to ensure stability
         kv_pair_generator = iter_key_value_pairs_unified(
             dataset_name=args.dataset,
             batch_size=args.batch_size, 
-            embedding_fn=lambda x: extract_embeddings(adapter_model, x, embeddings_dict)
+            embedding_fn=lambda x: extract_embeddings(baseline_model, x, baseline_embeddings_dict)
         )
         
         # Training loop
         logging.info("Starting training...")
-        logging.info(f"Training on top {100-args.training_percentile:.1f}% of datapoints (percentile threshold: {args.training_percentile})")
         episodes_range = range(start_episode, args.episodes)
         progress_bar = tqdm(episodes_range)
         
@@ -394,11 +410,12 @@ def main():
                 verbose=args.verbose,
             )
             
-            # Compute trajectory rewards
+            # Compute trajectory rewards using baseline model (not base model)
+            # This ensures fair comparison since baseline knows how to use vector queries
             compute_trajectory_rewards(
                 trajectory, 
                 adapter_model, 
-                base_model, 
+                baseline_model, 
                 initial_tokens,
                 tokenizer=tokenizer,
                 verbose=args.verbose
@@ -422,13 +439,14 @@ def main():
             total_loss, num_filtered, policy_loss, kl_loss = train_step(
                 trajectory,
                 adapter_model,
-                base_model,
+                baseline_model,  # Now using baseline instead of base
                 previous_model,  # Use the deep copy for KL divergence
                 optimizer,
                 reward_stats,
                 KL_PENALTY_COEFFICIENT,
                 verbose=args.verbose,
-                percentile=args.training_percentile  # Pass the percentile parameter
+                tokenizer=tokenizer,
+                embeddings_dict=embeddings_dict
             )
             
             # Calculate average reward across the batch
@@ -449,24 +467,29 @@ def main():
                 f"Episode {episode}/{args.episodes}, "
                 f"Loss: {total_loss:.4f}, "
                 f"Filtered: {num_filtered}/{trajectory.avg_reward.shape[0]}, "
-                f"Reward: {avg_reward:.4f}, "
-                f"Threshold: {reward_stats['mean'] + reward_stats['std']:.4f}"
+                f"Reward: {avg_reward:.4f}"
             )
+            
+            # Update baseline model less frequently (every 50 episodes)
+            if (episode + 1) % 50 == 0:
+                # Update the baseline model to reflect learning progress
+                baseline_model = create_model_copy(adapter_model)
+                
+                # Re-register the embedding hook for the new baseline
+                baseline_hook_remover()  # Remove old hook
+                baseline_embeddings_dict, baseline_hook_remover = register_embedding_hook(baseline_model)
+                
+                # Update the embedding function in the generator
+                kv_pair_generator = iter_key_value_pairs_unified(
+                    dataset_name=args.dataset,
+                    batch_size=args.batch_size, 
+                    embedding_fn=lambda x: extract_embeddings(baseline_model, x, baseline_embeddings_dict)
+                )
+                
+                logging.info(f"Updated baseline model at episode {episode + 1}")
             
             # Periodically verify weight changes (every 5 episodes)
             if (episode + 1) % 5 == 0:
-                # Check that base model weights are unchanged
-                base_weights_changed = False
-                for name, param in base_model.named_parameters():
-                    if 'lora' not in name and name in initial_base_weights:
-                        if not torch.allclose(initial_base_weights[name], param.data):
-                            base_weights_changed = True
-                            logging.warning(f"Base model weights changed for parameter {name}")
-                            break
-                
-                if not base_weights_changed:
-                    logging.info("Base model weights verification: UNCHANGED (correct)")
-                
                 # Check that adapter model weights are changing
                 adapter_weights_changed = False
                 for name, param in adapter_model.named_parameters():
@@ -536,8 +559,10 @@ def main():
             wandb.finish()
     
     finally:
-        # Remove hook
+        # Remove hooks
         hook_remover()
+        if 'baseline_hook_remover' in locals():
+            baseline_hook_remover()
 
 
 def plot_metrics(log_dir, step=None):

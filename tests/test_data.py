@@ -112,8 +112,8 @@ def test_format_prompt_with_kv_pairs():
     # Call the function
     prompt = format_prompt_with_kv_pairs(pairs)
     
-    # Check the result
-    expected_prompt = " Query: key1 Value: value1 Query: key2 Value: value2"
+    # Check the result - now uses Key: instead of Query:
+    expected_prompt = "Key: key1 Value: value1 Key: key2 Value: value2"
     assert prompt == expected_prompt
 
 

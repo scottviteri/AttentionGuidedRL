@@ -17,7 +17,7 @@ from src.config import DEVICE, MODEL_TYPE
 def register_embedding_hook(
     model, 
     embed_type: str = "query",
-    layer_idx: int = -1
+    layer_idx: int = -2
 ) -> Tuple[Dict, Callable]:
     """
     Register a hook to extract embeddings from an attention layer.
@@ -25,7 +25,7 @@ def register_embedding_hook(
     Args:
         model: The language model to extract embeddings from
         embed_type: Type of embedding to extract, either "query" or "key"
-        layer_idx: Which layer to extract from (negative indexing supported, default: -1 for last layer)
+        layer_idx: Which layer to extract from (negative indexing supported, default: -2 for second-to-last layer)
         
     Returns:
         Tuple[Dict, Callable]: A dictionary to store the embeddings and a function to remove the hook
@@ -46,7 +46,7 @@ def register_llama_embedding_hook(
     model, 
     embeddings_dict: Dict,
     embed_type: str = "query",
-    layer_idx: int = -1
+    layer_idx: int = -2
 ) -> Tuple[Dict, Callable]:
     """
     Register a hook for Llama models.
@@ -88,7 +88,7 @@ def register_gpt2_embedding_hook(
     model, 
     embeddings_dict: Dict,
     embed_type: str = "query",
-    layer_idx: int = -1
+    layer_idx: int = -2
 ) -> Tuple[Dict, Callable]:
     """
     Register a hook for GPT-2 models.
@@ -165,6 +165,25 @@ def extract_embeddings(
     avg_embeddings = torch.mean(full_embeddings, dim=1)  # [batch_size, hidden_size]
     
     return avg_embeddings
+
+
+def get_query_dimension(model) -> int:
+    """
+    Get the query projection dimension for the model.
+    
+    The query dimension is num_heads * head_dim, which equals the model's hidden dimension.
+    
+    Args:
+        model: The language model
+        
+    Returns:
+        int: The query projection dimension (num_heads * head_dim)
+    """
+    # Get the attention parameters
+    num_heads, num_kv_groups, head_dim = get_attention_params(model)
+    
+    # Query dimension is num_heads * head_dim
+    return num_heads * head_dim
 
 
 def get_attention_params(model) -> Tuple[int, int, int]:
@@ -264,6 +283,10 @@ def compute_similarity(
     
     # Get attention parameters
     num_heads, num_groups, head_dim = get_attention_params(model)
+    
+    # Ensure tensors are in float32 for computation (einsum doesn't handle bfloat16 well)
+    query_embeddings = query_embeddings.float()
+    key_embeddings = key_embeddings.float()
     
     # Reshape query embeddings to separate head dimensions
     # [batch, hidden_size] -> [batch, num_heads, head_dim]

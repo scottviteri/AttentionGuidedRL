@@ -1,0 +1,245 @@
+2025-06-17 23:31:57,899 - INFO - Starting training run with configuration:
+2025-06-17 23:31:57,899 - INFO -   Model: gpt2
+2025-06-17 23:31:57,899 - INFO -   Device: cuda
+2025-06-17 23:31:57,900 - INFO -   Dataset: wikipedia
+2025-06-17 23:31:57,900 - INFO -   Batch size: 4
+2025-06-17 23:31:57,900 - INFO -   Learning rate: 0.0002
+2025-06-17 23:31:57,900 - INFO -   Episodes: 10000
+2025-06-17 23:31:57,900 - INFO - Query mode: Vector queries
+2025-06-17 23:31:57,900 - INFO - Setting up models and tokenizer...
+The new embeddings will be initialized from a multivariate normal distribution that has old embeddings' mean and covariance. As described in this article: https://nlp.stanford.edu/~johnhew/vocab-expansion.html. To disable this, use `mean_resizing=False`
+2025-06-17 23:31:59,061 - INFO - Token count configuration:
+2025-06-17 23:31:59,061 - INFO -   Key prefix tokens: 3
+2025-06-17 23:31:59,061 - INFO -   Value prefix tokens: 3
+2025-06-17 23:31:59,061 - INFO -   Total tokens per round: 26
+2025-06-17 23:31:59,061 - INFO -   Initial prompt tokens: 9
+2025-06-17 23:31:59,061 - INFO -   Number of KV pairs: 15
+2025-06-17 23:31:59,065 - INFO - Setting up data loader for wikipedia dataset...
+2025-06-17 23:31:59,097 - INFO - Starting training...
+  0%|          | 0/1 [00:00<?, ?it/s]Token indices sequence length is longer than the specified maximum sequence length for this model (8287 > 1024). Running this sequence through the model will result in indexing errors
+/home/scottviteri/venv/lib/python3.13/site-packages/bitsandbytes/autograd/_functions.py:315: UserWarning: MatMul8bitLt: inputs will be cast from torch.bfloat16 to float16 during quantization
+  warnings.warn(f"MatMul8bitLt: inputs will be cast from {A.dtype} to float16 during quantization")
+  0%|          | 0/1 [00:06<?, ?it/s]
+
+
+======== EPISODE 0/1 ========
+Generated pool of 15 query-key-value steps
+
+=== Starting New Trajectory ===
+Initial context: Search for relevant information using learned vect...
+Available query-key-value steps: 15
+Query mode: Vector queries
+
+=== Complete Context from Trajectory ===
+Search for relevant information using learned vector queries.Key:  down authority and state, having taken a violent turnValue:  in the past, while evolutionary tactics aim to preKey:  During the latter half of the 19th and theValue:  first decades of the 20th century, the anarchistKey:  (libertarian socialism) of the socialist movement,Value:  and has a strong historical association with anti-capitalKey:  emphasised a sense of disorder. Various factions withinValue:  the French Revolution labelled their opponents as anarchists, althoughKey:  themselves or their beliefs.
+
+The first politicalValue:  philosopher to call himself an anarchist () was Pierre-Key:  anarchists on the matter, and various currents perceive anarchismValue:  slightly differently. Major definitional elements include the willKey:  the end of the classical era of anarchism. InValue:  the last decades of the 20th and into theKey:  Some usages of libertarianism refer to individualisticValue:  free-market philosophy only, and free-marketKey:  era 
+
+Before the establishment of towns andValue:  cities, an established authority did not exist. ItKey:  Zhou and Laozi. Alongside StoicismValue: , Taoism has been said to have had "Key:  extreme cultural liberals, who are primarily concerned with civilValue:  liberties. Additionally, some anarchists use libertarian socialist toKey:  etymological origin of anarchism is from theValue:  Ancient Greek anarkhia, meaning "withoutKey: Anarchism is a political philosophy and movement thatValue:  is sceptical of authority and rejects all involuntary,Key:  attempts at creating dichotomies between the two.Value:  Some scholars describe anarchism as having many influences from liberalismKey:  constantly and insisted on the right of individual freedom ofValue:  conscience. Cynics dismissed human law (nomos
+
+=== Trajectory Complete ===
+
+
+=== Computing Trajectory Rewards ===
+Batch size: 4
+Number of steps: 15
+
+--- Reward Calculation for Step 1/15 ---
+Query: <VECTOR_QUERY>
+Key:  down authority and state, having taken a violent turn
+Value:  in the past, while evolutionary tactics aim to pre
+Current context length: 9 tokens
+Adapter model log prob: -65.5000
+Base model log prob: -66.0000
+Reward: 0.5000
+Using vector query
+
+--- Reward Calculation for Step 2/15 ---
+Query: <VECTOR_QUERY>
+Key:  During the latter half of the 19th and the
+Value:  first decades of the 20th century, the anarchist
+Current context length: 35 tokens
+Adapter model log prob: -51.0000
+Base model log prob: -50.2500
+Reward: -0.7500
+Using vector query
+
+--- Reward Calculation for Step 3/15 ---
+Query: <VECTOR_QUERY>
+Key:  (libertarian socialism) of the socialist movement,
+Value:  and has a strong historical association with anti-capital
+Current context length: 61 tokens
+Adapter model log prob: -40.7500
+Base model log prob: -40.7500
+Reward: 0.0000
+Using vector query
+
+--- Reward Calculation for Step 4/15 ---
+Query: <VECTOR_QUERY>
+Key:  emphasised a sense of disorder. Various factions within
+Value:  the French Revolution labelled their opponents as anarchists, although
+Current context length: 87 tokens
+Adapter model log prob: -62.0000
+Base model log prob: -61.5000
+Reward: -0.5000
+Using vector query
+
+--- Reward Calculation for Step 5/15 ---
+Query: <VECTOR_QUERY>
+Key:  themselves or their beliefs.
+
+The first political
+Value:  philosopher to call himself an anarchist () was Pierre-
+Current context length: 113 tokens
+Adapter model log prob: -60.2500
+Base model log prob: -61.5000
+Reward: 1.2500
+Using vector query
+
+--- Reward Calculation for Step 6/15 ---
+Query: <VECTOR_QUERY>
+Key:  anarchists on the matter, and various currents perceive anarchism
+Value:  slightly differently. Major definitional elements include the will
+Current context length: 139 tokens
+Adapter model log prob: -71.5000
+Base model log prob: -71.0000
+Reward: -0.5000
+Using vector query
+
+--- Reward Calculation for Step 7/15 ---
+Query: <VECTOR_QUERY>
+Key:  the end of the classical era of anarchism. In
+Value:  the last decades of the 20th and into the
+Current context length: 165 tokens
+Adapter model log prob: -36.2500
+Base model log prob: -34.2500
+Reward: -2.0000
+Using vector query
+
+--- Reward Calculation for Step 8/15 ---
+Query: <VECTOR_QUERY>
+Key:  Some usages of libertarianism refer to individualistic
+Value:  free-market philosophy only, and free-market
+Current context length: 191 tokens
+Adapter model log prob: -49.5000
+Base model log prob: -48.2500
+Reward: -1.2500
+Using vector query
+
+--- Reward Calculation for Step 9/15 ---
+Query: <VECTOR_QUERY>
+Key:  era 
+
+Before the establishment of towns and
+Value:  cities, an established authority did not exist. It
+Current context length: 217 tokens
+Adapter model log prob: -54.2500
+Base model log prob: -53.0000
+Reward: -1.2500
+Using vector query
+
+--- Reward Calculation for Step 10/15 ---
+Query: <VECTOR_QUERY>
+Key:  Zhou and Laozi. Alongside Stoicism
+Value: , Taoism has been said to have had "
+Current context length: 243 tokens
+Adapter model log prob: -47.5000
+Base model log prob: -48.2500
+Reward: 0.7500
+Using vector query
+
+--- Reward Calculation for Step 11/15 ---
+Query: <VECTOR_QUERY>
+Key:  extreme cultural liberals, who are primarily concerned with civil
+Value:  liberties. Additionally, some anarchists use libertarian socialist to
+Current context length: 269 tokens
+Adapter model log prob: -61.0000
+Base model log prob: -62.5000
+Reward: 1.5000
+Using vector query
+
+--- Reward Calculation for Step 12/15 ---
+Query: <VECTOR_QUERY>
+Key:  etymological origin of anarchism is from the
+Value:  Ancient Greek anarkhia, meaning "without
+Current context length: 295 tokens
+Adapter model log prob: -57.7500
+Base model log prob: -58.5000
+Reward: 0.7500
+Using vector query
+
+--- Reward Calculation for Step 13/15 ---
+Query: <VECTOR_QUERY>
+Key: Anarchism is a political philosophy and movement that
+Value:  is sceptical of authority and rejects all involuntary,
+Current context length: 321 tokens
+Adapter model log prob: -57.2500
+Base model log prob: -56.7500
+Reward: -0.5000
+Using vector query
+
+--- Reward Calculation for Step 14/15 ---
+Query: <VECTOR_QUERY>
+Key:  attempts at creating dichotomies between the two.
+Value:  Some scholars describe anarchism as having many influences from liberalism
+Current context length: 347 tokens
+Adapter model log prob: -55.7500
+Base model log prob: -56.0000
+Reward: 0.2500
+Using vector query
+
+--- Reward Calculation for Step 15/15 ---
+Query: <VECTOR_QUERY>
+Key:  constantly and insisted on the right of individual freedom of
+Value:  conscience. Cynics dismissed human law (nomos
+Current context length: 373 tokens
+Adapter model log prob: -79.0000
+Base model log prob: -79.0000
+Reward: 0.0000
+Using vector query
+
+=== Trajectory Summary ===
+Average reward: -0.1167
+
+Updated reward stats:
+  Mean: 0.0417
+  Std: 0.1846
+  Count: 4
+
+=== Training Step ===
+Input trajectory batch size: 4
+Reward stats: mean=0.0417, std=0.1846
+Batch element rewards: 0: -0.1167, 1: 0.2417, 2: -0.1667, 3: 0.2083
+GRPO filtered batch size: 2/4
+Keeping trajectories with positive advantage (better than batch average)
+Softmax KL divergence: 0.0005
+Positive advantage ratio: 50.00%
+Traceback (most recent call last):
+  File "/home/scottviteri/Projects/AttentionGuidedRL/src/main.py", line 687, in <module>
+    main()
+    ~~~~^^
+  File "/home/scottviteri/Projects/AttentionGuidedRL/src/main.py", line 439, in main
+    total_loss, num_filtered, policy_loss, kl_loss = train_step(
+                                                     ~~~~~~~~~~^
+        trajectory,
+        ^^^^^^^^^^^
+    ...<8 lines>...
+        embeddings_dict=embeddings_dict
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/scottviteri/Projects/AttentionGuidedRL/src/training.py", line 755, in train_step
+    total_loss, policy_loss, kl_loss = compute_policy_loss(
+                                       ~~~~~~~~~~~~~~~~~~~^
+        filtered_trajectory,
+        ^^^^^^^^^^^^^^^^^^^^
+    ...<7 lines>...
+        embeddings_dict=embeddings_dict
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/scottviteri/Projects/AttentionGuidedRL/src/training.py", line 639, in compute_policy_loss
+    kl_divergence = F.kl_div(log_probs, prev_log_probs, reduction='batchmean', log_target=True)
+  File "/home/scottviteri/venv/lib/python3.13/site-packages/torch/nn/functional.py", line 3396, in kl_div
+    reduced = torch.kl_div(input, target, reduction_enum, log_target=log_target)
+RuntimeError: The size of tensor a (15) must match the size of tensor b (14) at non-singleton dimension 1

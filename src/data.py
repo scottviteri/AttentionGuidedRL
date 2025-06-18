@@ -19,7 +19,6 @@ from src.config import (
     TOKENS_PER_KEY,
     TOKENS_PER_VALUE,
     NUM_KV_PAIRS,
-    QUERY_PREFIX,
     VALUE_PREFIX,
     DEVICE,
     KV_EVERY_N,
@@ -40,6 +39,10 @@ class QKVStep:
         query_text: Optional query text that led to selecting this key-value pair
         query_tokens: Optional tokenized query that led to selecting this pair
         query_embedding: Optional embeddings for the query [batch_size, embedding_dim]
+        query_log_probs: Optional log probabilities for stochastic vector queries [batch_size]
+        query_mean: Optional mean vector for stochastic queries [batch_size, query_dim]
+        similarity_scores: Optional similarity scores between query and all keys [batch_size, num_keys]
+        selected_idx: Optional index of the selected key
     """
 
     key_tokens: torch.Tensor  # Shape: [batch_size, TOKENS_PER_KEY]
@@ -50,6 +53,10 @@ class QKVStep:
     query_text: List[str] = None  # Optional query text that selected this pair
     query_tokens: torch.Tensor = None  # Optional tokenized query
     query_embedding: torch.Tensor = None  # Optional query embedding
+    query_log_probs: torch.Tensor = None  # Optional log probabilities for vector queries [batch_size]
+    query_mean: torch.Tensor = None  # Optional mean vector for stochastic queries [batch_size, query_dim]
+    similarity_scores: torch.Tensor = None  # Optional similarity scores [batch_size, num_keys]
+    selected_idx: int = None  # Optional selected key index
 
     def __post_init__(self):
         """Validate tensor shapes and types."""
@@ -151,11 +158,12 @@ def format_prompt_with_kv_pairs(pairs: List[Tuple[str, str]]) -> str:
     Returns:
         str: The formatted prompt
     """
+    from src.config import KEY_PREFIX
     prompt = ""
     for key, value in pairs:
-        prompt += f"{QUERY_PREFIX}{key}{VALUE_PREFIX}{value}"
+        prompt += f"{KEY_PREFIX}{key} {VALUE_PREFIX}{value} "
 
-    return prompt
+    return prompt.strip()  # Remove trailing space
 
 
 def iter_wikipedia_articles() -> Iterator[Dict]:

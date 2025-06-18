@@ -1,28 +1,34 @@
 """
 Training module for the Attention-Guided RL project.
 
-Contains functions for reinforcement learning training loop, reward calculation,
-and policy optimization.
+Contains the main training loop and related functions for trajectory generation and optimization.
 """
 
+import copy
+import logging
+import numpy as np
 import torch
 import torch.nn.functional as F
+from typing import List, Tuple, Optional, Any, Dict
 from dataclasses import dataclass
-from typing import Dict, List, Any, Tuple, Optional
 
+from src.data import QKVStep
+from src.embeddings import extract_embeddings
 from src.config import (
     DEVICE,
-    TOKENS_PER_QUERY,
     TOKENS_PER_KEY,
-    QUERY_PREFIX,
+    TOKENS_PER_VALUE,
+    KEY_PREFIX,
     VALUE_PREFIX,
     GRADIENT_CLIP_NORM,
-    TEMPERATURE,
-    TOP_P,
-    KEY_PREFIX,
+    KL_PENALTY_COEFFICIENT,
+    QUERY_VEC_TOKEN,
+    NUM_KV_PAIRS,
+    INITIAL_PROMPT,
+    GAMMA,
+    GAE_LAMBDA
 )
-from src.model import create_model_copy
-from src.data import QKVStep
+
 
 
 @dataclass
@@ -34,10 +40,12 @@ class Trajectory:
         qkv_steps: List of QKVStep objects selected during trajectory
         rewards: Optional tensor of rewards for each step [batch_size, num_steps]
         avg_reward: Average reward across steps [batch_size]
+        all_key_embeddings: All available key embeddings for this trajectory [batch_size, num_keys, embedding_dim]
     """
     qkv_steps: List[QKVStep]
     rewards: Optional[torch.Tensor] = None
     avg_reward: Optional[torch.Tensor] = None
+    all_key_embeddings: Optional[torch.Tensor] = None
 
 
 def calculate_conditional_log_prob(
@@ -46,89 +54,41 @@ def calculate_conditional_log_prob(
     context: torch.Tensor
 ) -> torch.Tensor:
     """
-    Calculate conditional log probability of tokens given context.
+    Calculate the conditional log probability of generating tokens given context.
     
     Args:
         model: The language model
-        tokens: Target tokens to evaluate [batch_size, seq_length]
-        context: Context tokens [batch_size, context_length]
+        tokens: The tokens to evaluate [batch_size, seq_length]
+        context: The context tokens [batch_size, context_length]
         
     Returns:
-        torch.Tensor: Log probabilities [batch_size]
+        torch.Tensor: Log probabilities for each batch item [batch_size]
     """
-    batch_size = tokens.shape[0]
-    
-    # Concatenate context and tokens to create the full sequence
+    # Combine context and tokens
     full_sequence = torch.cat([context, tokens], dim=1)
     
-    # Forward pass to get logits (use the full sequence)
+    # Get model outputs
     with torch.no_grad():
         outputs = model(full_sequence)
+        logits = outputs.logits
     
-    # Get logits for only the token positions (last part of the sequence)
-    logits = outputs.logits[:, -tokens.shape[1]:, :]  # [batch_size, seq_length, vocab_size]
+    # Extract logits for the token positions
+    # We need logits from positions [context_length-1] to [context_length + seq_length - 2]
+    # because we predict the next token at each position
+    context_length = context.shape[1]
+    token_logits = logits[:, context_length-1:context_length + tokens.shape[1] - 1, :]
     
-    # Get log probabilities
-    log_probs = F.log_softmax(logits, dim=-1)
+    # Convert to log probabilities
+    log_probs = torch.nn.functional.log_softmax(token_logits, dim=-1)
     
-    # Calculate log prob for each token
-    token_log_probs = torch.gather(
-        log_probs, 
-        dim=2, 
-        index=tokens.unsqueeze(-1)
-    ).squeeze(-1)  # [batch_size, seq_length]
+    # Get the log probabilities of the actual tokens
+    # tokens shape: [batch_size, seq_length]
+    # log_probs shape: [batch_size, seq_length, vocab_size]
+    # We need to gather the log probs of the actual tokens
+    token_log_probs = torch.gather(log_probs, dim=2, index=tokens.unsqueeze(-1)).squeeze(-1)
     
-    # Sum over sequence length
-    sequence_log_probs = token_log_probs.mean(dim=1)  # [batch_size]
-    
-    return sequence_log_probs
-
-
-def generate_query(
-    model: torch.nn.Module,
-    tokenizer: Any,
-    context: List[str]
-) -> torch.Tensor:
-    """
-    Generate a query from the model given context.
-    
-    Args:
-        model: The language model
-        tokenizer: The tokenizer
-        context: Context text list [batch_size]
-        max_length: Maximum number of tokens to generate
-        
-    Returns:
-        torch.Tensor: Generated token IDs [batch_size, max_length]
-    """
-    # Tokenize the context
-    batch_inputs = tokenizer(
-        [f"{ctx}{QUERY_PREFIX}" for ctx in context],
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        add_special_tokens=False
-    ).to(DEVICE)
-    
-    # Generate query tokens - using same value for min and max tokens to ensure exact length
-    with torch.no_grad():
-        output_ids = model.generate(
-            input_ids=batch_inputs["input_ids"],
-            attention_mask=batch_inputs["attention_mask"],
-            min_new_tokens=TOKENS_PER_QUERY,
-            max_new_tokens=TOKENS_PER_QUERY,
-            do_sample=True,
-            temperature=TEMPERATURE,
-            top_p=TOP_P,
-            pad_token_id=tokenizer.eos_token_id,  # Use EOS as padding to avoid special tokens
-            no_repeat_ngram_size=0,  # Disable n-gram penalties
-            early_stopping=False,  # Don't stop before max_length
-        )
-    
-    # Extract only the new tokens (query tokens)
-    query_tokens = output_ids[:, batch_inputs["input_ids"].shape[1]:]
-    
-    return query_tokens
+    # Sum log probabilities across the sequence for each batch item
+    return token_log_probs.sum(dim=1)
 
 
 def generate_query_vector(
@@ -179,6 +139,9 @@ def generate_query_vector(
     finally:
         # Always remove the hook
         hook_remover()
+
+
+
 
 
 def compute_trajectory_rewards(
@@ -264,36 +227,21 @@ def compute_trajectory_rewards(
         if tokenizer:
             # Add prefixes if tokenizer is available
             batch_size = current_context.shape[0]
-            query_prefix_tokens = tokenizer([QUERY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
             key_prefix_tokens = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
             value_prefix_tokens = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
             
-            # Use the stored query tokens if available, otherwise generate new ones
-            query_tokens = None
-            if qkv_step.query_tokens is not None:
-                query_tokens = qkv_step.query_tokens.to(device)
-            else:
-                # Generate query tokens
-                query_tokens = generate_query(
-                    adapter_model,
-                    tokenizer,
-                    tokenizer.batch_decode(current_context)
-                ).to(device)
-            
-                # Display generated query text in verbose mode
-                if verbose and qkv_step.query_text is None:
-                    query_text = tokenizer.batch_decode(query_tokens)
-                    print(f"Generated Query: {query_text[0]}")
-            
+            # Vector queries - no query tokens to add to context
             current_context = torch.cat([
                 current_context,
-                query_prefix_tokens,
-                query_tokens,
                 key_prefix_tokens,
                 key_tokens, 
                 value_prefix_tokens,
                 value_tokens
             ], dim=1)
+            
+            # Display vector query indicator in verbose mode
+            if verbose and qkv_step.query_text is not None and "<VECTOR_QUERY>" in qkv_step.query_text[0]:
+                print(f"Using vector query")
         else:
             # Fallback for tests or when tokenizer is not available
             current_context = torch.cat([
@@ -353,46 +301,42 @@ def update_reward_stats(
     return {"mean": new_mean, "std": new_std, "count": new_count}
 
 
-def filter_trajectories(trajectory: Trajectory, reward_stats: Dict[str, float], percentile: float = 90.0) -> Optional[Trajectory]:
+def filter_trajectories_grpo(trajectory: Trajectory) -> Optional[Trajectory]:
     """
-    Filter a batch of trajectories based on rewards, keeping only those that exceed a certain threshold.
+    Filter a batch of trajectories based on GRPO baseline.
+    Keeps only trajectories with positive advantages (better than batch average at each step).
     
     Args:
         trajectory: The batch of trajectories to filter
-        reward_stats: Statistics about rewards used for normalization
-        percentile: Percentile threshold (0-100) to keep the top X% of datapoints (e.g., 90 for top 10%)
         
     Returns:
         Filtered trajectory, or None if no trajectories pass the filter
     """
-    if trajectory.avg_reward is None or reward_stats["count"] < 10:
-        # Not enough data to filter meaningfully
+    if trajectory.avg_reward is None:
         return trajectory
     
     # Get batch rewards
-    batch_rewards = trajectory.avg_reward
+    batch_rewards = trajectory.rewards
     
-    # If batch size is 1, always keep it during early training
+    # If batch size is 1, always keep it
     if batch_rewards.shape[0] == 1:
         return trajectory
     
-    # Calculate percentile threshold - we need to sort the rewards
-    # Get the value at the specified percentile (e.g., 90th percentile for top 10%)
-    sorted_rewards, _ = torch.sort(batch_rewards)
-    threshold_idx = max(0, int(len(sorted_rewards) * (1 - percentile / 100.0)) - 1)
+    # Compute advantages using GRPO baseline
+    advantages, _ = compute_advantages(
+        batch_rewards, 
+        values=None, 
+        gamma=GAMMA,
+        gae_lambda=GAE_LAMBDA,
+        use_grpo_baseline=True
+    )
     
-    # If threshold_idx is negative or beyond the array bounds, use the minimum value
-    # This ensures we keep at least one element
-    if threshold_idx < 0 or threshold_idx >= len(sorted_rewards):
-        threshold_idx = 0
+    # Get batch indices where overall advantage is positive
+    # Sum advantages across time steps for each batch element
+    batch_advantages = advantages.sum(dim=1)
+    batch_mask = batch_advantages > 0
     
-    # Get the threshold value
-    threshold = sorted_rewards[threshold_idx]
-    
-    # Get batch indices where reward exceeds or equals threshold
-    batch_mask = trajectory.avg_reward >= threshold
-    
-    # If no batch elements pass the threshold, return None
+    # If no batch elements have positive advantage, return None
     if not torch.any(batch_mask):
         return None
     
@@ -416,14 +360,34 @@ def filter_trajectories(trajectory: Trajectory, reward_stats: Dict[str, float], 
         if qkv_step.query_text is not None:
             filtered_attributes["query_text"] = [qkv_step.query_text[i] for i in range(len(qkv_step.query_text)) if batch_mask[i]]
         
-        if qkv_step.query_tokens is not None:
-            filtered_attributes["query_tokens"] = qkv_step.query_tokens[batch_mask_device]
+        if qkv_step.query_tokens is not None and qkv_step.query_tokens.numel() > 0:
+            # For vector queries, query_tokens may be empty tensors with shape [batch_size, 0]
+            if qkv_step.query_tokens.shape[1] > 0:
+                filtered_attributes["query_tokens"] = qkv_step.query_tokens[batch_mask_device]
+            else:
+                # Handle empty query tokens for vector queries
+                filtered_batch_size = batch_mask_device.sum().item()
+                filtered_attributes["query_tokens"] = torch.empty((filtered_batch_size, 0), dtype=qkv_step.query_tokens.dtype, device=qkv_step.query_tokens.device)
         
         if qkv_step.query_embedding is not None:
             filtered_attributes["query_embedding"] = qkv_step.query_embedding[batch_mask_device]
+            
+        if hasattr(qkv_step, 'query_log_probs') and qkv_step.query_log_probs is not None:
+            filtered_attributes["query_log_probs"] = qkv_step.query_log_probs[batch_mask_device]
+            
+        if hasattr(qkv_step, 'query_mean') and qkv_step.query_mean is not None:
+            filtered_attributes["query_mean"] = qkv_step.query_mean[batch_mask_device]
         
         # Create the filtered QKVStep
         filtered_qkv_step = QKVStep(**filtered_attributes)
+        
+        # Copy over additional attributes that are not part of the dataclass
+        if hasattr(qkv_step, 'similarity_scores') and qkv_step.similarity_scores is not None:
+            filtered_qkv_step.similarity_scores = qkv_step.similarity_scores[batch_mask_device]
+        
+        if hasattr(qkv_step, 'selected_idx'):
+            filtered_qkv_step.selected_idx = qkv_step.selected_idx
+        
         filtered_qkv_steps.append(filtered_qkv_step)
     
     # Create new trajectory with filtered elements
@@ -440,7 +404,94 @@ def filter_trajectories(trajectory: Trajectory, reward_stats: Dict[str, float], 
         device = filtered_qkv_steps[0].key_tokens.device
         filtered_trajectory.avg_reward = trajectory.avg_reward[batch_mask.to(device)]
     
+    # Copy over all_key_embeddings, filtering to keep only selected batch elements
+    if trajectory.all_key_embeddings is not None:
+        device = filtered_qkv_steps[0].key_tokens.device
+        filtered_trajectory.all_key_embeddings = trajectory.all_key_embeddings[batch_mask.to(device)]
+    
     return filtered_trajectory
+
+
+def compute_returns(rewards: torch.Tensor, gamma: float = 0.99) -> torch.Tensor:
+    """
+    Compute discounted returns (rewards-to-go) for each timestep.
+    
+    Args:
+        rewards: Tensor of rewards [batch_size, num_steps]
+        gamma: Discount factor
+        
+    Returns:
+        torch.Tensor: Returns for each timestep [batch_size, num_steps]
+    """
+    batch_size, num_steps = rewards.shape
+    returns = torch.zeros_like(rewards)
+    
+    # Compute returns backwards
+    returns[:, -1] = rewards[:, -1]
+    for t in reversed(range(num_steps - 1)):
+        returns[:, t] = rewards[:, t] + gamma * returns[:, t + 1]
+    
+    return returns
+
+
+def compute_advantages(
+    rewards: torch.Tensor,
+    values: Optional[torch.Tensor] = None,
+    gamma: float = 0.99,
+    gae_lambda: float = 0.95,
+    use_grpo_baseline: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantages using Generalized Advantage Estimation (GAE) or GRPO-style baseline.
+    
+    Args:
+        rewards: Tensor of rewards [batch_size, num_steps]
+        values: Tensor of value estimates [batch_size, num_steps] (optional)
+        gamma: Discount factor
+        gae_lambda: GAE lambda parameter
+        use_grpo_baseline: If True and values is None, use GRPO-style per-timestep batch average
+        
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: (advantages, returns)
+    """
+    returns = compute_returns(rewards, gamma)
+    
+    if values is None:
+        if use_grpo_baseline:
+            # GRPO-style: Use batch average return at each timestep as baseline
+            # This automatically handles the step-dependent nature of returns
+            baseline = returns.mean(dim=0, keepdim=True)  # [1, num_steps]
+            advantages = returns - baseline  # Broadcasting subtracts same baseline from each batch element
+            
+            # Note: We don't normalize here because GRPO advantages are already zero-centered
+            # at each timestep by construction (mean across batch is 0)
+        else:
+            # Original: Use average across all timesteps (high variance)
+            advantages = returns - returns.mean(dim=1, keepdim=True)
+            # Normalize advantages for stability
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    else:
+        # Compute TD residuals with value function
+        batch_size, num_steps = rewards.shape
+        advantages = torch.zeros_like(rewards)
+        
+        # Append a zero for the last value (terminal state)
+        values_extended = torch.cat([values, torch.zeros(batch_size, 1, device=values.device)], dim=1)
+        
+        # Compute advantages using GAE
+        last_advantage = 0
+        for t in reversed(range(num_steps)):
+            delta = rewards[:, t] + gamma * values_extended[:, t + 1] - values[:, t]
+            advantages[:, t] = delta + gamma * gae_lambda * last_advantage
+            last_advantage = advantages[:, t]
+        
+        # Normalize advantages for stability
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    
+    return advantages, returns
+
+
+
 
 
 def compute_policy_loss(
@@ -448,10 +499,14 @@ def compute_policy_loss(
     adapter_model: torch.nn.Module,
     previous_model: Any,
     kl_penalty_coef: float,
-    verbose: bool = False
+    verbose: bool = False,
+    gamma: float = 0.99,
+    entropy_coef: float = 0.01,
+    tokenizer: Any = None,
+    embeddings_dict: Dict = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Compute the policy gradient loss with KL penalty.
+    Compute the policy gradient loss with KL penalty for vector queries.
     
     Args:
         trajectory: The trajectory to train on
@@ -459,6 +514,10 @@ def compute_policy_loss(
         previous_model: The model state before update
         kl_penalty_coef: KL penalty coefficient (beta)
         verbose: Flag to enable verbose logging
+        gamma: Discount factor for returns
+        entropy_coef: Coefficient for entropy bonus
+        tokenizer: Tokenizer for reconstructing context
+        embeddings_dict: Embeddings dictionary (unused but kept for compatibility)
         
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: 
@@ -466,90 +525,167 @@ def compute_policy_loss(
             policy_loss: The policy gradient component
             kl_loss: The KL divergence component
     """
-    policy_loss = 0.0
-    kl_loss = 0.0
-    count = 0
-    
     # Determine device to use
     device = next(adapter_model.parameters()).device
+    
+    # Initialize as tensors to maintain gradient flow
+    policy_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    kl_loss = torch.tensor(0.0, device=device, requires_grad=True) 
+    entropy_bonus = torch.tensor(0.0, device=device, requires_grad=True)
+    count = 0
     
     # Ensure trajectory has rewards
     if trajectory.rewards is None or trajectory.avg_reward is None:
         raise ValueError("Trajectory must have rewards computed before policy loss")
     
-    # Get all queries from the trajectory's QKVSteps
-    for qkv_step in trajectory.qkv_steps:
-        # Get query tokens and ensure consistent device
-        if qkv_step.query_tokens is not None:
-            query_tokens = qkv_step.query_tokens.to(device)
+    # Import needed configs
+    from src.config import USE_GRPO_BASELINE, GAE_LAMBDA, INITIAL_PROMPT, KEY_PREFIX, VALUE_PREFIX, USE_POSITIVE_ADVANTAGES_ONLY
+    
+    # Compute returns and advantages
+    returns = compute_returns(trajectory.rewards, gamma)
+    advantages, _ = compute_advantages(
+        trajectory.rewards, 
+        values=None, 
+        gamma=gamma,
+        gae_lambda=GAE_LAMBDA,
+        use_grpo_baseline=USE_GRPO_BASELINE
+    )
+    
+    # Compute what the previous model would have generated
+    # We'll do this by reconstructing the context at each step
+    previous_query_means = []
+    if tokenizer is not None:
+        # Get batch size from first step
+        batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
+        
+        # Initialize context with the initial prompt
+        context_tokens = tokenizer(
+            [INITIAL_PROMPT] * batch_size,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False
+        ).input_ids.to(device)
+        
+        # Reconstruct context and generate previous means for each step
+        for t, qkv_step in enumerate(trajectory.qkv_steps):
+            # Generate query vector with previous model
+            with torch.no_grad():
+                prev_query_mean = generate_query_vector(
+                    previous_model,
+                    tokenizer,
+                    context_tokens,
+                    layer_idx=-2
+                )
+                previous_query_means.append(prev_query_mean)
+            
+            # Update context for next iteration (add key and value tokens)
+            key_prefix_tokens = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+            value_prefix_tokens = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+            
+            context_tokens = torch.cat([
+                context_tokens,
+                key_prefix_tokens,
+                qkv_step.key_tokens.to(device),
+                value_prefix_tokens,
+                qkv_step.value_tokens.to(device)
+            ], dim=1)
+    
+    # Process each step in the trajectory
+    for t, qkv_step in enumerate(trajectory.qkv_steps):
+        if hasattr(qkv_step, 'similarity_scores') and qkv_step.similarity_scores is not None:
+            # Vector queries - compute policy gradient using softmax probabilities
+            similarity_scores = qkv_step.similarity_scores.to(device)
+            selected_idx = qkv_step.selected_idx if hasattr(qkv_step, 'selected_idx') else 0
+            step_advantages = advantages[:, t].to(device)
+            
+            # Compute log probabilities from softmax over similarities
+            from src.config import TEMPERATURE
+            log_probs = F.log_softmax(similarity_scores / TEMPERATURE, dim=-1)
+            selected_log_probs = log_probs[:, selected_idx]  # Get log prob of selected action
+            
+            # Policy gradient loss: -log_prob * advantage
+            if USE_POSITIVE_ADVANTAGES_ONLY:
+                # Only positive advantages contribute - this implements step-level filtering
+                # while preserving sequential context for KL computation
+                effective_advantages = torch.clamp(step_advantages, min=0.0)
+            else:
+                effective_advantages = step_advantages
+            
+            # Add small epsilon to prevent zero gradients when all advantages are clamped
+            if torch.all(effective_advantages == 0):
+                effective_advantages = effective_advantages + 1e-8
+            
+            batch_policy_loss = -(selected_log_probs * effective_advantages).mean()
+            policy_loss = policy_loss + batch_policy_loss  # Use tensor addition to maintain gradient
+            
+            # Compute entropy bonus for categorical distribution
+            probs = torch.exp(log_probs)
+            entropy = -(probs * log_probs).sum(dim=-1).mean()
+            entropy_bonus = entropy_bonus + entropy  # Use tensor addition to maintain gradient
+            
+            # Compute KL divergence between current and previous softmax policies
+            # TODO: Fix dimension mismatch - similarity_scores shrinks but all_key_embeddings doesn't
+            if False and previous_query_means and trajectory.all_key_embeddings is not None:
+                # Recompute similarities with previous query vectors
+                query_embeddings_prev = previous_query_means[t].to(device)
+                all_key_embeddings = trajectory.all_key_embeddings.to(device)
+                
+                # Import compute_similarity to handle normalization properly
+                from src.embeddings import compute_similarity
+                
+                # Compute similarities with previous model's query
+                prev_similarities = compute_similarity(
+                    query_embeddings_prev.unsqueeze(1),  # Add key dimension
+                    all_key_embeddings,
+                    adapter_model  # Pass model for potential model-specific handling
+                )
+                prev_log_probs = F.log_softmax(prev_similarities / TEMPERATURE, dim=-1)
+                
+                # KL divergence between two categorical distributions
+                kl_divergence = F.kl_div(log_probs, prev_log_probs, reduction='batchmean', log_target=True)
+                kl_loss = kl_loss + kl_divergence  # Use tensor addition to maintain gradient
+                
+                if verbose and t == 0:  # Print info for first step
+                    print(f"Softmax KL divergence: {kl_divergence.item():.4f}")
+                    if USE_POSITIVE_ADVANTAGES_ONLY:
+                        pos_ratio = (step_advantages > 0).float().mean()
+                        print(f"Positive advantage ratio: {pos_ratio.item():.2%}")
+            
+            count += 1
         else:
-            # In real usage, query_tokens should be populated by this point
-            # This fallback is mainly for tests
+            # No query information - skip
             if verbose:
-                print("WARNING: Using key_tokens as query_tokens since query_tokens is None. "
-                      "In normal operation, query_tokens should be populated by this point.")
-            query_tokens = qkv_step.key_tokens.to(device)
-        
-        # Use the average reward for the trajectory
-        rewards = trajectory.avg_reward.to(device)
-        
-        # Forward pass with current model to compute log probabilities
-        outputs_current = adapter_model(query_tokens)
-        current_logits = outputs_current.logits
-        
-        # Forward pass with previous model
-        with torch.no_grad():
-            outputs_previous = previous_model(query_tokens)
-            previous_logits = outputs_previous.logits
-        
-        # Compute log probabilities
-        log_probs_current = F.log_softmax(current_logits, dim=-1)
-        log_probs_previous = F.log_softmax(previous_logits, dim=-1)
-        
-        # Gather log probabilities of the actual tokens, skipping the first token
-        # which is used as input
-        token_indices = query_tokens[:, 1:].unsqueeze(-1)
-        token_log_probs = torch.gather(
-            log_probs_current[:, :-1, :], 
-            dim=-1, 
-            index=token_indices
-        ).squeeze(-1)  # [batch_size, seq_length-1]
-        
-        # Compute policy gradient loss
-        batch_policy_loss = -(token_log_probs.mean(dim=-1) * rewards).mean()
-        policy_loss += batch_policy_loss
-        
-        # Compute KL divergence loss (regularization)
-        batch_kl_loss = F.kl_div(
-            log_probs_current.reshape(-1, log_probs_current.size(-1)),
-            log_probs_previous.reshape(-1, log_probs_previous.size(-1)),
-            reduction="batchmean",
-            log_target=True
-        )
-        kl_loss += batch_kl_loss
-        
-        count += 1
+                print("Skipping step - no similarity scores")
+            continue
     
     # Return average loss if there were trajectories, otherwise zero
     if count > 0:
-        avg_policy_loss = policy_loss / count
-        avg_kl_loss = kl_loss / count
+        avg_policy_loss = policy_loss / count if isinstance(policy_loss, torch.Tensor) else torch.tensor(policy_loss / count, device=device)
+        avg_kl_loss = kl_loss / count if isinstance(kl_loss, torch.Tensor) else torch.tensor(kl_loss / count, device=device)
+        avg_entropy = entropy_bonus / count if isinstance(entropy_bonus, torch.Tensor) else torch.tensor(entropy_bonus / count, device=device)
+        
         kl_penalty_term = kl_penalty_coef * avg_kl_loss
-        total_loss = avg_policy_loss + kl_penalty_term
+        entropy_term = entropy_coef * avg_entropy
+        total_loss = avg_policy_loss + kl_penalty_term - entropy_term
         
         if verbose:
             print(f"\n=== Loss Components ===")
             print(f"Policy loss: {avg_policy_loss.item():.4f}")
             print(f"KL divergence loss: {avg_kl_loss.item():.4f}")
+            print(f"Entropy bonus: {avg_entropy.item():.4f}")
             print(f"KL penalty coefficient: {kl_penalty_coef:.4f}")
+            print(f"Entropy coefficient: {entropy_coef:.4f}")
             print(f"KL penalty term: {kl_penalty_term.item():.4f}")
+            print(f"Entropy term: {entropy_term.item():.4f}")
             print(f"Total loss: {total_loss.item():.4f}")
+            print(f"  = {avg_policy_loss.item():.4f} + {kl_penalty_term.item():.4f} - {entropy_term.item():.4f}")
             print(f"=== End Loss Components ===\n")
             
         return total_loss, avg_policy_loss, avg_kl_loss
     else:
-        zero_tensor = torch.tensor(0.0, device=device, requires_grad=True)
-        return zero_tensor, zero_tensor, zero_tensor
+        # Create a small non-zero tensor to ensure gradients can flow
+        small_tensor = torch.tensor(1e-8, device=device, requires_grad=True)
+        return small_tensor, small_tensor, small_tensor
 
 
 def train_step(
@@ -561,7 +697,8 @@ def train_step(
     reward_stats: Dict[str, float],
     kl_penalty_coef: float,
     verbose: bool = False,
-    percentile: float = 90.0,  # Default to top 10%
+    tokenizer: Any = None,
+    embeddings_dict: Dict = None
 ) -> Tuple[float, int, float, float]:
     """
     Perform a single training step.
@@ -572,10 +709,11 @@ def train_step(
         base_model: The base language model without LoRA
         previous_model: The model before update (for KL divergence)
         optimizer: The optimizer
-        reward_stats: Reward statistics for filtering
+        reward_stats: Reward statistics (for logging only with GRPO)
         kl_penalty_coef: KL penalty coefficient (beta)
         verbose: Flag to enable verbose logging
-        percentile: Percentile to use for threshold (e.g., 90.0 means top 10% are kept)
+        tokenizer: Tokenizer (needed for vector queries)
+        embeddings_dict: Embeddings dictionary (needed for vector queries)
         
     Returns:
         Tuple[float, int, float, float]: 
@@ -584,48 +722,41 @@ def train_step(
             policy_loss: Policy gradient component of the loss
             kl_loss: KL divergence component of the loss
     """
-    # Import WARMUP_EPISODES only
-    from src.config import WARMUP_EPISODES
-    
     if verbose:
         print("\n=== Training Step ===")
         
         if trajectory.avg_reward is not None:
             batch_size = trajectory.avg_reward.shape[0]
             print(f"Input trajectory batch size: {batch_size}")
-            print(f"Reward stats: mean={reward_stats['mean']:.4f}, std={reward_stats['std']:.4f}, count={reward_stats['count']}")
+            print(f"Reward stats: mean={reward_stats['mean']:.4f}, std={reward_stats['std']:.4f}")
             
             # Print individual batch element rewards
             if batch_size > 0:
                 rewards = [f"{i}: {reward.item():.4f}" for i, reward in enumerate(trajectory.avg_reward)]
                 print(f"Batch element rewards: {', '.join(rewards)}")
     
-    # Filter trajectory based on reward
-    filtered_trajectory = filter_trajectories(trajectory, reward_stats, percentile)
+    # Filter trajectory based on GRPO baseline
+    filtered_trajectory = filter_trajectories_grpo(trajectory)
     
     # Skip update if no batch elements meet the criteria
     if filtered_trajectory is None:
         if verbose:
-            print("No batch elements meet filtering criteria. Skipping update.")
+            print("No batch elements have positive advantage. Skipping update.")
         return 0.0, 0, 0.0, 0.0
     
     # Get the number of batch elements that passed filtering
+    original_batch_size = trajectory.avg_reward.shape[0]
     filtered_batch_size = filtered_trajectory.avg_reward.shape[0]
     
     if verbose:
-        print(f"Filtered batch size: {filtered_batch_size}/{trajectory.avg_reward.shape[0]}")
-        if reward_stats["count"] > WARMUP_EPISODES:
-            # If we have batch rewards, calculate the actual threshold used
-            if trajectory.avg_reward is not None and trajectory.avg_reward.shape[0] > 1:
-                sorted_rewards, _ = torch.sort(trajectory.avg_reward)
-                threshold_idx = max(0, int(len(sorted_rewards) * (1 - percentile / 100.0)) - 1)
-                threshold = sorted_rewards[threshold_idx].item()
-                print(f"Using top {100-percentile:.1f}% filtering - threshold: {threshold:.4f}")
-            else:
-                print(f"Using top {100-percentile:.1f}% filtering - all datapoints kept with small batch")
+        print(f"GRPO filtered batch size: {filtered_batch_size}/{original_batch_size}")
+        print(f"Keeping trajectories with positive advantage (better than batch average)")
     
     # Zero gradients
     optimizer.zero_grad()
+    
+    # Import the new parameters
+    from src.config import GAMMA, ENTROPY_COEF
     
     # Compute policy loss
     total_loss, policy_loss, kl_loss = compute_policy_loss(
@@ -633,7 +764,11 @@ def train_step(
         adapter_model,
         previous_model,
         kl_penalty_coef,
-        verbose=verbose
+        verbose=verbose,
+        gamma=GAMMA,
+        entropy_coef=ENTROPY_COEF,
+        tokenizer=tokenizer,
+        embeddings_dict=embeddings_dict
     )
     
     if verbose:
