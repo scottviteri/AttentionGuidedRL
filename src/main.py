@@ -12,9 +12,10 @@ import torch
 import torch.optim as optim
 from tqdm import tqdm
 from datetime import datetime
-from typing import List, Optional, Dict, Callable, Any
+from typing import List, Optional, Dict, Callable, Any, Tuple
 import numpy as np
 from copy import deepcopy
+import sys
 
 from src.config import (
     DEVICE,
@@ -56,6 +57,8 @@ total_losses = []
 policy_losses = []
 kl_losses = []
 avg_rewards = []
+adapter_log_probs = []
+baseline_log_probs = []
 
 def setup_logging(args):
     """
@@ -224,6 +227,10 @@ def generate_trajectory(
         device_selected_step.similarity_scores = similarity_scores
         device_selected_step.selected_idx = selected_idx
         
+        # IMPORTANT: Store the current available key embeddings at this step
+        # This fixes the KL divergence dimension mismatch issue
+        device_selected_step.available_key_embeddings = key_embeddings
+        
         # Add selected step to the list
         selected_steps.append(device_selected_step)
         
@@ -358,13 +365,16 @@ def main():
         # This is a deep copy of the initial adapter model that won't be updated frequently
         baseline_model = create_model_copy(adapter_model)
         
-        # Register embedding hook for the baseline model
-        baseline_embeddings_dict, baseline_hook_remover = register_embedding_hook(baseline_model)
+        # Register embedding hook for the baseline model (for KEY embeddings)
+        baseline_embeddings_dict, baseline_hook_remover = register_embedding_hook(baseline_model, embed_type="key")
         
         # Use baseline model for key embeddings to ensure stability
-        kv_pair_generator = iter_key_value_pairs_unified(
+        # Pass the same tokenizer that was used to set up the models to avoid vocabulary mismatches
+        from src.data import iter_key_value_pairs_unified_with_tokenizer
+        kv_pair_generator = iter_key_value_pairs_unified_with_tokenizer(
             dataset_name=args.dataset,
             batch_size=args.batch_size, 
+            tokenizer=tokenizer,  # Use the same tokenizer instance
             embedding_fn=lambda x: extract_embeddings(baseline_model, x, baseline_embeddings_dict)
         )
         
@@ -372,6 +382,35 @@ def main():
         logging.info("Starting training...")
         episodes_range = range(start_episode, args.episodes)
         progress_bar = tqdm(episodes_range)
+        
+        # Training loop
+        reward_history = []
+        loss_history = []
+        gradient_history = []
+        gradient_magnitudes = []  # Track gradient magnitudes over time
+        weight_changes = []  # Track weight changes over time
+        
+        # Keep a copy of the previous model for KL penalty
+        previous_model = deepcopy(adapter_model)
+        
+        # Function to compute gradient statistics
+        def get_gradient_stats(model):
+            total_norm = 0.0
+            param_count = 0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_count += 1
+                    total_norm += p.grad.data.norm(2).item() ** 2
+            total_norm = total_norm ** 0.5
+            return total_norm, param_count
+        
+        # Function to compute weight change
+        def compute_weight_change(model1, model2):
+            total_change = 0.0
+            for p1, p2 in zip(model1.parameters(), model2.parameters()):
+                if p1.requires_grad:
+                    total_change += (p1 - p2).norm(2).item() ** 2
+            return total_change ** 0.5
         
         for episode in progress_bar:
             if args.verbose:
@@ -412,7 +451,7 @@ def main():
             
             # Compute trajectory rewards using baseline model (not base model)
             # This ensures fair comparison since baseline knows how to use vector queries
-            compute_trajectory_rewards(
+            _, adapter_log_probs_batch, baseline_log_probs_batch = compute_trajectory_rewards(
                 trajectory, 
                 adapter_model, 
                 baseline_model, 
@@ -423,7 +462,7 @@ def main():
             
             # Create a deep copy of the current adapter model for KL divergence computation
             # This is important to ensure the reference model doesn't change during training
-            previous_model = create_model_copy(adapter_model)
+            previous_model = deepcopy(adapter_model)
             
             # Update reward stats
             if trajectory.avg_reward is not None:
@@ -436,7 +475,7 @@ def main():
                     print(f"  Count: {reward_stats['count']}")
             
             # Perform training step
-            total_loss, num_filtered, policy_loss, kl_loss = train_step(
+            total_loss, positive_adv_percentage, policy_loss, kl_loss = train_step(
                 trajectory,
                 adapter_model,
                 baseline_model,  # Now using baseline instead of base
@@ -466,7 +505,7 @@ def main():
             progress_bar.set_description(
                 f"Episode {episode}/{args.episodes}, "
                 f"Loss: {total_loss:.4f}, "
-                f"Filtered: {num_filtered}/{trajectory.avg_reward.shape[0]}, "
+                f"Pos Adv: {positive_adv_percentage:.1f}%, "
                 f"Reward: {avg_reward:.4f}"
             )
             
@@ -475,14 +514,15 @@ def main():
                 # Update the baseline model to reflect learning progress
                 baseline_model = create_model_copy(adapter_model)
                 
-                # Re-register the embedding hook for the new baseline
+                # Re-register the embedding hook for the new baseline (for KEY embeddings)
                 baseline_hook_remover()  # Remove old hook
-                baseline_embeddings_dict, baseline_hook_remover = register_embedding_hook(baseline_model)
+                baseline_embeddings_dict, baseline_hook_remover = register_embedding_hook(baseline_model, embed_type="key")
                 
                 # Update the embedding function in the generator
-                kv_pair_generator = iter_key_value_pairs_unified(
+                kv_pair_generator = iter_key_value_pairs_unified_with_tokenizer(
                     dataset_name=args.dataset,
                     batch_size=args.batch_size, 
+                    tokenizer=tokenizer,  # Use the same tokenizer instance
                     embedding_fn=lambda x: extract_embeddings(baseline_model, x, baseline_embeddings_dict)
                 )
                 
@@ -514,29 +554,22 @@ def main():
                 if args.verbose:
                     print(f"\nCheckpoint saved at episode {episode}")
                 
-                # Plot metrics periodically
+            # Plot metrics more frequently (every 25 episodes) for better monitoring
+            if episode > 0 and episode % 25 == 0:
                 plot_metrics(log_dir)
             
             # Log statistics
             if episode % args.log_interval == 0:
-                log_dict = {
-                    "episode": episode,
-                    "total_loss": total_loss,
-                    "policy_loss": policy_loss,
-                    "kl_loss": kl_loss,
-                    "kl_penalty_term": kl_loss * KL_PENALTY_COEFFICIENT,
-                    "reward": avg_reward,
-                    "reward_mean": reward_stats["mean"],
-                    "reward_std": reward_stats["std"],
-                    "filtered_ratio": num_filtered / trajectory.avg_reward.shape[0] if trajectory.avg_reward.shape[0] > 0 else 0
-                }
+                # Convert tensors to floats for logging
+                policy_loss_val = policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss
+                kl_loss_val = kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss
                 
                 logging.info(
                     f"Episode {episode}/{args.episodes}, "
                     f"Total Loss: {total_loss:.4f}, "
-                    f"Policy Loss: {policy_loss:.4f}, "
-                    f"KL Loss: {kl_loss:.4f}, "
-                    f"Filtered: {num_filtered}/{trajectory.avg_reward.shape[0]}, "
+                    f"Policy Loss: {policy_loss_val:.4f}, "
+                    f"KL Loss: {kl_loss_val:.4f}, "
+                    f"Filtered: {positive_adv_percentage:.1f}%, "
                     f"Reward: {avg_reward:.4f}, "
                     f"Reward Mean: {reward_stats['mean']:.4f}, "
                     f"Reward Std: {reward_stats['std']:.4f}"
@@ -544,7 +577,68 @@ def main():
                 
                 # Log to wandb if enabled
                 if ENABLE_WANDB:
-                    wandb.log(log_dict)
+                    wandb.log({
+                        "episode": episode,
+                        "total_loss": total_loss,
+                        "policy_loss": policy_loss_val,
+                        "kl_loss": kl_loss_val,
+                        "kl_penalty_term": kl_loss_val * KL_PENALTY_COEFFICIENT,
+                        "reward": avg_reward,
+                        "reward_mean": reward_stats["mean"],
+                        "reward_std": reward_stats["std"],
+                        "positive_adv_percentage": positive_adv_percentage
+                    })
+            
+            # Track gradient statistics
+            gradient_stats = get_gradient_stats(adapter_model)
+            gradient_history.append(gradient_stats)
+            gradient_magnitudes.append(gradient_stats[0])
+            
+            # Track weight change
+            weight_change = compute_weight_change(adapter_model, previous_model)
+            weight_changes.append(weight_change)
+            
+            # Track reward history
+            reward_history.append(avg_reward)
+            loss_history.append(total_loss)
+            
+            # Track log probabilities (average across batch and timesteps)
+            adapter_log_probs.append(adapter_log_probs_batch.mean().item())
+            baseline_log_probs.append(baseline_log_probs_batch.mean().item())
+            
+            # Log every LOG_INTERVAL episodes
+            if episode % LOG_INTERVAL == 0:
+                # Convert tensors to floats for logging
+                policy_loss_val = policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss
+                kl_loss_val = kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss
+                
+                logging.info(
+                    f"Episode {episode}/{args.episodes}, "
+                    f"Total Loss: {total_loss:.4f}, "
+                    f"Policy Loss: {policy_loss_val:.4f}, "
+                    f"KL Loss: {kl_loss_val:.4f}, "
+                    f"Filtered: {positive_adv_percentage:.1f}%, "
+                    f"Reward: {avg_reward:.4f}, "
+                    f"Reward Mean: {reward_stats['mean']:.4f}, "
+                    f"Reward Std: {reward_stats['std']:.4f}"
+                )
+                
+                # Log gradient diagnostics
+                if len(gradient_magnitudes) > 0:
+                    logging.info(
+                        f"  Gradient Stats - Norm: {gradient_magnitudes[-1]:.6f}, "
+                        f"Weight Change: {weight_changes[-1]:.6f}"
+                    )
+                    
+                    # Check if weights are updating
+                    if weight_changes[-1] < 1e-6:
+                        logging.warning("  WARNING: Weights are not changing!")
+                    
+                    # Check gradient health
+                    if gradient_magnitudes[-1] < 1e-8:
+                        logging.warning("  WARNING: Gradients are vanishing!")
+                    elif gradient_magnitudes[-1] > 100:
+                        logging.warning("  WARNING: Gradients are exploding!")
             
         # Save final checkpoint
         save_checkpoint(adapter_model, "latest")
@@ -584,11 +678,15 @@ def plot_metrics(log_dir, step=None):
     cpu_kl_losses = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in kl_losses]
     cpu_avg_rewards = [reward.item() if isinstance(reward, torch.Tensor) else reward for reward in avg_rewards]
     
+    # Convert log probabilities to CPU
+    cpu_adapter_log_probs = [prob.item() if isinstance(prob, torch.Tensor) else prob for prob in adapter_log_probs]
+    cpu_baseline_log_probs = [prob.item() if isinstance(prob, torch.Tensor) else prob for prob in baseline_log_probs]
+    
     # Calculate KL penalty term for visualization
     cpu_kl_penalty_terms = [kl * KL_PENALTY_COEFFICIENT for kl in cpu_kl_losses]
     
-    # Create a figure with 2x2 subplots for more detailed visualization
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+    # Create a figure with 2x3 subplots for more comprehensive visualization
+    fig, ((ax1, ax2, ax3), (ax4, ax5, ax6)) = plt.subplots(2, 3, figsize=(20, 12))
     
     # 1. Loss components plot
     ax1.plot(cpu_training_steps, cpu_total_losses, 'b-', label='Total Loss', linewidth=2)
@@ -614,7 +712,23 @@ def plot_metrics(log_dir, step=None):
         ax2.plot(cpu_training_steps, p(cpu_training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
         ax2.legend()
     
-    # 3. Loss breakdown pie chart (for the most recent step)
+    # 3. Log Probabilities plot (NEW!)
+    ax3.plot(cpu_training_steps, cpu_adapter_log_probs, 'darkgreen', label='Adapter Model', linewidth=2)
+    ax3.plot(cpu_training_steps, cpu_baseline_log_probs, 'orange', label='Baseline Model', linewidth=2)
+    ax3.set_xlabel('Training Step')
+    ax3.set_ylabel('Average Log Probability')
+    ax3.set_title('Model Log Probabilities Over Time')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    
+    # Add trend lines for log probabilities
+    if len(cpu_training_steps) > 10:
+        z_adapter = np.polyfit(cpu_training_steps, cpu_adapter_log_probs, 1)
+        z_baseline = np.polyfit(cpu_training_steps, cpu_baseline_log_probs, 1)
+        ax3.plot(cpu_training_steps, np.poly1d(z_adapter)(cpu_training_steps), "g--", alpha=0.5)
+        ax3.plot(cpu_training_steps, np.poly1d(z_baseline)(cpu_training_steps), "orange", linestyle="--", alpha=0.5)
+    
+    # 4. Loss breakdown pie chart (for the most recent step)
     if len(cpu_policy_losses) > 0 and len(cpu_kl_penalty_terms) > 0:
         latest_policy_loss = abs(cpu_policy_losses[-1])
         latest_kl_penalty = abs(cpu_kl_penalty_terms[-1])
@@ -625,24 +739,44 @@ def plot_metrics(log_dir, step=None):
             labels = ['Policy Loss', 'KL Penalty']
             colors = ['green', 'red']
             
-            ax3.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
-            ax3.set_title('Loss Breakdown (Latest Step)')
+            ax4.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+            ax4.set_title('Loss Breakdown (Latest Step)')
     else:
-        ax3.text(0.5, 0.5, 'No data available', ha='center', va='center', transform=ax3.transAxes)
-        ax3.set_title('Loss Breakdown (Latest Step)')
+        ax4.text(0.5, 0.5, 'No data available', ha='center', va='center', transform=ax4.transAxes)
+        ax4.set_title('Loss Breakdown (Latest Step)')
     
-    # 4. KL Divergence over time
-    ax4.plot(cpu_training_steps, cpu_kl_losses, 'darkred', linewidth=2)
-    ax4.set_xlabel('Training Step')
-    ax4.set_ylabel('KL Divergence')
-    ax4.set_title('KL Divergence Between Current and Previous Policy')
-    ax4.grid(True, alpha=0.3)
+    # 5. KL Divergence over time
+    ax5.plot(cpu_training_steps, cpu_kl_losses, 'darkred', linewidth=2)
+    ax5.set_xlabel('Training Step')
+    ax5.set_ylabel('KL Divergence')
+    ax5.set_title('KL Divergence Between Current and Previous Policy')
+    ax5.grid(True, alpha=0.3)
     
     # Add horizontal line for typical KL divergence scale
     if len(cpu_kl_losses) > 0:
         mean_kl = np.mean(cpu_kl_losses)
-        ax4.axhline(y=mean_kl, color='gray', linestyle='--', alpha=0.5, label=f'Mean: {mean_kl:.4f}')
-        ax4.legend()
+        ax5.axhline(y=mean_kl, color='gray', linestyle='--', alpha=0.5, label=f'Mean: {mean_kl:.4f}')
+        ax5.legend()
+    
+    # 6. Log Probability Improvement plot (NEW!)
+    if len(cpu_adapter_log_probs) > 0 and len(cpu_baseline_log_probs) > 0:
+        improvement = [adapt - base for adapt, base in zip(cpu_adapter_log_probs, cpu_baseline_log_probs)]
+        ax6.plot(cpu_training_steps, improvement, 'darkblue', linewidth=2)
+        ax6.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+        ax6.set_xlabel('Training Step')
+        ax6.set_ylabel('Log Prob Improvement')
+        ax6.set_title('Adapter vs Baseline Log Probability Improvement')
+        ax6.grid(True, alpha=0.3)
+        
+        # Add trend line
+        if len(cpu_training_steps) > 10:
+            z = np.polyfit(cpu_training_steps, improvement, 1)
+            p = np.poly1d(z)
+            ax6.plot(cpu_training_steps, p(cpu_training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
+            ax6.legend()
+    else:
+        ax6.text(0.5, 0.5, 'No data available', ha='center', va='center', transform=ax6.transAxes)
+        ax6.set_title('Log Probability Improvement')
     
     plt.tight_layout()
     

@@ -10,7 +10,7 @@ import copy
 import torch.nn.functional as F
 import logging
 
-from src.config import KL_PENALTY_COEFFICIENT, TOKENS_PER_KEY, TOKENS_PER_VALUE, KEY_PREFIX, GAMMA, ENTROPY_COEF
+from src.config import KL_PENALTY_COEFFICIENT, TOKENS_PER_KEY, TOKENS_PER_VALUE, KEY_PREFIX, GAMMA
 from src.data import KeyValuePair, QKVStep
 
 
@@ -146,18 +146,27 @@ def test_compute_trajectory_rewards(mock_trajectory, mock_models):
         # Create context tokens
         context_tokens = torch.randint(0, 1000, (batch_size, 5))
         
-        # Compute rewards
-        rewards = compute_trajectory_rewards(
+        # Mock tokenizer
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.return_value.input_ids = torch.zeros((batch_size, 3), dtype=torch.long)
+        
+        # Call function
+        rewards, adapter_log_probs, baseline_log_probs = compute_trajectory_rewards(
             mock_trajectory,
             adapter_model,
             base_model,
             context_tokens,
+            tokenizer=mock_tokenizer,
+            verbose=False
         )
-        
-        # Verify shapes and rewards computation
-        assert rewards is not None
-        assert isinstance(rewards, torch.Tensor)
-        assert rewards.shape == (batch_size, len(mock_trajectory.qkv_steps))
+    
+    # Verify outputs
+    assert isinstance(rewards, torch.Tensor)
+    assert isinstance(adapter_log_probs, torch.Tensor)
+    assert isinstance(baseline_log_probs, torch.Tensor)
+    assert rewards.shape == (2, 2)  # batch_size=2, num_steps=2
+    assert adapter_log_probs.shape == (2, 2)
+    assert baseline_log_probs.shape == (2, 2)
 
 
 def test_update_reward_stats():
@@ -248,7 +257,7 @@ def test_compute_policy_loss(mock_trajectory, mock_models):
     previous_model.return_value = MagicMock(logits=previous_logits)
     
     # Call function
-    total_loss, policy_loss, kl_loss = compute_policy_loss(
+    total_loss, policy_loss, kl_loss, positive_adv_percentage = compute_policy_loss(
         mock_trajectory,
         adapter_model,
         previous_model,
@@ -273,11 +282,11 @@ def test_train_step(mock_models, mock_trajectory):
     optimizer = MagicMock()
     
     # Mock compute_policy_loss
-    with patch("src.training.compute_policy_loss", return_value=(torch.tensor(1.0, requires_grad=True), torch.tensor(0.7, requires_grad=True), torch.tensor(0.3, requires_grad=True))):
+    with patch("src.training.compute_policy_loss", return_value=(torch.tensor(1.0, requires_grad=True), torch.tensor(0.7, requires_grad=True), torch.tensor(0.3, requires_grad=True), 75.0)):
         # Mock filter_trajectories_grpo to return the trajectory with filtered batch elements
         with patch("src.training.filter_trajectories_grpo", return_value=mock_trajectory):
             # Call function
-            total_loss, num_filtered, policy_loss, kl_loss = train_step(
+            total_loss, positive_adv_percentage, policy_loss, kl_loss = train_step(
                 mock_trajectory, 
                 adapter_model, 
                 base_model,
@@ -290,7 +299,7 @@ def test_train_step(mock_models, mock_trajectory):
     
     # Check outputs
     assert isinstance(total_loss, float)
-    assert isinstance(num_filtered, int)
+    assert isinstance(positive_adv_percentage, float)
     assert isinstance(policy_loss, torch.Tensor)
     assert isinstance(kl_loss, torch.Tensor)
     assert optimizer.zero_grad.called
@@ -404,10 +413,10 @@ def test_model_behavior_during_training():
     with patch("src.training.filter_trajectories_grpo", return_value=trajectory):
         with patch('src.training.compute_policy_loss') as mock_compute_policy_loss:
             # Create tensors that require grad for the backward pass
-            mock_total_loss = torch.tensor([0.1], requires_grad=True)
-            mock_policy_loss = torch.tensor([0.07], requires_grad=True)
-            mock_kl_loss = torch.tensor([0.03], requires_grad=True)
-            mock_compute_policy_loss.return_value = (mock_total_loss, mock_policy_loss, mock_kl_loss)
+            mock_total_loss = torch.tensor([0.1], device=device, requires_grad=True)
+            mock_policy_loss = torch.tensor([0.07], device=device, requires_grad=True)
+            mock_kl_loss = torch.tensor([0.03], device=device, requires_grad=True)
+            mock_compute_policy_loss.return_value = (mock_total_loss, mock_policy_loss, mock_kl_loss, 75.0)
             
             train_step(
                 trajectory,
@@ -467,7 +476,7 @@ def test_compute_trajectory_rewards_with_real_model(gpt2_model, gpt2_tokenizer):
     # With some patching to avoid full model runs
     with patch('src.training.calculate_conditional_log_prob', return_value=torch.tensor([0.5], device=gpt2_model.device)):
         # Compute rewards
-        compute_trajectory_rewards(trajectory, gpt2_model, gpt2_model, context_tokens)
+        _, _, _ = compute_trajectory_rewards(trajectory, gpt2_model, gpt2_model, context_tokens)
         
         # Verify rewards were computed
         assert trajectory.rewards is not None
@@ -533,10 +542,10 @@ def test_train_step_with_real_model(gpt2_model):
         mock_total_loss = torch.tensor([0.1], device=gpt2_model.device, requires_grad=True)
         mock_policy_loss = torch.tensor([0.07], device=gpt2_model.device, requires_grad=True)
         mock_kl_loss = torch.tensor([0.03], device=gpt2_model.device, requires_grad=True)
-        mock_compute_policy_loss.return_value = (mock_total_loss, mock_policy_loss, mock_kl_loss)
+        mock_compute_policy_loss.return_value = (mock_total_loss, mock_policy_loss, mock_kl_loss, 75.0)
         
         # Run train step
-        total_loss, num_filtered, policy_loss, kl_loss = train_step(
+        total_loss, positive_adv_percentage, policy_loss, kl_loss = train_step(
             trajectory,
             adapter_model,
             gpt2_model,
@@ -549,7 +558,7 @@ def test_train_step_with_real_model(gpt2_model):
     
     # Verify output
     assert isinstance(total_loss, float)
-    assert isinstance(num_filtered, int)
+    assert isinstance(positive_adv_percentage, float)
     assert isinstance(policy_loss, torch.Tensor)
     assert isinstance(kl_loss, torch.Tensor)
     assert zero_grad_called[0]  # Check that zero_grad was called
@@ -665,7 +674,7 @@ def test_compute_advantages():
 def test_improved_policy_loss(gpt2_model):
     """Test the improved compute_policy_loss with advantages and entropy."""
     from src.training import Trajectory, compute_policy_loss, QKVStep
-    from src.config import GAMMA, ENTROPY_COEF
+    from src.config import GAMMA
     
     batch_size = 2
     device = next(gpt2_model.parameters()).device
@@ -704,8 +713,7 @@ def test_improved_policy_loss(gpt2_model):
         previous_model,
         kl_penalty_coef=0.1,
         verbose=True,
-        gamma=GAMMA,
-        entropy_coef=ENTROPY_COEF
+        gamma=GAMMA
     )
     
     # Verify that losses are computed
@@ -786,4 +794,261 @@ def test_grpo_baseline():
     )
     
     # These should be different
-    assert not torch.allclose(advantages_grpo, advantages_no_grpo) 
+    assert not torch.allclose(advantages_grpo, advantages_no_grpo)
+
+
+def test_kl_divergence_dimension_match():
+    """Test that KL divergence computation works with per-step available key embeddings."""
+    from src.training import Trajectory, compute_policy_loss
+    from src.data import QKVStep
+    import copy
+    
+    batch_size = 2
+    device = torch.device("cpu")
+    
+    # Create a mock model
+    class MockModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(10, 10)
+            
+        def parameters(self):
+            return self.linear.parameters()
+    
+    adapter_model = MockModel()
+    previous_model = copy.deepcopy(adapter_model)
+    
+    # Create trajectory with decreasing number of available keys at each step
+    qkv_steps = []
+    for t in range(3):
+        num_available_keys = 5 - t  # 5, 4, 3 keys available at each step
+        
+        step = QKVStep(
+            key_tokens=torch.randint(0, 100, (batch_size, 10)),
+            value_tokens=torch.randint(0, 100, (batch_size, 10)),
+            key_embedding=torch.randn(batch_size, 768),
+            key_text=[f"key_{t}_b0", f"key_{t}_b1"],
+            value_text=[f"val_{t}_b0", f"val_{t}_b1"],
+            query_text=["<VECTOR_QUERY>"] * batch_size,
+            query_tokens=torch.empty((batch_size, 0), dtype=torch.long),
+            query_embedding=torch.randn(batch_size, 768),
+        )
+        
+        # Add similarity scores and available key embeddings with matching dimensions
+        step.similarity_scores = torch.randn(batch_size, num_available_keys)
+        step.available_key_embeddings = torch.randn(batch_size, num_available_keys, 768)
+        step.selected_idx = 0
+        
+        qkv_steps.append(step)
+    
+    trajectory = Trajectory(qkv_steps=qkv_steps)
+    trajectory.rewards = torch.tensor([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
+    trajectory.avg_reward = trajectory.rewards.mean(dim=1)
+    
+    # Mock tokenizer
+    class MockTokenizer:
+        def __call__(self, texts, **kwargs):
+            return type('obj', (object,), {'input_ids': torch.zeros((len(texts), 10), dtype=torch.long)})
+        
+        def encode(self, text, **kwargs):
+            return [1, 2, 3]
+    
+    tokenizer = MockTokenizer()
+    
+    # This should not raise dimension mismatch errors
+    with patch('src.training.generate_query_vector') as mock_generate_query:
+        # Mock query vector generation
+        mock_generate_query.return_value = torch.randn(batch_size, 768)
+        
+        with patch('src.embeddings.compute_similarity') as mock_compute_similarity:
+            # Mock similarity computation to return matching dimensions
+            def mock_similarity(query_emb, key_emb, model):
+                batch_size = query_emb.shape[0]
+                num_keys = key_emb.shape[1]
+                return torch.randn(batch_size, num_keys)
+            
+            mock_compute_similarity.side_effect = mock_similarity
+            
+            try:
+                total_loss, policy_loss, kl_loss = compute_policy_loss(
+                    trajectory,
+                    adapter_model,
+                    previous_model,
+                    kl_penalty_coef=0.1,
+                    tokenizer=tokenizer,
+                    verbose=False
+                )
+                
+                # Verify the losses are computed
+                assert isinstance(total_loss, torch.Tensor)
+                assert isinstance(policy_loss, torch.Tensor)
+                assert isinstance(kl_loss, torch.Tensor)
+                
+                # KL loss should be computed (non-zero) if we have available_key_embeddings
+                # Though it might be zero if models are identical
+                assert kl_loss.item() >= 0.0
+                
+                # Verify that compute_similarity was called for KL computation
+                # It should be called twice per timestep (current + previous model = 6 times for 3 timesteps)
+                assert mock_compute_similarity.call_count == 6
+                
+            except RuntimeError as e:
+                if "size mismatch" in str(e):
+                    pytest.fail(f"Dimension mismatch in KL divergence computation: {e}")
+                else:
+                    raise 
+
+
+def test_adapter_weights_update_during_training(gpt2_model):
+    """Test that adapter weights actually update during a training step."""
+    from src.training import train_step, Trajectory, compute_policy_loss
+    from src.model import apply_lora_adapter
+    from src.data import QKVStep
+    import copy
+    
+    # Set up adapter model with LoRA
+    adapter_model = apply_lora_adapter(gpt2_model)
+    device = next(adapter_model.parameters()).device
+    
+    # Get LoRA parameters before training
+    lora_params_before = {}
+    for name, param in adapter_model.named_parameters():
+        if 'lora' in name.lower() and param.requires_grad:
+            lora_params_before[name] = param.clone().detach()
+    
+    # Ensure we found LoRA parameters
+    assert len(lora_params_before) > 0, "No LoRA parameters found in adapter model"
+    
+    # Create optimizer with high learning rate for testing
+    optimizer = torch.optim.Adam(adapter_model.parameters(), lr=0.1)
+    
+    # Create trajectory with guaranteed positive advantages
+    batch_size = 4
+    qkv_steps = []
+    for i in range(3):
+        num_keys = 5
+        step = QKVStep(
+            key_tokens=torch.randint(0, 100, (batch_size, 10), device=device),
+            value_tokens=torch.randint(0, 100, (batch_size, 10), device=device),
+            key_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=device),
+            key_text=[f"key_{i}_{j}" for j in range(batch_size)],
+            value_text=[f"val_{i}_{j}" for j in range(batch_size)],
+            query_text=["<VECTOR_QUERY>"] * batch_size,
+            query_tokens=torch.empty((batch_size, 0), device=device, dtype=torch.long),
+            query_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=device),
+        )
+        # Add similarity scores and available embeddings
+        step.similarity_scores = torch.randn(batch_size, num_keys, device=device)
+        step.available_key_embeddings = torch.randn(batch_size, num_keys, gpt2_model.config.n_embd, device=device)
+        step.selected_idx = 0
+        qkv_steps.append(step)
+    
+    trajectory = Trajectory(qkv_steps=qkv_steps)
+    # Create rewards with clear positive advantages
+    # Make some batch elements clearly better than others
+    trajectory.rewards = torch.tensor([
+        [0.1, 0.2, 0.3],  # Low rewards
+        [1.0, 2.0, 3.0],  # High rewards - positive advantage
+        [0.0, 0.1, 0.2],  # Very low rewards  
+        [0.5, 1.0, 1.5],  # Medium rewards
+    ], device=device)
+    trajectory.avg_reward = trajectory.rewards.mean(dim=1)
+    
+    # Create copies for base and previous models
+    base_model = copy.deepcopy(gpt2_model)
+    previous_model = copy.deepcopy(adapter_model)
+    
+    # Mock tokenizer
+    class MockTokenizer:
+        def __call__(self, texts, **kwargs):
+            return type('obj', (object,), {'input_ids': torch.zeros((len(texts), 10), device=device, dtype=torch.long)})
+        
+        def encode(self, text, **kwargs):
+            return [1, 2, 3]
+    
+    tokenizer = MockTokenizer()
+    
+    # Compute initial loss to verify gradients
+    # Don't mock generate_query_vector - let it actually run to produce gradients
+    total_loss, _, _ = compute_policy_loss(
+        trajectory,
+        adapter_model, 
+        previous_model,
+        kl_penalty_coef=0.01,
+        tokenizer=tokenizer,
+        verbose=False
+    )
+    
+    # Verify loss requires grad
+    assert total_loss.requires_grad, "Loss doesn't require gradients"
+    
+    # Compute gradients
+    total_loss.backward()
+    
+    # Check that LoRA parameters have gradients
+    # All LoRA layers receive gradients due to the forward pass chain,
+    # but layer -2 (layer 10 for GPT-2 with 12 layers) receives the strongest gradients
+    # because it's closest to the query extraction point in the computation graph
+    lora_grads = {}
+    layer_10_has_gradients = False
+    total_layers_with_grads = 0
+    
+    for name, param in adapter_model.named_parameters():
+        if 'lora' in name.lower() and param.requires_grad:
+            if param.grad is not None and param.grad.abs().max() > 0:
+                lora_grads[name] = param.grad.abs().max().item()
+                # Check if this is layer 10 (layer -2)
+                if '.h.10.' in name:
+                    layer_10_has_gradients = True
+                # Count layers with gradients
+                if '.h.' in name:
+                    layer_num = int(name.split('.h.')[1].split('.')[0])
+                    total_layers_with_grads = max(total_layers_with_grads, layer_num + 1)
+    
+    # Layer -2 should have gradients (strongest signal)
+    assert layer_10_has_gradients, "Layer -2 (layer 10) LoRA parameters should have gradients"
+    # Multiple layers should have gradients (not just layer -2)
+    assert len(lora_grads) > 2, "Multiple LoRA parameters should have gradients across layers"
+    # Expect gradients in most layers for a 12-layer model
+    assert total_layers_with_grads >= 8, f"Expected gradients in most layers, got {total_layers_with_grads}"
+    
+    # Clear gradients before train step
+    optimizer.zero_grad()
+    
+    # Now run the full train step
+    total_loss_val, positive_adv_percentage, policy_loss, kl_loss = train_step(
+        trajectory,
+        adapter_model,
+        base_model,
+        previous_model,
+        optimizer,
+        {"mean": 0.0, "std": 1.0, "count": 10},
+        kl_penalty_coef=0.01,
+        verbose=False,
+        tokenizer=tokenizer
+    )
+    
+    # Get LoRA parameters after training
+    lora_params_after = {}
+    for name, param in adapter_model.named_parameters():
+        if 'lora' in name.lower() and param.requires_grad:
+            lora_params_after[name] = param.clone().detach()
+    
+    # Verify that at least one LoRA parameter changed
+    any_changed = False
+    max_change = 0.0
+    for name in lora_params_before:
+        change = (lora_params_after[name] - lora_params_before[name]).abs().max().item()
+        max_change = max(max_change, change)
+        if change > 1e-6:
+            any_changed = True
+    
+    assert any_changed, f"No LoRA parameters changed after training step. Max change: {max_change}"
+    
+    # Verify base model didn't change
+    for (name1, param1), (name2, param2) in zip(base_model.named_parameters(), gpt2_model.named_parameters()):
+        assert torch.allclose(param1, param2), f"Base model parameter {name1} changed"
+
+    # Test compute_trajectory_rewards with small test input
+    test_input = torch.randint(0, 100, (1, 5), device=device)
+    _, _, _ = compute_trajectory_rewards(trajectory, adapter_model, base_model, test_input) 

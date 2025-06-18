@@ -75,7 +75,12 @@ def register_llama_embedding_hook(
     # Define the hook function
     def hook_fn(module, input_tensor, output_tensor):
         # Store the output tensor since we want the embeddings after projection
-        embeddings_dict["embeddings"] = output_tensor.detach()
+        if embed_type.lower() == "key":
+            # Detach key embeddings - they're pre-computed database entries
+            embeddings_dict["embeddings"] = output_tensor.detach()
+        else:
+            # Don't detach query embeddings - they're the trainable policy
+            embeddings_dict["embeddings"] = output_tensor
     
     # Register the hook
     hook = target_module.register_forward_hook(hook_fn)
@@ -119,9 +124,11 @@ def register_gpt2_embedding_hook(
         # Shape: [batch_size, seq_len, 3 * hidden_size]
         if embed_type.lower() == "query":
             # Extract query portion (first third)
-            embeddings_dict["embeddings"] = output_tensor[..., :split_size].detach()
+            # Don't detach query embeddings - they're the trainable policy
+            embeddings_dict["embeddings"] = output_tensor[..., :split_size]
         elif embed_type.lower() == "key":
             # Extract key portion (middle third)
+            # Detach key embeddings - they're pre-computed database entries
             embeddings_dict["embeddings"] = output_tensor[..., split_size:2*split_size].detach()
         else:
             raise ValueError(f"Unsupported embed_type: {embed_type}. Must be 'query' or 'key'")
@@ -136,7 +143,8 @@ def register_gpt2_embedding_hook(
 def extract_embeddings(
     model: torch.nn.Module,
     tokenized_input: torch.Tensor,  # Shape: [batch, seq_len]
-    embeddings_dict: Dict
+    embeddings_dict: Dict,
+    requires_grad: bool = False
 ) -> torch.Tensor:  # Shape: [batch, head_dim*num_heads]
     """
     Extract embeddings from the model's last attention layer and average over the sequence length 
@@ -146,6 +154,7 @@ def extract_embeddings(
         model: The language model
         tokenized_input: Tokenized input tensor with shape [batch, seq_len]
         embeddings_dict: Dictionary to store the embeddings from the hook
+        requires_grad: If True, compute with gradients enabled (for query embeddings during training)
         
     Returns:
         Extracted embeddings with shape [batch, head_dim*num_heads]
@@ -155,11 +164,25 @@ def extract_embeddings(
     tokenized_input = tokenized_input.to(device)
     
     # Run forward pass to trigger the hook
-    with torch.no_grad():
+    if requires_grad:
+        # For query embeddings during training - need gradients
         model(tokenized_input)
+    else:
+        # For key embeddings (pre-computed) - no gradients needed
+        with torch.no_grad():
+            model(tokenized_input)
     
     # Get the embeddings from the hook
     full_embeddings = embeddings_dict["embeddings"]
+    
+    if full_embeddings is None:
+        raise RuntimeError(
+            "No embeddings were captured by the hook. This usually means:\n"
+            "1. The hook was not properly registered\n"
+            "2. The forward pass didn't trigger the hook\n"
+            "3. The hook was registered for the wrong embedding type (query vs key)\n"
+            "Make sure to register the hook with the correct embed_type before calling extract_embeddings."
+        )
     
     # Average over the sequence length
     avg_embeddings = torch.mean(full_embeddings, dim=1)  # [batch_size, hidden_size]

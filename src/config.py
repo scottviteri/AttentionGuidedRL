@@ -76,22 +76,21 @@ KV_EVERY_N = 4  # Skip 4 chunks between each extraction for diversity
 # Number of key-value pairs
 available_context = MAX_CONTEXT_LENGTH - INITIAL_PROMPT_TOKENS
 NUM_KV_PAIRS = available_context // TOKENS_PER_ROUND
-NUM_KV_PAIRS = min(NUM_KV_PAIRS, 15)  # Cap at 15 for reasonable trajectory length
+NUM_KV_PAIRS = min(NUM_KV_PAIRS, 10)  # Cap at 15 for reasonable trajectory length
 
 # LoRA configuration
-LORA_RANK = 16
+LORA_RANK = 8 
 LORA_ALPHA = 16
 LORA_DROPOUT = 0.05
 
 # Training configuration
-LEARNING_RATE = 2e-4
+LEARNING_RATE = 5e-4
 GRADIENT_CLIP_NORM = 1.0
 NUM_EPISODES = 10000
 CHECKPOINT_INTERVAL = 100
-TRAINING_BATCH_SIZE = 16  # Used for trajectory generation and training
+TRAINING_BATCH_SIZE = 4  # Used for trajectory generation and training
 
-# Reward computation
-REWARD_SCALE = 1.0  # Scale factor for rewards
+# Reward computation - no scaling needed
 
 # KL penalty
 KL_PENALTY_COEFFICIENT = 0.01  # Beta coefficient for KL penalty
@@ -110,7 +109,7 @@ LOG_INTERVAL = 10
 # Policy gradient configuration
 GAMMA = 0.99  # Discount factor
 GAE_LAMBDA = 0.95  # For GAE (if using value function)
-ENTROPY_COEF = 0.01  # Entropy bonus coefficient
+
 
 # Always use GRPO baseline - no warmup needed
 USE_GRPO_BASELINE = True
@@ -119,4 +118,4 @@ USE_GRPO_BASELINE = True
 TEMPERATURE = 1.0 
 
 # Step-level advantage filtering
-USE_POSITIVE_ADVANTAGES_ONLY = False  # If True, only positive advantages contribute to policy gradient
+USE_POSITIVE_ADVANTAGES_ONLY = True  # Changed to True - only positive advantages contribute, but keeps all trajectories

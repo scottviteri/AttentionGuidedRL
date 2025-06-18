@@ -436,3 +436,207 @@ def iter_key_value_pairs_unified(
         return iter_twenty_questions_pairs(batch_size, embedding_fn)
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
+
+
+def iter_key_value_pairs_unified_with_tokenizer(
+    dataset_name: str = "wikipedia",
+    batch_size: int = 1,
+    tokenizer: PreTrainedTokenizer = None,
+    embedding_fn=None
+) -> Iterator[QKVStep]:
+    """
+    Unified iterator for different datasets that accepts a specific tokenizer instance.
+
+    Args:
+        dataset_name: Name of the dataset ('wikipedia' or 'twenty_questions')
+        batch_size: Number of items to process in each batch
+        tokenizer: Specific tokenizer instance to use (to ensure vocabulary consistency)
+        embedding_fn: Optional function to compute embeddings
+
+    Returns:
+        Iterator[QKVStep]: Iterator yielding batched QKVStep objects
+    """
+    if dataset_name == "wikipedia":
+        return iter_key_value_pairs_with_tokenizer(batch_size, tokenizer, embedding_fn)
+    elif dataset_name == "twenty_questions":
+        return iter_twenty_questions_pairs_with_tokenizer(batch_size, tokenizer, embedding_fn)
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
+
+def iter_key_value_pairs_with_tokenizer(
+    batch_size: int = 1, 
+    tokenizer: PreTrainedTokenizer = None, 
+    embedding_fn=None
+) -> Iterator[QKVStep]:
+    """
+    Create an iterator that yields batches of query-key-value steps with a specific tokenizer.
+
+    Args:
+        batch_size: Number of articles to process in each batch
+        tokenizer: Specific tokenizer instance to use
+        embedding_fn: Optional function to compute embeddings
+
+    Returns:
+        Iterator[QKVStep]: Iterator yielding a batched QKVStep object
+    """
+    if tokenizer is None:
+        tokenizer = get_tokenizer()
+
+    while True:
+        # Collect batch_size number of suitable articles
+        article_batch = []
+        for article in filter_articles_by_length(tokenizer):
+            article_batch.append(article)
+            if len(article_batch) >= batch_size:
+                break
+
+        # Only yield full batches
+        if len(article_batch) < batch_size:
+            break
+
+        # Ensure we have exactly batch_size articles
+        assert len(article_batch) == batch_size, f"Expected batch size {batch_size}, got {len(article_batch)}"
+        # Determine the fixed token length we require for each article
+        # (we only need the first max_len tokens)
+        max_len = (TOKENS_PER_KEY + TOKENS_PER_VALUE) * NUM_KV_PAIRS * KV_EVERY_N
+        chunk_size = TOKENS_PER_KEY + TOKENS_PER_VALUE
+
+        # Batch tokenize the article texts to a fixed length tensor (truncating if necessary)
+        article_texts = [article["text"] for article in article_batch]
+        batch_tokens = tokenizer(
+            article_texts,
+            add_special_tokens=False,
+            padding="max_length",
+            truncation=True,
+            max_length=max_len,
+            return_tensors="pt",
+        )["input_ids"].to(DEVICE)  # Ensure tokens are on the correct device from the start
+        
+        assert (
+            batch_tokens.size(0) == batch_size
+        ), f"Expected batch size {batch_size}, got {batch_tokens.size(0)}"
+
+        # Instead of aggregating all key-value pairs, yield a QKVStep for each chunk
+        for i in range(NUM_KV_PAIRS):
+            j = i * KV_EVERY_N  # compute the starting index multiplier
+            start_idx = j * chunk_size
+            key_end_idx = start_idx + TOKENS_PER_KEY
+            value_end_idx = key_end_idx + TOKENS_PER_VALUE
+
+            # Batched slicing: extract pair keys and values with shape (batch_size, TOKENS_PER_KEY) and (batch_size, TOKENS_PER_VALUE)
+            pair_keys = batch_tokens[:, start_idx:key_end_idx]  # Already on the device
+            pair_values = batch_tokens[:, key_end_idx:value_end_idx]  # Already on the device
+
+            # For logging, decode each row in the batch
+            key_text_list = tokenizer.batch_decode(pair_keys.tolist(), clean_up_tokenization_spaces=False)
+            value_text_list = tokenizer.batch_decode(pair_values.tolist(), clean_up_tokenization_spaces=False)
+
+            # Compute embeddings for the key tokens if embedding_fn is provided
+            if embedding_fn is not None:
+                # embedding_fn should handle the device placement internally
+                key_embedding = embedding_fn(pair_keys)  
+            else:
+                embedding_dim = 768  # Default embedding dimension
+                key_embedding = torch.zeros((batch_size, embedding_dim), device=DEVICE)
+
+            yield QKVStep(
+                key_tokens=pair_keys,
+                value_tokens=pair_values,
+                key_embedding=key_embedding,
+                key_text=key_text_list,
+                value_text=value_text_list,
+            )
+
+
+def iter_twenty_questions_pairs_with_tokenizer(
+    batch_size: int = 1, 
+    tokenizer: PreTrainedTokenizer = None, 
+    embedding_fn=None
+) -> Iterator[QKVStep]:
+    """
+    Create an iterator that yields batches of query-key-value steps from the twenty questions dataset with a specific tokenizer.
+
+    Args:
+        batch_size: Number of games to process in each batch
+        tokenizer: Specific tokenizer instance to use
+        embedding_fn: Optional function to compute embeddings
+
+    Returns:
+        Iterator[QKVStep]: Iterator yielding a batched QKVStep object
+    """
+    if tokenizer is None:
+        tokenizer = get_tokenizer()
+        
+    dataset = load_twenty_questions_dataset()
+    questions = dataset['questions']
+    games = dataset['data']
+    
+    # Process games in chunks without wrapping
+    game_idx = 0
+    
+    while game_idx < len(games):
+        # Collect batch_size number of games
+        game_batch = []
+        for _ in range(batch_size):
+            if game_idx >= len(games):
+                # Not enough games to fill the batch, stop here
+                break
+            game_batch.append(games[game_idx])
+            game_idx += 1
+        
+        # Only process if we have a full batch or it's the last batch
+        if len(game_batch) == 0:
+            break
+            
+        # If it's not a full batch and we need exactly batch_size, skip this batch
+        if len(game_batch) < batch_size:
+            # For the last batch, we can either skip it or pad it
+            # Here we choose to skip incomplete batches
+            break
+        
+        # For each question index, yield a batch of question-answer pairs
+        for q_idx in range(min(len(questions), NUM_KV_PAIRS)):
+            # Prepare batch data
+            key_texts = []
+            value_texts = []
+            
+            for game in game_batch:
+                # The key is the question
+                key_texts.append(questions[q_idx])
+                # The value is the answer (YES/NO)
+                value_texts.append(game['answers'][q_idx])
+            
+            # Tokenize in batch
+            key_tokens = tokenizer(
+                key_texts,
+                add_special_tokens=False,
+                padding="max_length",
+                truncation=True,
+                max_length=TOKENS_PER_KEY,
+                return_tensors="pt",
+            )["input_ids"].to(DEVICE)
+            
+            value_tokens = tokenizer(
+                value_texts,
+                add_special_tokens=False,
+                padding="max_length",
+                truncation=True,
+                max_length=TOKENS_PER_VALUE,
+                return_tensors="pt",
+            )["input_ids"].to(DEVICE)
+            
+            # Compute embeddings for the key tokens if embedding_fn is provided
+            if embedding_fn is not None:
+                key_embedding = embedding_fn(key_tokens)
+            else:
+                embedding_dim = 768  # Default embedding dimension
+                key_embedding = torch.zeros((batch_size, embedding_dim), device=DEVICE)
+            
+            yield QKVStep(
+                key_tokens=key_tokens,
+                value_tokens=value_tokens,
+                key_embedding=key_embedding,
+                key_text=key_texts,
+                value_text=value_texts,
+            )

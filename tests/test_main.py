@@ -230,6 +230,7 @@ def test_main(
                 with patch("src.main.parse_args") as mock_parse_args:
                     mock_args = MockArgs()
                     mock_args.episodes = 1  # Set to 1 to minimize iterations
+                    mock_args.log_interval = 10  # Set a reasonable log interval
                     mock_parse_args.return_value = mock_args
                     
                     # Create mock models
@@ -240,7 +241,14 @@ def test_main(
                     
                     # Setup adapter_model.parameters to return a valid parameter list
                     mock_param = MagicMock()
+                    # Mock the parameter to have required attributes
+                    mock_param.data = torch.randn(10, 10)
+                    mock_param.requires_grad = True
+                    mock_param.device = torch.device('cpu')
+                    mock_param.grad = None
                     adapter_model.parameters.return_value = [mock_param]
+                    adapter_model.named_parameters.return_value = [('test_param', mock_param)]
+                    base_model.named_parameters.return_value = [('test_param', mock_param)]
                     
                     # Mock necessary return values
                     mock_setup_logging.return_value = "logs/test"
@@ -275,18 +283,24 @@ def test_main(
                     mock_generate_trajectory.return_value = mock_trajectory
                     
                     # Mock train_step - returns loss and number of filtered batch elements
-                    mock_train_step.return_value = (0.5, 0, 0.3, 0.2)  # total_loss, num_filtered, policy_loss, kl_loss
+                    mock_train_step.return_value = (0.5, 75.0, 0.3, 0.2)  # total_loss, positive_adv_percentage, policy_loss, kl_loss
                     
-                    # Mock torch.zeros
-                    with patch("torch.zeros", return_value=torch.zeros((2, 1), dtype=torch.long)):
-                        # Mock load_checkpoint
-                        with patch("src.main.load_checkpoint", return_value=False):
-                            # Mock tqdm properly
-                            with patch("src.main.tqdm", return_value=mock_progress_bar):
-                                # Mock next to handle batch key-value pair creation
-                                with patch("builtins.next", side_effect=lambda gen: mock_kv_pair):
-                                    # Call function
-                                    main()
+                    # Mock additional functions to prevent runtime errors
+                    with patch("src.main.update_reward_stats", return_value={"mean": 0.0, "std": 1.0, "count": 1}):
+                        with patch("src.main.deepcopy", return_value=baseline_model):
+                            with patch("src.main.extract_embeddings", return_value=torch.randn(1, 768)):
+                                # Mock torch.zeros
+                                with patch("torch.zeros", return_value=torch.zeros((2, 1), dtype=torch.long)):
+                                    # Mock load_checkpoint
+                                    with patch("src.main.load_checkpoint", return_value=False):
+                                        # Mock tqdm properly
+                                        with patch("src.main.tqdm", return_value=mock_progress_bar):
+                                            # Mock next to handle batch key-value pair creation
+                                            with patch("builtins.next", side_effect=lambda gen: mock_kv_pair):
+                                                # Mock LOG_INTERVAL to prevent logging-related issues
+                                                with patch("src.main.LOG_INTERVAL", 10):
+                                                    # Call function
+                                                    main()
                 
                 # Check that setup functions were called
                 mock_setup_logging.assert_called_once()
@@ -361,9 +375,9 @@ def test_weights_update_with_real_model(gpt2_model, gpt2_tokenizer):
         mock_total_loss = torch.tensor([0.1], device=device, requires_grad=True)
         mock_policy_loss = torch.tensor([0.07], device=device, requires_grad=True)
         mock_kl_loss = torch.tensor([0.03], device=device, requires_grad=True)
-        mock_compute_policy_loss.return_value = (mock_total_loss, mock_policy_loss, mock_kl_loss)
+        mock_compute_policy_loss.return_value = (mock_total_loss, mock_policy_loss, mock_kl_loss, 75.0)
         
-        total_loss, num_filtered, policy_loss, kl_loss = train_step(
+        total_loss, positive_adv_percentage, policy_loss, kl_loss = train_step(
             trajectory,
             adapter_model,
             base_model,
@@ -385,7 +399,7 @@ def test_weights_update_with_real_model(gpt2_model, gpt2_tokenizer):
     # For this test, we're mainly checking that the training step runs without errors
     # The actual weight update may not happen if the loss is very small or zero
     assert isinstance(total_loss, float)
-    assert isinstance(num_filtered, int)
+    assert isinstance(positive_adv_percentage, float)
 
 
 def test_base_model_weights_unchanged(gpt2_model, gpt2_tokenizer):
