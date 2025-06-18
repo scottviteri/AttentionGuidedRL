@@ -675,7 +675,7 @@ def compute_policy_loss(
             step_advantages = advantages[:, t].to(device)
             selected_log_probs = log_probs[:, selected_idx]  # Get log prob of selected action
             
-            # Policy gradient loss: -log_prob * advantage
+            # Policy gradient: log_prob * advantage (positive reinforces good actions)
             if USE_POSITIVE_ADVANTAGES_ONLY:
                 # Only positive advantages contribute - this implements step-level filtering
                 # while preserving sequential context for KL computation
@@ -687,8 +687,9 @@ def compute_policy_loss(
             if torch.all(effective_advantages == 0):
                 effective_advantages = effective_advantages + 1e-8
             
-            batch_policy_loss = -(selected_log_probs * effective_advantages).mean()
-            policy_loss = policy_loss + batch_policy_loss  # Use tensor addition to maintain gradient
+            # Policy gradient term (positive for reinforcement)
+            batch_policy_gradient = (selected_log_probs * effective_advantages).mean()
+            policy_loss = policy_loss + batch_policy_gradient  # Accumulate positive gradient
             
             # Compute KL divergence between current and previous softmax policies
             # Fixed: Use per-step available key embeddings to match similarity_scores dimensions
@@ -727,15 +728,19 @@ def compute_policy_loss(
     
     # Return average loss if there were trajectories, otherwise zero
     if count > 0:
-        avg_policy_loss = policy_loss / count if isinstance(policy_loss, torch.Tensor) else torch.tensor(policy_loss / count, device=device)
+        avg_policy_gradient = policy_loss / count if isinstance(policy_loss, torch.Tensor) else torch.tensor(policy_loss / count, device=device)
         avg_kl_loss = kl_loss / count if isinstance(kl_loss, torch.Tensor) else torch.tensor(kl_loss / count, device=device)
         
+        # Convert to loss: negate policy gradient (since we want to maximize expected reward)
+        # and add KL penalty (since we want to minimize divergence)
+        avg_policy_loss = -avg_policy_gradient  # Only sign flip happens here!
         kl_penalty_term = kl_penalty_coef * avg_kl_loss
         total_loss = avg_policy_loss + kl_penalty_term
         
         if verbose:
             print(f"\n=== Loss Components ===")
-            print(f"Policy loss: {avg_policy_loss.item():.4f}")
+            print(f"Policy gradient (before negation): {avg_policy_gradient.item():.4f}")
+            print(f"Policy loss (after negation): {avg_policy_loss.item():.4f}")
             print(f"KL divergence loss: {avg_kl_loss.item():.4f}")
             print(f"KL penalty coefficient: {kl_penalty_coef:.4f}")
             print(f"Total loss: {total_loss.item():.4f}")
