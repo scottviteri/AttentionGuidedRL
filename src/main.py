@@ -389,8 +389,10 @@ def main():
         gradient_history = []
         gradient_magnitudes = []  # Track gradient magnitudes over time
         weight_changes = []  # Track weight changes over time
+        policy_gradients = []  # Track policy gradients (before negation) for conceptual clarity
         
         # Keep a copy of the previous model for KL penalty
+        # Initialize with current model for the first episode
         previous_model = deepcopy(adapter_model)
         
         # Function to compute gradient statistics
@@ -460,10 +462,6 @@ def main():
                 verbose=args.verbose
             )
             
-            # Create a deep copy of the current adapter model for KL divergence computation
-            # This is important to ensure the reference model doesn't change during training
-            previous_model = deepcopy(adapter_model)
-            
             # Update reward stats
             if trajectory.avg_reward is not None:
                 reward_stats = update_reward_stats(reward_stats, trajectory.avg_reward)
@@ -479,7 +477,7 @@ def main():
                 trajectory,
                 adapter_model,
                 baseline_model,  # Now using baseline instead of base
-                previous_model,  # Use the deep copy for KL divergence
+                previous_model,  # Use the previous model state for KL divergence
                 optimizer,
                 reward_stats,
                 KL_PENALTY_COEFFICIENT,
@@ -487,6 +485,14 @@ def main():
                 tokenizer=tokenizer,
                 embeddings_dict=embeddings_dict
             )
+            
+            # Track weight change BEFORE updating previous_model
+            weight_change = compute_weight_change(adapter_model, previous_model)
+            weight_changes.append(weight_change)
+            
+            # After training step, update previous_model to current state for next episode
+            # This ensures previous_model represents the state before the next update
+            previous_model = deepcopy(adapter_model)
             
             # Calculate average reward across the batch
             if trajectory.avg_reward is not None and trajectory.avg_reward.numel() > 0:
@@ -500,6 +506,11 @@ def main():
             policy_losses.append(policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss)
             kl_losses.append(kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss)
             avg_rewards.append(avg_reward)
+            
+            # For conceptual clarity, also track the policy gradient (before negation)
+            # This helps visualize what we're actually reinforcing
+            policy_gradient = -(policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss)
+            policy_gradients.append(policy_gradient)
             
             # Update progress bar
             progress_bar.set_description(
@@ -556,7 +567,7 @@ def main():
                 
             # Plot metrics more frequently (every 25 episodes) for better monitoring
             if episode > 0 and episode % 25 == 0:
-                plot_metrics(log_dir)
+                plot_metrics(log_dir, policy_gradients)
             
             # Log statistics
             if episode % args.log_interval == 0:
@@ -593,10 +604,6 @@ def main():
             gradient_stats = get_gradient_stats(adapter_model)
             gradient_history.append(gradient_stats)
             gradient_magnitudes.append(gradient_stats[0])
-            
-            # Track weight change
-            weight_change = compute_weight_change(adapter_model, previous_model)
-            weight_changes.append(weight_change)
             
             # Track reward history
             reward_history.append(avg_reward)
@@ -644,7 +651,7 @@ def main():
         save_checkpoint(adapter_model, "latest")
         
         # Create final plots
-        plot_metrics(log_dir)
+        plot_metrics(log_dir, policy_gradients)
         
         logging.info("Training complete!")
         
@@ -659,13 +666,13 @@ def main():
             baseline_hook_remover()
 
 
-def plot_metrics(log_dir, step=None):
+def plot_metrics(log_dir, policy_gradients_data=None):
     """
     Create and save detailed plots of training metrics.
     
     Args:
         log_dir: Directory where logs and plots are saved
-        step: Current training step (optional, not used for filename)
+        policy_gradients_data: List of policy gradient values for plotting
     """
     # Create plots directory
     plots_dir = f"{log_dir}/plots"
@@ -683,7 +690,8 @@ def plot_metrics(log_dir, step=None):
         len(kl_losses),
         len(avg_rewards),
         len(adapter_log_probs),
-        len(baseline_log_probs)
+        len(baseline_log_probs),
+        len(policy_gradients_data) if policy_gradients_data else len(training_steps)
     )
     
     # Truncate all arrays to the same length
@@ -697,18 +705,23 @@ def plot_metrics(log_dir, step=None):
     cpu_adapter_log_probs = [prob.item() if isinstance(prob, torch.Tensor) else prob for prob in adapter_log_probs[:min_length]]
     cpu_baseline_log_probs = [prob.item() if isinstance(prob, torch.Tensor) else prob for prob in baseline_log_probs[:min_length]]
     
+    # Convert policy gradients to CPU if available
+    cpu_policy_gradients = []
+    if policy_gradients_data and len(policy_gradients_data) > 0:
+        cpu_policy_gradients = [grad.item() if isinstance(grad, torch.Tensor) else grad for grad in policy_gradients_data[:min_length]]
+    
     # Calculate KL penalty term for visualization
     cpu_kl_penalty_terms = [kl * KL_PENALTY_COEFFICIENT for kl in cpu_kl_losses]
     
     # Create a figure with 2x3 subplots for more comprehensive visualization
     fig, ((ax1, ax2, ax3), (ax4, ax5, ax6)) = plt.subplots(2, 3, figsize=(20, 12))
     
-    # 1. Loss components plot
+    # 1. Loss components plot (for optimization)
     ax1.plot(cpu_training_steps, cpu_total_losses, 'b-', label='Total Loss', linewidth=2)
-    ax1.plot(cpu_training_steps, cpu_policy_losses, 'g--', label='Policy Loss', linewidth=1.5)
+    ax1.plot(cpu_training_steps, cpu_policy_losses, 'g--', label='Policy Loss (-gradient)', linewidth=1.5)
     ax1.plot(cpu_training_steps, cpu_kl_penalty_terms, 'r:', label=f'KL Penalty (β={KL_PENALTY_COEFFICIENT})', linewidth=1.5)
     ax1.set_xlabel('Training Step')
-    ax1.set_ylabel('Loss')
+    ax1.set_ylabel('Loss (to minimize)')
     ax1.set_title('Loss Components During Training')
     ax1.legend()
     ax1.grid(True, alpha=0.3)
@@ -743,22 +756,25 @@ def plot_metrics(log_dir, step=None):
         ax3.plot(cpu_training_steps, np.poly1d(z_adapter)(cpu_training_steps), "g--", alpha=0.5)
         ax3.plot(cpu_training_steps, np.poly1d(z_baseline)(cpu_training_steps), "orange", linestyle="--", alpha=0.5)
     
-    # 4. Loss breakdown pie chart (for the most recent step)
-    if len(cpu_policy_losses) > 0 and len(cpu_kl_penalty_terms) > 0:
-        latest_policy_loss = abs(cpu_policy_losses[-1])
-        latest_kl_penalty = abs(cpu_kl_penalty_terms[-1])
+    # 4. Policy Gradient plot (conceptually clearer - positive = reinforcement)
+    if len(cpu_policy_gradients) > 0:
+        ax4.plot(cpu_training_steps, cpu_policy_gradients, 'darkgreen', linewidth=2, label='Policy Gradient')
+        ax4.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+        ax4.set_xlabel('Training Step')
+        ax4.set_ylabel('Policy Gradient (positive = reinforce)')
+        ax4.set_title('Policy Gradient Over Time')
+        ax4.legend()
+        ax4.grid(True, alpha=0.3)
         
-        # Only create pie chart if both components are positive
-        if latest_policy_loss > 0 or latest_kl_penalty > 0:
-            sizes = [latest_policy_loss, latest_kl_penalty]
-            labels = ['Policy Loss', 'KL Penalty']
-            colors = ['green', 'red']
-            
-            ax4.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
-            ax4.set_title('Loss Breakdown (Latest Step)')
+        # Add annotation explaining the interpretation
+        if len(cpu_policy_gradients) > 10:
+            mean_grad = np.mean(cpu_policy_gradients)
+            ax4.text(0.02, 0.98, f'Mean: {mean_grad:.4f}\n(>0 = reinforcing good actions)', 
+                    transform=ax4.transAxes, verticalalignment='top', fontsize=9,
+                    bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
     else:
-        ax4.text(0.5, 0.5, 'No data available', ha='center', va='center', transform=ax4.transAxes)
-        ax4.set_title('Loss Breakdown (Latest Step)')
+        ax4.text(0.5, 0.5, 'No policy gradient data available', ha='center', va='center', transform=ax4.transAxes)
+        ax4.set_title('Policy Gradient Over Time')
     
     # 5. KL Divergence over time
     ax5.plot(cpu_training_steps, cpu_kl_losses, 'darkred', linewidth=2)
