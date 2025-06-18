@@ -59,6 +59,61 @@ python -m src.main
 
 If no `MODEL_TYPE` is specified, GPT-2 is used by default.
 
+### Query Token Configuration
+
+**NEW**: The project now supports using standard vocabulary tokens instead of special tokens for much better log probabilities.
+
+By default, the system uses standard tokens from the existing vocabulary (e.g., "Query", "Search") instead of adding new special tokens like `<VECTOR_QUERY>`. This provides dramatically better log probabilities since the model has seen these tokens during pre-training.
+
+#### Token Configuration Options:
+
+```bash
+# Use standard tokens (default - RECOMMENDED)
+export USE_STANDARD_QUERY_TOKEN=true  # Default: true
+python -m src.main
+
+# Use specific standard token
+export USE_STANDARD_QUERY_TOKEN=true
+export QUERY_TOKEN='Search'  # Options: Query, Search, Find, What, ?
+python -m src.main
+
+# Use original special token approach (not recommended - gives poor log probabilities)
+export USE_STANDARD_QUERY_TOKEN=false
+python -m src.main
+```
+
+**Performance Impact**: Using standard tokens improves log probabilities by 10-12 points compared to special tokens (e.g., from -17.49 to -4.96), which should significantly improve training quality.
+
+### Baseline Model Configuration
+
+**NEW**: The project now uses a simplified 3-model architecture with configurable baseline update frequency to fix KL divergence issues.
+
+The previous 4-model setup caused KL loss to always be 0. The new simplified architecture uses:
+1. **`base_model`** - Original model (for reward computation)
+2. **`adapter_model`** - Trainable model with LoRA
+3. **`baseline_model`** - Single baseline for both key embeddings AND KL computation
+
+#### Baseline Update Configuration:
+
+```bash
+# Default: Update baseline every 25 episodes
+export BASELINE_UPDATE_FREQUENCY=25
+python -m src.main
+
+# More frequent updates (faster adaptation, less KL accumulation)
+export BASELINE_UPDATE_FREQUENCY=10
+python -m src.main
+
+# Less frequent updates (more KL accumulation, more stability)
+export BASELINE_UPDATE_FREQUENCY=50
+python -m src.main
+```
+
+**KL Divergence Behavior**: 
+- KL accumulates over episodes until baseline update (no longer always 0!)
+- Higher frequencies = faster adaptation but less regularization
+- Lower frequencies = more regularization but slower adaptation to learning progress
+
 ### Training with Wikipedia
 
 Run the training with default parameters (Wikipedia dataset):

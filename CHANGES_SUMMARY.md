@@ -4,20 +4,32 @@ This document summarizes the major improvements made to the Attention-Guided RL 
 
 ## 🔧 **Fixes Applied**
 
-### 1. KL Divergence and Weight Change Tracking Fix
-**Issue**: KL Loss consistently showed 0.0000 and weight changes showed 0.000000  
-**Root Cause**: Timing bug where `previous_model` was created identical to current model  
-**Solution**: Move `previous_model` update to after training step  
-**Result**: KL divergence now shows meaningful values from episode 1+, weight changes in realistic 1e-5 to 1e-3 range  
-**Commit**: `98a2dc0`
+### 1. Standard Token Support for Improved Log Probabilities
+**Issue**: Model log probabilities around -53 due to unknown special token `<VECTOR_QUERY>`
+**Root Cause**: Special tokens not seen during pre-training confuse the model
+**Solution**: Added option to use standard vocabulary tokens instead of special tokens
+**Result**: Dramatic improvement in log probabilities (from -17.49 to -4.96, +12.53 improvement)
+**Usage**: `export USE_STANDARD_QUERY_TOKEN=true` (now default)
+**Best Tokens**: 'Search' (-4.96), 'Find' (-5.82), 'Query' (-7.30)
 
-### 2. Policy Gradient Sign Convention Improvement  
+### 2. Simplified Model Architecture for Meaningful KL Divergence
+**Issue**: KL Loss consistently showed 0.0000 due to overly complex 4-model setup
+**Root Cause**: `previous_model` was reset to be identical to `adapter_model` after each episode
+**Solution**: Simplified to 3-model architecture with single configurable baseline
+**Architecture**: 
+- `base_model` (original, for rewards)
+- `adapter_model` (trainable with LoRA) 
+- `baseline_model` (for both key embeddings AND KL computation)
+**Result**: KL divergence now accumulates over episodes (0.000 → 0.056 → 0.102 → 0.000 reset)
+**Configuration**: `export BASELINE_UPDATE_FREQUENCY=25` (default)
+
+### 3. Policy Gradient Sign Convention Improvement  
 **Issue**: Confusing sign conventions with multiple negations throughout computation  
 **Solution**: Work with positive gradients throughout, single sign flip only at the end  
 **Benefits**: More intuitive reasoning (positive = reinforce good actions)  
 **Commit**: `b64eb83`
 
-### 3. Machine-Dependent Test Behavior Fix
+### 4. Machine-Dependent Test Behavior Fix
 **Issue**: Tests behaved differently based on GPU memory (<12GB = GPT-2, ≥12GB = Llama)  
 **Solution**: Manual model configuration via `MODEL_TYPE` environment variable  
 **Benefits**: Deterministic tests across all machines, explicit user control  
@@ -91,6 +103,35 @@ MODEL_TYPE=llama python -m src.main --dataset twenty_questions
 MODEL_TYPE=gpt2 python -m src.main --batch-size 8 --episodes 2000
 ```
 
+### Query Token Configuration
+```bash
+# Use standard tokens (RECOMMENDED - default)
+export USE_STANDARD_QUERY_TOKEN=true
+python -m src.main
+
+# Use specific standard token for best results
+export USE_STANDARD_QUERY_TOKEN=true
+export QUERY_TOKEN='Search'  # Best performing token
+python -m src.main
+
+# Combined model + token configuration
+MODEL_TYPE=llama USE_STANDARD_QUERY_TOKEN=true QUERY_TOKEN='Search' python -m src.main --dataset twenty_questions
+```
+
+### Baseline Model Configuration
+```bash
+# Default baseline update frequency (every 25 episodes)
+export BASELINE_UPDATE_FREQUENCY=25
+python -m src.main
+
+# More KL accumulation (update every 50 episodes)
+export BASELINE_UPDATE_FREQUENCY=50
+python -m src.main
+
+# Combined with other options
+MODEL_TYPE=gpt2 USE_STANDARD_QUERY_TOKEN=true BASELINE_UPDATE_FREQUENCY=30 python -m src.main
+```
+
 ### Running Tests
 ```bash
 # All tests (now deterministic)
@@ -102,12 +143,15 @@ python -m pytest tests/test_config.py -v
 
 ## ✅ **Benefits Achieved**
 
-1. **Deterministic Testing**: Tests behave consistently across all machines
-2. **User Control**: Explicit model selection instead of automatic guessing
-3. **Better Training Insights**: Enhanced monitoring and visualization
-4. **Conceptual Clarity**: Intuitive sign conventions and clear documentation
-5. **Proper Metrics**: KL divergence and weight changes now show meaningful values
-6. **Comprehensive Testing**: 7 new tests ensure configuration reliability
+1. **Dramatically Improved Log Probabilities**: Standard tokens give 10-12 point improvements (e.g., -17.49 → -4.96)
+2. **Meaningful KL Divergence**: Simplified architecture allows KL to accumulate over episodes (no longer always 0)
+3. **Reduced Complexity**: Simplified from 4 models to 3 models with clearer responsibilities
+4. **Configurable Regularization**: Baseline update frequency controls KL accumulation vs. adaptation speed
+5. **Deterministic Testing**: Tests behave consistently across all machines
+6. **User Control**: Explicit model selection instead of automatic guessing
+7. **Better Training Insights**: Enhanced monitoring and visualization
+8. **Conceptual Clarity**: Intuitive sign conventions and clear documentation
+9. **Comprehensive Testing**: 7 new tests ensure configuration reliability
 
 ## 📈 **Impact**
 

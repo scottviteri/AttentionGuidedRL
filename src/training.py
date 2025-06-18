@@ -88,8 +88,9 @@ def calculate_conditional_log_prob(
     # We need to gather the log probs of the actual tokens
     token_log_probs = torch.gather(log_probs, dim=2, index=tokens.unsqueeze(-1)).squeeze(-1)
     
-    # Sum log probabilities across the sequence for each batch item
-    return token_log_probs.sum(dim=1)
+    # Return average log probability per token for better interpretability
+    # This makes the plotted values much more meaningful (-5 vs -50)
+    return token_log_probs.mean(dim=1)
 
 
 def generate_query_vector(
@@ -514,7 +515,7 @@ def compute_advantages(
 def compute_policy_loss(
     trajectory: Trajectory,
     adapter_model: torch.nn.Module,
-    previous_model: Any,
+    baseline_model: torch.nn.Module,
     kl_penalty_coef: float,
     verbose: bool = False,
     gamma: float = 0.99,
@@ -527,7 +528,7 @@ def compute_policy_loss(
     Args:
         trajectory: The trajectory to train on
         adapter_model: The language model with LoRA adapter
-        previous_model: The model state before update
+        baseline_model: The baseline model for KL divergence computation
         kl_penalty_coef: KL penalty coefficient (beta)
         verbose: Flag to enable verbose logging
         gamma: Discount factor for returns
@@ -570,9 +571,9 @@ def compute_policy_loss(
     positive_advantages = (advantages > 0).float()
     positive_adv_percentage = positive_advantages.mean().item() * 100.0  # Convert to percentage
     
-    # Compute what the previous model would have generated
+    # Compute what the baseline model would have generated
     # We'll do this by reconstructing the context at each step
-    previous_query_means = []
+    baseline_query_means = []
     if tokenizer is not None:
         # Get batch size from first step
         batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
@@ -585,17 +586,17 @@ def compute_policy_loss(
             add_special_tokens=False
         ).input_ids.to(device)
         
-        # Reconstruct context and generate previous means for each step
+        # Reconstruct context and generate baseline means for each step
         for t, qkv_step in enumerate(trajectory.qkv_steps):
-            # Generate query vector with previous model
+            # Generate query vector with baseline model
             with torch.no_grad():
                 prev_query_mean = generate_query_vector(
-                    previous_model,
+                    baseline_model,
                     tokenizer,
                     context_tokens,
                     layer_idx=-2
                 )
-                previous_query_means.append(prev_query_mean)
+                baseline_query_means.append(prev_query_mean)
             
             # Update context for next iteration (add key and value tokens)
             key_prefix_tokens = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
@@ -691,17 +692,17 @@ def compute_policy_loss(
             batch_policy_gradient = (selected_log_probs * effective_advantages).mean()
             policy_loss = policy_loss + batch_policy_gradient  # Accumulate positive gradient
             
-            # Compute KL divergence between current and previous softmax policies
+            # Compute KL divergence between current and baseline softmax policies
             # Fixed: Use per-step available key embeddings to match similarity_scores dimensions
-            if previous_query_means and hasattr(qkv_step, 'available_key_embeddings') and qkv_step.available_key_embeddings is not None:
-                # Recompute similarities with previous query vectors
-                query_embeddings_prev = previous_query_means[t].to(device)
+            if baseline_query_means and hasattr(qkv_step, 'available_key_embeddings') and qkv_step.available_key_embeddings is not None:
+                # Recompute similarities with baseline query vectors
+                query_embeddings_prev = baseline_query_means[t].to(device)
                 available_key_embeddings = qkv_step.available_key_embeddings.to(device)
                 
                 # Import compute_similarity to handle normalization properly
                 from src.embeddings import compute_similarity
                 
-                # Compute similarities with previous model's query
+                # Compute similarities with baseline model's query
                 prev_similarities = compute_similarity(
                     query_embeddings_prev.unsqueeze(1),  # Add key dimension
                     available_key_embeddings,
@@ -758,7 +759,7 @@ def train_step(
     trajectory: Trajectory,
     adapter_model: torch.nn.Module,
     base_model: torch.nn.Module,
-    previous_model: torch.nn.Module,
+    baseline_model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     reward_stats: Dict[str, float],
     kl_penalty_coef: float,
@@ -767,13 +768,13 @@ def train_step(
     embeddings_dict: Dict = None
 ) -> Tuple[float, float, float, float]:
     """
-    Perform a single training step.
+    Perform a single training step with simplified model architecture.
     
     Args:
         trajectory: The trajectory to train on
-        adapter_model: The language model with LoRA adapter
-        base_model: The base language model without LoRA
-        previous_model: The model before update (for KL divergence)
+        adapter_model: The language model with LoRA adapter (trainable)
+        base_model: The base language model without LoRA (for reward computation)
+        baseline_model: The baseline model for KL divergence computation (updated every N episodes)
         optimizer: The optimizer
         reward_stats: Reward statistics (for logging only with GRPO)
         kl_penalty_coef: KL penalty coefficient (beta)
@@ -835,11 +836,11 @@ def train_step(
     # Import the new parameters
     from src.config import GAMMA
     
-    # Compute policy loss
+    # Compute policy loss using baseline_model for KL computation
     total_loss, policy_loss, kl_loss, positive_adv_percentage = compute_policy_loss(
         trajectory,  # Use original trajectory, not filtered
         adapter_model,
-        previous_model,
+        baseline_model,  # Use baseline_model instead of previous_model for KL computation
         kl_penalty_coef,
         verbose=verbose,
         gamma=GAMMA,

@@ -35,6 +35,36 @@ DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 # Query configuration - Vector queries only
 QUERY_VEC_TOKEN = "<VECTOR_QUERY>"
 
+# Option to use standard vocabulary tokens instead of special tokens
+# This should give much better log probabilities since the model has seen these during pre-training
+USE_STANDARD_QUERY_TOKEN = os.environ.get("USE_STANDARD_QUERY_TOKEN", "true").lower() == "true"
+
+# Standard query tokens for each model type
+# These are common tokens that both models should handle well
+STANDARD_QUERY_TOKENS = {
+    "gpt2": "Query",      # Simple, semantic word that GPT-2 knows well
+    "llama": "Query",     # Same for Llama - consistency across models
+}
+
+# Alternative options (can be changed by setting environment variable)
+ALTERNATIVE_STANDARD_TOKENS = {
+    "gpt2": ["Query", "?", "Find", "Search", "What"],
+    "llama": ["Query", "?", "Find", "Search", "What"],
+}
+
+# Allow override via environment variable
+CUSTOM_QUERY_TOKEN = os.environ.get("QUERY_TOKEN", None)
+
+# Determine the actual token to use
+if USE_STANDARD_QUERY_TOKEN:
+    if CUSTOM_QUERY_TOKEN:
+        QUERY_VEC_TOKEN = CUSTOM_QUERY_TOKEN
+    else:
+        QUERY_VEC_TOKEN = STANDARD_QUERY_TOKENS.get(MODEL_TYPE, "Query")
+else:
+    # Use the original special token
+    QUERY_VEC_TOKEN = "<VECTOR_QUERY>"
+
 # Prefix tokens for context building
 KEY_PREFIX = "Key: "
 VALUE_PREFIX = "Value: "
@@ -73,7 +103,7 @@ KV_EVERY_N = 4  # Skip 4 chunks between each extraction for diversity
 # Number of key-value pairs
 available_context = MAX_CONTEXT_LENGTH - INITIAL_PROMPT_TOKENS
 NUM_KV_PAIRS = available_context // TOKENS_PER_ROUND
-NUM_KV_PAIRS = min(NUM_KV_PAIRS, 10)  # Cap at 15 for reasonable trajectory length
+NUM_KV_PAIRS = min(NUM_KV_PAIRS, 15)  # Cap at 15 for reasonable trajectory length
 
 # LoRA configuration
 LORA_RANK = 8 
@@ -85,7 +115,7 @@ LEARNING_RATE = 5e-4
 GRADIENT_CLIP_NORM = 1.0
 NUM_EPISODES = 10000
 CHECKPOINT_INTERVAL = 100
-TRAINING_BATCH_SIZE = 4  # Used for trajectory generation and training
+TRAINING_BATCH_SIZE = 40  # Used for trajectory generation and training
 
 # Reward computation - no scaling needed
 
@@ -116,3 +146,8 @@ TEMPERATURE = 1.0
 
 # Step-level advantage filtering
 USE_POSITIVE_ADVANTAGES_ONLY = True  # Changed to True - only positive advantages contribute, but keeps all trajectories
+
+# Baseline model update frequency (how often to update the single baseline model)
+# Higher values = more KL divergence accumulation, more stability
+# Lower values = faster adaptation to learning progress
+BASELINE_UPDATE_FREQUENCY = int(os.environ.get("BASELINE_UPDATE_FREQUENCY", "25"))  # Default: every 25 episodes

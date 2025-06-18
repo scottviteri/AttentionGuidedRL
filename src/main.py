@@ -31,6 +31,7 @@ from src.config import (
     CHECKPOINT_DIR,
     ENABLE_WANDB,
     LOG_INTERVAL,
+    BASELINE_UPDATE_FREQUENCY,
 )
 from src.model import setup_model_and_tokenizer, save_checkpoint, load_checkpoint, create_model_copy, get_checkpoint_path
 from src.data import iter_key_value_pairs, iter_key_value_pairs_unified, QKVStep
@@ -333,12 +334,6 @@ def main():
             if 'lora' not in name:  # Only track non-LoRA parameters
                 initial_base_weights[name] = param.data.clone()
         
-        # Store adapter weights from previous episode for verification
-        previous_adapter_weights = {}
-        for name, param in adapter_model.named_parameters():
-            if 'lora' in name:  # Only track LoRA parameters
-                previous_adapter_weights[name] = param.data.clone()
-        
         # Try to load checkpoint if resume is specified
         start_episode = 0
         if args.resume:
@@ -361,8 +356,8 @@ def main():
         # Set up data loader
         logging.info(f"Setting up data loader for {args.dataset} dataset...")
         
-        # Create a baseline model for both key embeddings and reward computation
-        # This is a deep copy of the initial adapter model that won't be updated frequently
+        # Create a single baseline model for both key embeddings and KL computation
+        # This will be updated every BASELINE_UPDATE_FREQUENCY episodes
         baseline_model = create_model_copy(adapter_model)
         
         # Register embedding hook for the baseline model (for KEY embeddings)
@@ -391,9 +386,10 @@ def main():
         weight_changes = []  # Track weight changes over time
         policy_gradients = []  # Track policy gradients (before negation) for conceptual clarity
         
-        # Keep a copy of the previous model for KL penalty
-        # Initialize with current model for the first episode
-        previous_model = deepcopy(adapter_model)
+        # No separate previous_model - use baseline_model for KL computation
+        # This allows KL divergence to accumulate over multiple episodes
+        logging.info(f"Using single baseline model for both key embeddings and KL computation")
+        logging.info(f"Baseline model will be updated every {BASELINE_UPDATE_FREQUENCY} episodes")
         
         # Function to compute gradient statistics
         def get_gradient_stats(model):
@@ -477,7 +473,7 @@ def main():
                 trajectory,
                 adapter_model,
                 baseline_model,  # Now using baseline instead of base
-                previous_model,  # Use the previous model state for KL divergence
+                baseline_model,  # Use the same baseline model for KL computation
                 optimizer,
                 reward_stats,
                 KL_PENALTY_COEFFICIENT,
@@ -486,13 +482,12 @@ def main():
                 embeddings_dict=embeddings_dict
             )
             
-            # Track weight change BEFORE updating previous_model
-            weight_change = compute_weight_change(adapter_model, previous_model)
+            # Track weight change BEFORE updating baseline_model
+            weight_change = compute_weight_change(adapter_model, baseline_model)
             weight_changes.append(weight_change)
             
-            # After training step, update previous_model to current state for next episode
-            # This ensures previous_model represents the state before the next update
-            previous_model = deepcopy(adapter_model)
+            # NO automatic baseline update after each training step - only at intervals
+            # This allows KL divergence to accumulate over multiple episodes for meaningful regularization
             
             # Calculate average reward across the batch
             if trajectory.avg_reward is not None and trajectory.avg_reward.numel() > 0:
@@ -520,8 +515,8 @@ def main():
                 f"Reward: {avg_reward:.4f}"
             )
             
-            # Update baseline model less frequently (every 50 episodes)
-            if (episode + 1) % 50 == 0:
+            # Update baseline model at configurable frequency
+            if (episode + 1) % BASELINE_UPDATE_FREQUENCY == 0:
                 # Update the baseline model to reflect learning progress
                 baseline_model = create_model_copy(adapter_model)
                 
@@ -537,15 +532,17 @@ def main():
                     embedding_fn=lambda x: extract_embeddings(baseline_model, x, baseline_embeddings_dict)
                 )
                 
-                logging.info(f"Updated baseline model at episode {episode + 1}")
+                logging.info(f"Updated baseline model at episode {episode + 1} (every {BASELINE_UPDATE_FREQUENCY} episodes)")
+                if args.verbose:
+                    print(f"Baseline model updated - KL divergence will now be computed against new baseline")
             
             # Periodically verify weight changes (every 5 episodes)
             if (episode + 1) % 5 == 0:
                 # Check that adapter model weights are changing
                 adapter_weights_changed = False
                 for name, param in adapter_model.named_parameters():
-                    if 'lora' in name and name in previous_adapter_weights:
-                        if not torch.allclose(previous_adapter_weights[name], param.data):
+                    if 'lora' in name and name in initial_base_weights:
+                        if not torch.allclose(initial_base_weights[name], param.data):
                             adapter_weights_changed = True
                             break
                 
@@ -553,11 +550,6 @@ def main():
                     logging.info("Adapter model weights verification: CHANGED (correct)")
                 else:
                     logging.warning("Adapter model weights are NOT changing! This may indicate a training issue.")
-                
-                # Update previous adapter weights for next check
-                for name, param in adapter_model.named_parameters():
-                    if 'lora' in name:
-                        previous_adapter_weights[name] = param.data.clone()
             
             # Save checkpoint if needed
             if episode > 0 and episode % CHECKPOINT_INTERVAL == 0:
@@ -740,12 +732,12 @@ def plot_metrics(log_dir, policy_gradients_data=None):
         ax2.plot(cpu_training_steps, p(cpu_training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
         ax2.legend()
     
-    # 3. Log Probabilities plot (NEW!)
+    # 3. Average Log Probabilities plot (per token)
     ax3.plot(cpu_training_steps, cpu_adapter_log_probs, 'darkgreen', label='Adapter Model', linewidth=2)
     ax3.plot(cpu_training_steps, cpu_baseline_log_probs, 'orange', label='Baseline Model', linewidth=2)
     ax3.set_xlabel('Training Step')
-    ax3.set_ylabel('Average Log Probability')
-    ax3.set_title('Model Log Probabilities Over Time')
+    ax3.set_ylabel('Average Log Probability (per token)')
+    ax3.set_title('Model Log Probabilities Over Time (Average per Token)')
     ax3.legend()
     ax3.grid(True, alpha=0.3)
     
