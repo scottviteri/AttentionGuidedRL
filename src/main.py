@@ -671,16 +671,31 @@ def plot_metrics(log_dir, step=None):
     plots_dir = f"{log_dir}/plots"
     os.makedirs(plots_dir, exist_ok=True)
     
-    # Make sure all tensors are converted to CPU before plotting
-    cpu_training_steps = [step.item() if isinstance(step, torch.Tensor) else step for step in training_steps]
-    cpu_total_losses = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in total_losses]
-    cpu_policy_losses = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in policy_losses]
-    cpu_kl_losses = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in kl_losses]
-    cpu_avg_rewards = [reward.item() if isinstance(reward, torch.Tensor) else reward for reward in avg_rewards]
+    # Make sure all arrays have data and same length
+    if len(training_steps) == 0:
+        return  # No data to plot yet
     
-    # Convert log probabilities to CPU
-    cpu_adapter_log_probs = [prob.item() if isinstance(prob, torch.Tensor) else prob for prob in adapter_log_probs]
-    cpu_baseline_log_probs = [prob.item() if isinstance(prob, torch.Tensor) else prob for prob in baseline_log_probs]
+    # Ensure all arrays have the same length by taking the minimum
+    min_length = min(
+        len(training_steps),
+        len(total_losses), 
+        len(policy_losses),
+        len(kl_losses),
+        len(avg_rewards),
+        len(adapter_log_probs),
+        len(baseline_log_probs)
+    )
+    
+    # Truncate all arrays to the same length
+    cpu_training_steps = [step.item() if isinstance(step, torch.Tensor) else step for step in training_steps[:min_length]]
+    cpu_total_losses = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in total_losses[:min_length]]
+    cpu_policy_losses = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in policy_losses[:min_length]]
+    cpu_kl_losses = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in kl_losses[:min_length]]
+    cpu_avg_rewards = [reward.item() if isinstance(reward, torch.Tensor) else reward for reward in avg_rewards[:min_length]]
+    
+    # Convert log probabilities to CPU with same length
+    cpu_adapter_log_probs = [prob.item() if isinstance(prob, torch.Tensor) else prob for prob in adapter_log_probs[:min_length]]
+    cpu_baseline_log_probs = [prob.item() if isinstance(prob, torch.Tensor) else prob for prob in baseline_log_probs[:min_length]]
     
     # Calculate KL penalty term for visualization
     cpu_kl_penalty_terms = [kl * KL_PENALTY_COEFFICIENT for kl in cpu_kl_losses]
