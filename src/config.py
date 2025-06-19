@@ -105,6 +105,10 @@ available_context = MAX_CONTEXT_LENGTH - INITIAL_PROMPT_TOKENS
 NUM_KV_PAIRS = available_context // TOKENS_PER_ROUND
 NUM_KV_PAIRS = min(NUM_KV_PAIRS, 15)  # Cap at 15 for reasonable trajectory length
 
+# Key embedding batch size - number of keys to process together in a single forward pass
+# Higher values improve GPU utilization but use more memory
+KEY_EMBEDDING_BATCH_SIZE = int(os.environ.get("KEY_EMBEDDING_BATCH_SIZE", "4"))  # Process 4 keys at once by default
+
 # LoRA configuration
 LORA_RANK = 8 
 LORA_ALPHA = 16
@@ -119,8 +123,9 @@ TRAINING_BATCH_SIZE = 40  # Used for trajectory generation and training
 
 # Reward computation - no scaling needed
 
-# KL penalty
-KL_PENALTY_COEFFICIENT = 0.01  # Beta coefficient for KL penalty
+# KL penalty - increased significantly to provide meaningful regularization
+# Higher values mean stronger KL penalty, more stable but potentially slower learning
+KL_PENALTY_COEFFICIENT = float(os.environ.get("KL_PENALTY_COEFFICIENT", "0.1"))  # Increased from 0.01 to 0.1 (10x stronger)
 
 # Directory configuration
 CHECKPOINT_DIR = "checkpoints"
@@ -144,10 +149,15 @@ USE_GRPO_BASELINE = True
 # Temperature for softmax in similarity computation
 TEMPERATURE = 1.0 
 
-# Step-level advantage filtering
-USE_POSITIVE_ADVANTAGES_ONLY = True  # Changed to True - only positive advantages contribute, but keeps all trajectories
+# PPO clipping parameter (epsilon) for clipped surrogate objective
+PPO_CLIP_EPSILON = float(os.environ.get("PPO_CLIP_EPSILON", "0.2"))  # Standard PPO clipping range
 
 # Baseline model update frequency (how often to update the single baseline model)
-# Higher values = more KL divergence accumulation, more stability
-# Lower values = faster adaptation to learning progress
-BASELINE_UPDATE_FREQUENCY = int(os.environ.get("BASELINE_UPDATE_FREQUENCY", "25"))  # Default: every 25 episodes
+# Since baseline model is now only used for key embeddings (not KL), we can update more frequently
+BASELINE_UPDATE_FREQUENCY = int(os.environ.get("BASELINE_UPDATE_FREQUENCY", "10"))  # More frequent updates (reduced from 50)
+
+# Reward computation configuration
+# Whether to subtract base model log probabilities from adapter log probabilities when computing rewards
+# True: reward = adapter_log_prob - base_log_prob (classic baseline subtraction)
+# False: reward = adapter_log_prob (raw adapter performance, let GRPO handle baselines)
+SUBTRACT_BASE_MODEL_LOGPROBS = os.environ.get("SUBTRACT_BASE_MODEL_LOGPROBS", "false").lower() == "true"

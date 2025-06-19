@@ -15,7 +15,7 @@ from src.data import (
     tokenize_text,
     filter_articles_by_length,
 )
-from src.config import TOKENS_PER_KEY, TOKENS_PER_VALUE
+from src.config import TOKENS_PER_KEY, TOKENS_PER_VALUE, KEY_EMBEDDING_BATCH_SIZE, NUM_KV_PAIRS
 
 
 def print_separator():
@@ -519,3 +519,69 @@ def test_iter_key_value_pairs_unified():
             embedding_fn=dummy_embedding_fn
         )
     assert "Unknown dataset" in str(excinfo.value)
+
+
+def test_batched_key_embedding_processing():
+    """Test that batched key embedding processing works correctly."""
+    from src.data import iter_key_value_pairs
+    from src.config import KEY_EMBEDDING_BATCH_SIZE
+    import torch
+    
+    # Mock embedding function that tracks how many times it's called
+    call_count = 0
+    call_sizes = []
+    
+    def mock_embedding_fn(tokens):
+        nonlocal call_count, call_sizes
+        call_count += 1
+        call_sizes.append(tokens.shape[0])  # Track batch size
+        # Return random embeddings
+        batch_size, seq_len = tokens.shape
+        return torch.randn(batch_size, 768)
+    
+    # Create iterator with small batch size for testing
+    batch_size = 1
+    iterator = iter_key_value_pairs(batch_size=batch_size, embedding_fn=mock_embedding_fn)
+    
+    # Get a few QKV steps
+    qkv_steps = []
+    for i, qkv_step in enumerate(iterator):
+        qkv_steps.append(qkv_step)
+        if i >= 2:  # Get 3 steps to test batching
+            break
+    
+    # Verify we got the expected number of steps
+    assert len(qkv_steps) == 3, f"Expected 3 QKV steps, got {len(qkv_steps)}"
+    
+    # Verify embedding function was called fewer times than the number of keys
+    # (because of batching)
+    from src.config import NUM_KV_PAIRS
+    expected_calls = (NUM_KV_PAIRS + KEY_EMBEDDING_BATCH_SIZE - 1) // KEY_EMBEDDING_BATCH_SIZE
+    assert call_count == expected_calls, f"Expected {expected_calls} embedding calls, got {call_count}"
+    
+    # Verify each call processed the expected batch size
+    for i, size in enumerate(call_sizes[:-1]):  # All but possibly the last call
+        expected_size = KEY_EMBEDDING_BATCH_SIZE * batch_size
+        assert size == expected_size, f"Call {i} processed {size} items, expected {expected_size}"
+    
+    # The last call might be smaller if NUM_KV_PAIRS doesn't divide evenly
+    last_call_size = call_sizes[-1]
+    remaining_keys = NUM_KV_PAIRS % KEY_EMBEDDING_BATCH_SIZE
+    if remaining_keys == 0:
+        expected_last_size = KEY_EMBEDDING_BATCH_SIZE * batch_size
+    else:
+        expected_last_size = remaining_keys * batch_size
+    assert last_call_size == expected_last_size, f"Last call processed {last_call_size} items, expected {expected_last_size}"
+    
+    print(f"✓ Batched processing test passed: {call_count} calls for {NUM_KV_PAIRS} keys with batch size {KEY_EMBEDDING_BATCH_SIZE}")
+
+
+def test_key_embedding_batch_size_configuration():
+    """Test that the KEY_EMBEDDING_BATCH_SIZE configuration is properly imported."""
+    from src.config import KEY_EMBEDDING_BATCH_SIZE
+    
+    # Verify it's a positive integer
+    assert isinstance(KEY_EMBEDDING_BATCH_SIZE, int), f"KEY_EMBEDDING_BATCH_SIZE should be int, got {type(KEY_EMBEDDING_BATCH_SIZE)}"
+    assert KEY_EMBEDDING_BATCH_SIZE > 0, f"KEY_EMBEDDING_BATCH_SIZE should be positive, got {KEY_EMBEDDING_BATCH_SIZE}"
+    
+    print(f"✓ KEY_EMBEDDING_BATCH_SIZE configuration test passed: {KEY_EMBEDDING_BATCH_SIZE}")

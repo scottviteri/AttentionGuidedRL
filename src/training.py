@@ -27,7 +27,10 @@ from src.config import (
     INITIAL_PROMPT,
     GAMMA,
     GAE_LAMBDA,
-    USE_GRPO_BASELINE
+    USE_GRPO_BASELINE,
+    SUBTRACT_BASE_MODEL_LOGPROBS,
+    PPO_CLIP_EPSILON,
+    TEMPERATURE
 )
 
 
@@ -150,7 +153,7 @@ def generate_query_vector(
 def compute_trajectory_rewards(
     trajectory: Trajectory,
     adapter_model: torch.nn.Module,
-    base_model: torch.nn.Module,
+    ref_model: torch.nn.Module,
     context_tokens: torch.Tensor,
     tokenizer: Any = None,
     verbose: bool = False,
@@ -161,7 +164,7 @@ def compute_trajectory_rewards(
     Args:
         trajectory: The trajectory containing QKVStep objects
         adapter_model: The model with LoRA adapter
-        base_model: The base model without LoRA
+        ref_model: The reference model without LoRA (pi_ref)
         context_tokens: Initial context tokens [batch_size, context_length]
         tokenizer: The tokenizer for processing text
         verbose: Flag to enable verbose logging
@@ -170,7 +173,7 @@ def compute_trajectory_rewards(
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: 
             rewards: Rewards for each step [batch_size, num_steps]
             adapter_log_probs: Log probabilities from adapter model [batch_size, num_steps]
-            baseline_log_probs: Log probabilities from baseline model [batch_size, num_steps]
+            ref_log_probs: Log probabilities from reference model [batch_size, num_steps]
     """
     batch_size = context_tokens.shape[0]
     num_steps = len(trajectory.qkv_steps)
@@ -186,7 +189,7 @@ def compute_trajectory_rewards(
     # Initialize tensors
     rewards = torch.zeros((batch_size, num_steps), device=device)
     adapter_log_probs = torch.zeros((batch_size, num_steps), device=device)
-    baseline_log_probs = torch.zeros((batch_size, num_steps), device=device)
+    ref_log_probs = torch.zeros((batch_size, num_steps), device=device)
     
     # Build context incrementally, including each step
     current_context = context_tokens
@@ -215,24 +218,33 @@ def compute_trajectory_rewards(
             current_context
         )
         
-        # Compute log prob with base model
-        base_log_prob = calculate_conditional_log_prob(
-            base_model, 
+        # Compute log prob with reference model (pi_ref)
+        ref_log_prob = calculate_conditional_log_prob(
+            ref_model, 
             value_tokens, 
             current_context
         )
         
         # Store log probabilities
         adapter_log_probs[:, i] = adapter_log_prob
-        baseline_log_probs[:, i] = base_log_prob
+        ref_log_probs[:, i] = ref_log_prob
         
-        # Calculate reward as improvement over base model
-        rewards[:, i] = adapter_log_prob - base_log_prob
+        # Calculate reward - conditionally subtract reference model baseline
+        if SUBTRACT_BASE_MODEL_LOGPROBS:
+            # Classic approach: reward = improvement over reference model
+            rewards[:, i] = adapter_log_prob - ref_log_prob
+        else:
+            # Simplified approach: use raw adapter performance, let GRPO handle baselines
+            rewards[:, i] = adapter_log_prob
         
         if verbose:
             print(f"Adapter model log prob: {adapter_log_prob[0].item():.4f}")
-            print(f"Base model log prob: {base_log_prob[0].item():.4f}")
-            print(f"Reward: {rewards[0, i].item():.4f}")
+            print(f"Reference model log prob: {ref_log_prob[0].item():.4f}")
+            if SUBTRACT_BASE_MODEL_LOGPROBS:
+                print(f"Reward (adapter - ref): {rewards[0, i].item():.4f}")
+            else:
+                print(f"Reward (raw adapter): {rewards[0, i].item():.4f}")
+                print(f"Note: Using raw adapter log probs as rewards (SUBTRACT_BASE_MODEL_LOGPROBS=False)")
         
         # Update context for next iteration
         # Append query, key and value tokens to context, all on the same device
@@ -269,13 +281,13 @@ def compute_trajectory_rewards(
         print("\n=== Trajectory Summary ===")
         print(f"Average reward: {avg_reward[0].item():.4f}")
         print(f"Average adapter log prob: {adapter_log_probs.mean().item():.4f}")
-        print(f"Average baseline log prob: {baseline_log_probs.mean().item():.4f}")
+        print(f"Average reference log prob: {ref_log_probs.mean().item():.4f}")
     
     # Store rewards in the trajectory object
     trajectory.rewards = rewards
     trajectory.avg_reward = avg_reward
     
-    return rewards, adapter_log_probs, baseline_log_probs
+    return rewards, adapter_log_probs, ref_log_probs
 
 
 def update_reward_stats(
@@ -315,119 +327,7 @@ def update_reward_stats(
     return {"mean": new_mean, "std": new_std, "count": new_count}
 
 
-def filter_trajectories_grpo(trajectory: Trajectory) -> Optional[Trajectory]:
-    """
-    Filter a batch of trajectories based on GRPO baseline.
-    Keeps only trajectories with positive advantages (better than batch average at each step).
-    
-    Args:
-        trajectory: The batch of trajectories to filter
-        
-    Returns:
-        Filtered trajectory, or None if no trajectories pass the filter
-    """
-    if trajectory.avg_reward is None:
-        return trajectory
-    
-    # Get batch rewards
-    batch_rewards = trajectory.rewards
-    
-    # If batch size is 1, always keep it
-    if batch_rewards.shape[0] == 1:
-        return trajectory
-    
-    # Compute advantages using GRPO baseline
-    advantages, _ = compute_advantages(
-        batch_rewards, 
-        values=None, 
-        gamma=GAMMA,
-        gae_lambda=GAE_LAMBDA,
-        use_grpo_baseline=True
-    )
-    
-    # Get batch indices where overall advantage is positive
-    # Sum advantages across time steps for each batch element
-    batch_advantages = advantages.sum(dim=1)
-    batch_mask = batch_advantages > 0
-    
-    # If no batch elements have positive advantage, return None
-    if not torch.any(batch_mask):
-        return None
-    
-    # Create a new trajectory with only the filtered batch elements
-    filtered_qkv_steps = []
-    
-    for qkv_step in trajectory.qkv_steps:
-        # Ensure batch_mask is on the same device as tensors
-        batch_mask_device = batch_mask.to(qkv_step.key_tokens.device)
-        
-        # Prepare the filtered attributes
-        filtered_attributes = {
-            "key_tokens": qkv_step.key_tokens[batch_mask_device],
-            "value_tokens": qkv_step.value_tokens[batch_mask_device],
-            "key_embedding": qkv_step.key_embedding[batch_mask_device],
-            "key_text": [qkv_step.key_text[i] for i in range(len(qkv_step.key_text)) if batch_mask[i]],
-            "value_text": [qkv_step.value_text[i] for i in range(len(qkv_step.value_text)) if batch_mask[i]],
-        }
-        
-        # Include query attributes if present
-        if qkv_step.query_text is not None:
-            filtered_attributes["query_text"] = [qkv_step.query_text[i] for i in range(len(qkv_step.query_text)) if batch_mask[i]]
-        
-        if qkv_step.query_tokens is not None and qkv_step.query_tokens.numel() > 0:
-            # For vector queries, query_tokens may be empty tensors with shape [batch_size, 0]
-            if qkv_step.query_tokens.shape[1] > 0:
-                filtered_attributes["query_tokens"] = qkv_step.query_tokens[batch_mask_device]
-            else:
-                # Handle empty query tokens for vector queries
-                filtered_batch_size = batch_mask_device.sum().item()
-                filtered_attributes["query_tokens"] = torch.empty((filtered_batch_size, 0), dtype=qkv_step.query_tokens.dtype, device=qkv_step.query_tokens.device)
-        
-        if qkv_step.query_embedding is not None:
-            filtered_attributes["query_embedding"] = qkv_step.query_embedding[batch_mask_device]
-            
-        if hasattr(qkv_step, 'query_log_probs') and qkv_step.query_log_probs is not None:
-            filtered_attributes["query_log_probs"] = qkv_step.query_log_probs[batch_mask_device]
-            
-        if hasattr(qkv_step, 'query_mean') and qkv_step.query_mean is not None:
-            filtered_attributes["query_mean"] = qkv_step.query_mean[batch_mask_device]
-        
-        # Create the filtered QKVStep
-        filtered_qkv_step = QKVStep(**filtered_attributes)
-        
-        # Copy over additional attributes that are not part of the dataclass
-        if hasattr(qkv_step, 'similarity_scores') and qkv_step.similarity_scores is not None:
-            filtered_qkv_step.similarity_scores = qkv_step.similarity_scores[batch_mask_device]
-        
-        if hasattr(qkv_step, 'selected_idx'):
-            filtered_qkv_step.selected_idx = qkv_step.selected_idx
-        
-        # Filter available_key_embeddings for KL divergence computation
-        if hasattr(qkv_step, 'available_key_embeddings') and qkv_step.available_key_embeddings is not None:
-            filtered_qkv_step.available_key_embeddings = qkv_step.available_key_embeddings[batch_mask_device]
-        
-        filtered_qkv_steps.append(filtered_qkv_step)
-    
-    # Create new trajectory with filtered elements
-    filtered_trajectory = Trajectory(qkv_steps=filtered_qkv_steps)
-    
-    # Copy over rewards, filtering to keep only selected batch elements
-    if trajectory.rewards is not None:
-        # Get the device from one of the tensors
-        device = filtered_qkv_steps[0].key_tokens.device
-        filtered_trajectory.rewards = trajectory.rewards[batch_mask.to(device)]
-    
-    if trajectory.avg_reward is not None:
-        # Ensure avg_reward is on the same device
-        device = filtered_qkv_steps[0].key_tokens.device
-        filtered_trajectory.avg_reward = trajectory.avg_reward[batch_mask.to(device)]
-    
-    # Copy over all_key_embeddings, filtering to keep only selected batch elements
-    if trajectory.all_key_embeddings is not None:
-        device = filtered_qkv_steps[0].key_tokens.device
-        filtered_trajectory.all_key_embeddings = trajectory.all_key_embeddings[batch_mask.to(device)]
-    
-    return filtered_trajectory
+
 
 
 def compute_returns(rewards: torch.Tensor, gamma: float = 0.99) -> torch.Tensor:
@@ -481,8 +381,7 @@ def compute_advantages(
             baseline = returns.mean(dim=0, keepdim=True)  # [1, num_steps]
             advantages = returns - baseline  # Broadcasting subtracts same baseline from each batch element
             
-            # Note: We don't normalize here because GRPO advantages are already zero-centered
-            # at each timestep by construction (mean across batch is 0)
+            # Advantages are now zero-centered at each timestep
         else:
             # Original: Use average across all timesteps (high variance)
             advantages = returns - returns.mean(dim=1, keepdim=True)
@@ -515,24 +414,24 @@ def compute_advantages(
 def compute_policy_loss(
     trajectory: Trajectory,
     adapter_model: torch.nn.Module,
-    baseline_model: torch.nn.Module,
+    old_model: torch.nn.Module,
     kl_penalty_coef: float,
     verbose: bool = False,
     gamma: float = 0.99,
     tokenizer: Any = None,
-    embeddings_dict: Dict = None
+    embeddings_dict: Optional[Dict] = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
     """
-    Compute the policy gradient loss with KL penalty for vector queries.
+    Compute the PPO clipped surrogate loss with KL penalty for vector queries.
     
     Args:
         trajectory: The trajectory to train on
         adapter_model: The language model with LoRA adapter
-        baseline_model: The baseline model for KL divergence computation
+        old_model: The old model for KL divergence computation and probability ratios (pi_old)
         kl_penalty_coef: KL penalty coefficient (beta)
         verbose: Flag to enable verbose logging
         gamma: Discount factor for returns
-        tokenizer: Tokenizer for reconstructing context
+        tokenizer: Tokenizer for reconstructing context (REQUIRED for vector queries)
         embeddings_dict: Embeddings dictionary (unused but kept for compatibility)
         
     Returns:
@@ -540,8 +439,12 @@ def compute_policy_loss(
             total_loss: The combined loss value
             policy_loss: The policy gradient component
             kl_loss: The KL divergence component
-            positive_adv_percentage: Percentage of steps with positive advantages
+            avg_clipping_ratio: Average clipping ratio across all steps
     """
+    # For vector queries, tokenizer is required
+    if tokenizer is None:
+        raise ValueError("Tokenizer is required for computing policy loss with vector queries")
+    
     # Determine device to use
     device = next(adapter_model.parameters()).device
     
@@ -550,12 +453,15 @@ def compute_policy_loss(
     kl_loss = torch.tensor(0.0, device=device, requires_grad=True) 
     count = 0
     
+    # Track clipping ratios
+    all_clipping_ratios = []
+    
     # Ensure trajectory has rewards
     if trajectory.rewards is None or trajectory.avg_reward is None:
         raise ValueError("Trajectory must have rewards computed before policy loss")
     
     # Import needed configs
-    from src.config import USE_GRPO_BASELINE, GAE_LAMBDA, INITIAL_PROMPT, KEY_PREFIX, VALUE_PREFIX, USE_POSITIVE_ADVANTAGES_ONLY
+    from src.config import USE_GRPO_BASELINE, GAE_LAMBDA, INITIAL_PROMPT, KEY_PREFIX, VALUE_PREFIX, PPO_CLIP_EPSILON, TEMPERATURE
     
     # Compute returns and advantages
     returns = compute_returns(trajectory.rewards, gamma)
@@ -567,18 +473,61 @@ def compute_policy_loss(
         use_grpo_baseline=USE_GRPO_BASELINE
     )
     
-    # Calculate positive advantage percentage for logging
-    positive_advantages = (advantages > 0).float()
-    positive_adv_percentage = positive_advantages.mean().item() * 100.0  # Convert to percentage
+
     
-    # Compute what the baseline model would have generated
+    # Compute what the old model would have generated (pi_old)
     # We'll do this by reconstructing the context at each step
-    baseline_query_means = []
-    if tokenizer is not None:
-        # Get batch size from first step
-        batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
+    old_query_means = []
+    
+    # Get batch size from first step
+    batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
+    
+    # Initialize context with the initial prompt
+    context_tokens = tokenizer(
+        [INITIAL_PROMPT] * batch_size,
+        return_tensors="pt",
+        padding=True,
+        add_special_tokens=False
+    ).input_ids.to(device)
+    
+    # Reconstruct context and generate old model means for each step
+    for t, qkv_step in enumerate(trajectory.qkv_steps):
+        # Generate query vector with old model (pi_old)
+        with torch.no_grad():
+            prev_query_mean = generate_query_vector(
+                old_model,
+                tokenizer,
+                context_tokens,
+                layer_idx=-2
+            )
+            old_query_means.append(prev_query_mean)
         
-        # Initialize context with the initial prompt
+        # Update context for next iteration (add key and value tokens)
+        key_prefix_tokens = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        value_prefix_tokens = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        
+        context_tokens = torch.cat([
+            context_tokens,
+            key_prefix_tokens,
+            qkv_step.key_tokens.to(device),
+            value_prefix_tokens,
+            qkv_step.value_tokens.to(device)
+        ], dim=1)
+    
+    # Process each step in the trajectory
+    for t, qkv_step in enumerate(trajectory.qkv_steps):
+        # For vector queries, we expect similarity_scores to be present
+        if not hasattr(qkv_step, 'similarity_scores') or qkv_step.similarity_scores is None:
+            if verbose:
+                print(f"Warning: Skipping step {t} - no similarity scores")
+            continue
+            
+        # For proper gradient flow and KL computation, we need available_key_embeddings
+        if not hasattr(qkv_step, 'available_key_embeddings') or qkv_step.available_key_embeddings is None:
+            raise ValueError(f"Step {t} is missing available_key_embeddings - required for PPO with vector queries")
+        
+        # Reconstruct context up to this step
+        batch_size = qkv_step.key_tokens.shape[0]
         context_tokens = tokenizer(
             [INITIAL_PROMPT] * batch_size,
             return_tensors="pt",
@@ -586,186 +535,141 @@ def compute_policy_loss(
             add_special_tokens=False
         ).input_ids.to(device)
         
-        # Reconstruct context and generate baseline means for each step
-        for t, qkv_step in enumerate(trajectory.qkv_steps):
-            # Generate query vector with baseline model
-            with torch.no_grad():
-                prev_query_mean = generate_query_vector(
-                    baseline_model,
-                    tokenizer,
-                    context_tokens,
-                    layer_idx=-2
-                )
-                baseline_query_means.append(prev_query_mean)
-            
-            # Update context for next iteration (add key and value tokens)
+        # Add all previous steps to context
+        for prev_t in range(t):
+            prev_step = trajectory.qkv_steps[prev_t]
             key_prefix_tokens = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
             value_prefix_tokens = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
             
             context_tokens = torch.cat([
                 context_tokens,
                 key_prefix_tokens,
-                qkv_step.key_tokens.to(device),
+                prev_step.key_tokens.to(device),
                 value_prefix_tokens,
-                qkv_step.value_tokens.to(device)
+                prev_step.value_tokens.to(device)
             ], dim=1)
-    
-    # Process each step in the trajectory
-    for t, qkv_step in enumerate(trajectory.qkv_steps):
-        if hasattr(qkv_step, 'similarity_scores') and qkv_step.similarity_scores is not None:
-            # IMPORTANT: Recompute query embeddings with current model to enable gradient flow
-            if tokenizer is not None:
-                # Reconstruct context up to this step
-                batch_size = qkv_step.key_tokens.shape[0]
-                context_tokens = tokenizer(
-                    [INITIAL_PROMPT] * batch_size,
-                    return_tensors="pt",
-                    padding=True,
-                    add_special_tokens=False
-                ).input_ids.to(device)
-                
-                # Add all previous steps to context
-                for prev_t in range(t):
-                    prev_step = trajectory.qkv_steps[prev_t]
-                    key_prefix_tokens = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-                    value_prefix_tokens = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-                    
-                    context_tokens = torch.cat([
-                        context_tokens,
-                        key_prefix_tokens,
-                        prev_step.key_tokens.to(device),
-                        value_prefix_tokens,
-                        prev_step.value_tokens.to(device)
-                    ], dim=1)
-                
-                # Generate query vector with current adapter model (with gradients)
-                current_query_embeddings = generate_query_vector(
-                    adapter_model,
-                    tokenizer,
-                    context_tokens,
-                    layer_idx=-2
-                )
-                
-                # Recompute similarities with available key embeddings
-                if hasattr(qkv_step, 'available_key_embeddings') and qkv_step.available_key_embeddings is not None:
-                    from src.embeddings import compute_similarity
-                    available_key_embeddings = qkv_step.available_key_embeddings.to(device)
-                    
-                    # Compute new similarity scores with gradients
-                    recomputed_similarities = compute_similarity(
-                        current_query_embeddings.unsqueeze(1),  # Add key dimension
-                        available_key_embeddings,
-                        adapter_model
-                    )
-                    
-                    # Use recomputed similarities for policy gradient
-                    from src.config import TEMPERATURE
-                    log_probs = F.log_softmax(recomputed_similarities / TEMPERATURE, dim=-1)
-                else:
-                    # Fallback to stored similarities if key embeddings not available
-                    similarity_scores = qkv_step.similarity_scores.to(device)
-                    from src.config import TEMPERATURE
-                    log_probs = F.log_softmax(similarity_scores / TEMPERATURE, dim=-1)
-            else:
-                # No tokenizer, use stored similarities
-                similarity_scores = qkv_step.similarity_scores.to(device)
-                from src.config import TEMPERATURE
-                log_probs = F.log_softmax(similarity_scores / TEMPERATURE, dim=-1)
+        
+        # Generate query vector with current adapter model (with gradients)
+        current_query_embeddings = generate_query_vector(
+            adapter_model,
+            tokenizer,
+            context_tokens,
+            layer_idx=-2
+        )
+        
+        # Recompute similarities with available key embeddings
+        from src.embeddings import compute_similarity
+        available_key_embeddings = qkv_step.available_key_embeddings.to(device)
+        
+        # Compute new similarity scores with gradients (current policy)
+        current_similarities = compute_similarity(
+            current_query_embeddings.unsqueeze(1),  # Add key dimension
+            available_key_embeddings,
+            adapter_model
+        )
+        
+        # Compute old policy similarities
+        if t < len(old_query_means):
+            old_query_embeddings = old_query_means[t].to(device)
             
-            selected_idx = qkv_step.selected_idx if hasattr(qkv_step, 'selected_idx') else 0
-            step_advantages = advantages[:, t].to(device)
-            selected_log_probs = log_probs[:, selected_idx]  # Get log prob of selected action
-            
-            # Policy gradient: log_prob * advantage (positive reinforces good actions)
-            if USE_POSITIVE_ADVANTAGES_ONLY:
-                # Only positive advantages contribute - this implements step-level filtering
-                # while preserving sequential context for KL computation
-                effective_advantages = torch.clamp(step_advantages, min=0.0)
-            else:
-                effective_advantages = step_advantages
-            
-            # Add small epsilon to prevent zero gradients when all advantages are clamped
-            if torch.all(effective_advantages == 0):
-                effective_advantages = effective_advantages + 1e-8
-            
-            # Policy gradient term (positive for reinforcement)
-            batch_policy_gradient = (selected_log_probs * effective_advantages).mean()
-            policy_loss = policy_loss + batch_policy_gradient  # Accumulate positive gradient
-            
-            # Compute KL divergence between current and baseline softmax policies
-            # Fixed: Use per-step available key embeddings to match similarity_scores dimensions
-            if baseline_query_means and hasattr(qkv_step, 'available_key_embeddings') and qkv_step.available_key_embeddings is not None:
-                # Recompute similarities with baseline query vectors
-                query_embeddings_prev = baseline_query_means[t].to(device)
-                available_key_embeddings = qkv_step.available_key_embeddings.to(device)
-                
-                # Import compute_similarity to handle normalization properly
-                from src.embeddings import compute_similarity
-                
-                # Compute similarities with baseline model's query
-                prev_similarities = compute_similarity(
-                    query_embeddings_prev.unsqueeze(1),  # Add key dimension
-                    available_key_embeddings,
-                    adapter_model  # Pass model for potential model-specific handling
-                )
-                prev_log_probs = F.log_softmax(prev_similarities / TEMPERATURE, dim=-1)
-                
-                # KL divergence between two categorical distributions
-                kl_divergence = F.kl_div(log_probs, prev_log_probs, reduction='batchmean', log_target=True)
-                kl_loss = kl_loss + kl_divergence  # Use tensor addition to maintain gradient
-                
-                if verbose and t == 0:  # Print info for first step
-                    print(f"Softmax KL divergence: {kl_divergence.item():.4f}")
-                    if USE_POSITIVE_ADVANTAGES_ONLY:
-                        pos_ratio = (step_advantages > 0).float().mean()
-                        print(f"Positive advantage ratio: {pos_ratio.item():.2%}")
-            
-            count += 1
+            # Compute old similarities
+            old_similarities = compute_similarity(
+                old_query_embeddings.unsqueeze(1),  # Add key dimension
+                available_key_embeddings,
+                adapter_model  # Use same model for consistency
+            )
         else:
-            # No query information - skip
-            if verbose:
-                print("Skipping step - no similarity scores")
-            continue
+            raise ValueError(f"Missing old query mean for step {t}")
+        
+        selected_idx = qkv_step.selected_idx if hasattr(qkv_step, 'selected_idx') else 0
+        step_advantages = advantages[:, t].to(device)
+        
+        # Compute log probabilities for numerical stability
+        current_log_probs = F.log_softmax(current_similarities / TEMPERATURE, dim=-1)
+        old_log_probs = F.log_softmax(old_similarities / TEMPERATURE, dim=-1)
+        
+        # Get log probabilities for selected action
+        current_action_log_probs = current_log_probs[:, selected_idx]  # [batch_size]
+        old_action_log_probs = old_log_probs[:, selected_idx]  # [batch_size]
+        
+        # Compute probability ratio: pi_theta(a|s) / pi_old(a|s)
+        # Use log-space for numerical stability: exp(ln pi_theta - ln pi_old)
+        log_ratio = current_action_log_probs - old_action_log_probs
+        ratio = torch.exp(log_ratio)
+        
+        # PPO clipped surrogate objective
+        clipped_ratio = torch.clamp(ratio, 1.0 - PPO_CLIP_EPSILON, 1.0 + PPO_CLIP_EPSILON)
+        
+        # Track clipping ratios for monitoring
+        all_clipping_ratios.extend(ratio.detach().cpu().numpy().tolist())
+        
+        # Compute both unclipped and clipped surrogate terms
+        unclipped_surrogate = ratio * step_advantages
+        clipped_surrogate = clipped_ratio * step_advantages
+        
+        # Take the minimum (more conservative update)
+        ppo_surrogate = torch.min(unclipped_surrogate, clipped_surrogate)
+        
+        # Sum over batch (not average) - PPO typically sums over trajectory
+        batch_policy_gradient = ppo_surrogate.sum()  # Sum over batch
+        policy_loss = policy_loss + batch_policy_gradient  # Accumulate across timesteps
+        
+        # Compute KL divergence between current and old softmax policies (for regularization)
+        # KL divergence between two categorical distributions
+        kl_divergence = F.kl_div(current_log_probs, old_log_probs, reduction='batchmean', log_target=True)
+        kl_loss = kl_loss + kl_divergence  # Use tensor addition to maintain gradient
+        
+        if verbose and t == 0:  # Print info for first step
+            print(f"PPO ratio mean: {ratio.mean().item():.4f}, std: {ratio.std().item():.4f}")
+            print(f"Clipped ratio range: [{clipped_ratio.min().item():.4f}, {clipped_ratio.max().item():.4f}]")
+            print(f"Softmax KL divergence: {kl_divergence.item():.4f}")
+        
+        count += 1
     
-    # Return average loss if there were trajectories, otherwise zero
+    # Compute average clipping ratio
+    avg_clipping_ratio = sum(all_clipping_ratios) / len(all_clipping_ratios) if all_clipping_ratios else 1.0
+    
+    # Compute final loss (sum over trajectory, not average)
     if count > 0:
-        avg_policy_gradient = policy_loss / count if isinstance(policy_loss, torch.Tensor) else torch.tensor(policy_loss / count, device=device)
-        avg_kl_loss = kl_loss / count if isinstance(kl_loss, torch.Tensor) else torch.tensor(kl_loss / count, device=device)
+        # Sum policy loss across trajectory steps (not average)
+        total_policy_loss = policy_loss  # Already summed
+        total_kl_loss = kl_loss / count  # Average KL loss across steps
         
         # Convert to loss: negate policy gradient (since we want to maximize expected reward)
         # and add KL penalty (since we want to minimize divergence)
-        avg_policy_loss = -avg_policy_gradient  # Only sign flip happens here!
-        kl_penalty_term = kl_penalty_coef * avg_kl_loss
-        total_loss = avg_policy_loss + kl_penalty_term
+        total_policy_loss = -total_policy_loss  # Negate for gradient ascent -> descent
+        kl_penalty_term = kl_penalty_coef * total_kl_loss
+        total_loss = total_policy_loss + kl_penalty_term
         
         if verbose:
-            print(f"\n=== Loss Components ===")
-            print(f"Policy gradient (before negation): {avg_policy_gradient.item():.4f}")
-            print(f"Policy loss (after negation): {avg_policy_loss.item():.4f}")
-            print(f"KL divergence loss: {avg_kl_loss.item():.4f}")
+            print(f"\n=== PPO Loss Components ===")
+            print(f"Policy gradient sum (before negation): {-total_policy_loss.item():.4f}")
+            print(f"Policy loss (after negation): {total_policy_loss.item():.4f}")
+            print(f"KL divergence loss: {total_kl_loss.item():.4f}")
             print(f"KL penalty coefficient: {kl_penalty_coef:.4f}")
             print(f"Total loss: {total_loss.item():.4f}")
-            print(f"  = {avg_policy_loss.item():.4f} + {kl_penalty_term.item():.4f}")
-            print(f"=== End Loss Components ===\n")
+            print(f"  = {total_policy_loss.item():.4f} + {kl_penalty_term.item():.4f}")
+            print(f"Average clipping ratio: {avg_clipping_ratio:.4f}")
+            print(f"=== End PPO Loss Components ===\n")
             
-        return total_loss, avg_policy_loss, avg_kl_loss, positive_adv_percentage
+        return total_loss, total_policy_loss, total_kl_loss, avg_clipping_ratio
     else:
         # Create a small non-zero tensor to ensure gradients can flow
         small_tensor = torch.tensor(1e-8, device=device, requires_grad=True)
-        return small_tensor, small_tensor, small_tensor, 0.0
+        return small_tensor, small_tensor, small_tensor, 1.0
 
 
 def train_step(
     trajectory: Trajectory,
     adapter_model: torch.nn.Module,
-    base_model: torch.nn.Module,
-    baseline_model: torch.nn.Module,
+    ref_model: torch.nn.Module,
+    old_model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     reward_stats: Dict[str, float],
     kl_penalty_coef: float,
     verbose: bool = False,
     tokenizer: Any = None,
-    embeddings_dict: Dict = None
+    embeddings_dict: Optional[Dict] = None
 ) -> Tuple[float, float, float, float]:
     """
     Perform a single training step with simplified model architecture.
@@ -773,8 +677,8 @@ def train_step(
     Args:
         trajectory: The trajectory to train on
         adapter_model: The language model with LoRA adapter (trainable)
-        base_model: The base language model without LoRA (for reward computation)
-        baseline_model: The baseline model for KL divergence computation (updated every N episodes)
+        ref_model: The reference language model without LoRA (pi_ref for reward computation)
+        old_model: The old model for KL divergence computation (pi_old, updated every N episodes)
         optimizer: The optimizer
         reward_stats: Reward statistics (for logging only with GRPO)
         kl_penalty_coef: KL penalty coefficient (beta)
@@ -785,9 +689,9 @@ def train_step(
     Returns:
         Tuple[float, float, float, float]: 
             total_loss: Total loss value 
-            positive_adv_percentage: Percentage of steps with positive advantages
             policy_loss: Policy gradient component of the loss
             kl_loss: KL divergence component of the loss
+            avg_clipping_ratio: Average clipping ratio across all steps
     """
     if verbose:
         print("\n=== Training Step ===")
@@ -802,33 +706,11 @@ def train_step(
                 rewards = [f"{i}: {reward.item():.4f}" for i, reward in enumerate(trajectory.avg_reward)]
                 print(f"Batch element rewards: {', '.join(rewards)}")
     
-    # Filter trajectory based on GRPO baseline
-    filtered_trajectory = filter_trajectories_grpo(trajectory)
-    
-    # Skip update if no batch elements meet the criteria
-    if filtered_trajectory is None:
-        if verbose:
-            print("No batch elements have positive advantage. Skipping update.")
-        return 0.0, 0.0, 0.0, 0.0
-    
-    # Get the number of batch elements that passed filtering
-    original_batch_size = trajectory.avg_reward.shape[0]
-    filtered_batch_size = filtered_trajectory.avg_reward.shape[0]
-    
-    if verbose:
-        print(f"GRPO filtered batch size: {filtered_batch_size}/{original_batch_size}")
-        print(f"Keeping trajectories with positive advantage (better than batch average)")
-    
     # No trajectory-level filtering - we use all trajectories
-    # The step-level filtering via USE_POSITIVE_ADVANTAGES_ONLY handles this
     
-    if verbose:
+    if verbose and trajectory.avg_reward is not None:
         batch_size = trajectory.avg_reward.shape[0]
         print(f"Processing all {batch_size} trajectories")
-        print(f"Step-level filtering via positive advantages is enabled")
-    
-    # Use original trajectory without filtering
-    filtered_batch_size = trajectory.avg_reward.shape[0]
     
     # Zero gradients
     optimizer.zero_grad()
@@ -836,11 +718,11 @@ def train_step(
     # Import the new parameters
     from src.config import GAMMA
     
-    # Compute policy loss using baseline_model for KL computation
-    total_loss, policy_loss, kl_loss, positive_adv_percentage = compute_policy_loss(
+    # Compute policy loss using old_model for KL computation
+    total_loss, policy_loss, kl_loss, avg_clipping_ratio = compute_policy_loss(
         trajectory,  # Use original trajectory, not filtered
         adapter_model,
-        baseline_model,  # Use baseline_model instead of previous_model for KL computation
+        old_model,  # Use old_model instead of baseline_model for KL computation
         kl_penalty_coef,
         verbose=verbose,
         gamma=GAMMA,
@@ -867,4 +749,4 @@ def train_step(
         print("Parameters updated.")
         print(f"=== Training Step Complete ===\n")
     
-    return total_loss.item(), positive_adv_percentage, policy_loss, kl_loss 
+    return total_loss.item(), policy_loss.item(), kl_loss.item(), avg_clipping_ratio 

@@ -283,7 +283,7 @@ def test_main(
                     mock_generate_trajectory.return_value = mock_trajectory
                     
                     # Mock train_step - returns loss and number of filtered batch elements
-                    mock_train_step.return_value = (0.5, 75.0, 0.3, 0.2)  # total_loss, positive_adv_percentage, policy_loss, kl_loss
+                    mock_train_step.return_value = (0.5, 0.3, 0.2, 1.2)  # total_loss, policy_loss, kl_loss, avg_clipping_ratio
                     
                     # Mock additional functions to prevent runtime errors
                     with patch("src.main.update_reward_stats", return_value={"mean": 0.0, "std": 1.0, "count": 1}):
@@ -377,7 +377,7 @@ def test_weights_update_with_real_model(gpt2_model, gpt2_tokenizer):
         mock_kl_loss = torch.tensor([0.03], device=device, requires_grad=True)
         mock_compute_policy_loss.return_value = (mock_total_loss, mock_policy_loss, mock_kl_loss, 75.0)
         
-        total_loss, positive_adv_percentage, policy_loss, kl_loss = train_step(
+                    total_loss, policy_loss, kl_loss, avg_clipping_ratio = train_step(
             trajectory,
             adapter_model,
             base_model,
@@ -399,7 +399,7 @@ def test_weights_update_with_real_model(gpt2_model, gpt2_tokenizer):
     # For this test, we're mainly checking that the training step runs without errors
     # The actual weight update may not happen if the loss is very small or zero
     assert isinstance(total_loss, float)
-    assert isinstance(positive_adv_percentage, float)
+    assert isinstance(avg_clipping_ratio, float)
 
 
 def test_base_model_weights_unchanged(gpt2_model, gpt2_tokenizer):

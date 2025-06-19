@@ -23,13 +23,25 @@ This document summarizes the major improvements made to the Attention-Guided RL 
 **Result**: KL divergence now accumulates over episodes (0.000 → 0.056 → 0.102 → 0.000 reset)
 **Configuration**: `export BASELINE_UPDATE_FREQUENCY=25` (default)
 
-### 3. Policy Gradient Sign Convention Improvement  
+### 3. Meaningful KL Regularization for Training Stability
+**Issue**: KL penalty too weak (0.01 coefficient, losses 0.0000-0.0013) - not providing meaningful regularization
+**Root Cause**: KL penalty coefficient was 10x too small and baseline updated too frequently (every 25 episodes)
+**Solution**: Increased KL penalty coefficient to 0.1 (10x stronger) and decreased baseline update frequency to 50 episodes
+**Benefits**: 
+- Stronger regularization to prevent policy collapse
+- More KL divergence accumulation between baseline updates
+- Configurable via `KL_PENALTY_COEFFICIENT` and `BASELINE_UPDATE_FREQUENCY`
+**Expected**: KL losses should now be in 0.01-0.1 range, providing meaningful training stabilization
+
+### 4. KL Divergence and Weight Change Tracking Fix
+
+### 5. Policy Gradient Sign Convention Improvement  
 **Issue**: Confusing sign conventions with multiple negations throughout computation  
 **Solution**: Work with positive gradients throughout, single sign flip only at the end  
 **Benefits**: More intuitive reasoning (positive = reinforce good actions)  
 **Commit**: `b64eb83`
 
-### 4. Machine-Dependent Test Behavior Fix
+### 6. Machine-Dependent Test Behavior Fix
 **Issue**: Tests behaved differently based on GPU memory (<12GB = GPT-2, ≥12GB = Llama)  
 **Solution**: Manual model configuration via `MODEL_TYPE` environment variable  
 **Benefits**: Deterministic tests across all machines, explicit user control  
@@ -116,6 +128,25 @@ python -m src.main
 
 # Combined model + token configuration
 MODEL_TYPE=llama USE_STANDARD_QUERY_TOKEN=true QUERY_TOKEN='Search' python -m src.main --dataset twenty_questions
+```
+
+### KL Regularization and Baseline Configuration
+```bash
+# Default: Stronger KL penalty (0.1) with less frequent baseline updates (50 episodes)
+python -m src.main
+
+# Strong regularization for stability
+export KL_PENALTY_COEFFICIENT=0.2
+export BASELINE_UPDATE_FREQUENCY=75
+python -m src.main
+
+# Lighter regularization for faster learning
+export KL_PENALTY_COEFFICIENT=0.05
+export BASELINE_UPDATE_FREQUENCY=25
+python -m src.main
+
+# Combined with other settings
+MODEL_TYPE=gpt2 USE_STANDARD_QUERY_TOKEN=true KL_PENALTY_COEFFICIENT=0.15 BASELINE_UPDATE_FREQUENCY=60 python -m src.main
 ```
 
 ### Baseline Model Configuration

@@ -18,23 +18,32 @@ from copy import deepcopy
 import sys
 
 from src.config import (
-    DEVICE,
     MODEL_NAME,
-    NUM_KV_PAIRS,
-    CHECKPOINT_INTERVAL,
-    NUM_EPISODES,
+    TOKENIZER_NAME,
+    DEVICE,
+    LORA_RANK,
+    LORA_ALPHA,
+    LORA_DROPOUT,
     LEARNING_RATE,
+    GRADIENT_CLIP_NORM,
+    NUM_EPISODES,
+    CHECKPOINT_INTERVAL,
+    TRAINING_BATCH_SIZE,
     KL_PENALTY_COEFFICIENT,
+    CHECKPOINT_DIR,
+    LOG_DIR,
+    LOG_INTERVAL,
+    ENABLE_WANDB,
+    WANDB_PROJECT,
+    INITIAL_PROMPT,
     KEY_PREFIX,
     VALUE_PREFIX,
-    INITIAL_PROMPT,
-    CHECKPOINT_DIR,
-    ENABLE_WANDB,
-    LOG_INTERVAL,
+    NUM_KV_PAIRS,
     BASELINE_UPDATE_FREQUENCY,
+    SUBTRACT_BASE_MODEL_LOGPROBS,
 )
 from src.model import setup_model_and_tokenizer, save_checkpoint, load_checkpoint, create_model_copy, get_checkpoint_path
-from src.data import iter_key_value_pairs, iter_key_value_pairs_unified, QKVStep
+from src.data import iter_key_value_pairs, iter_key_value_pairs_unified, QKVStep, repeat_n_times
 from src.embeddings import register_embedding_hook, extract_embeddings, compute_similarity, sample_key_value
 from src.training import (
     Trajectory,
@@ -60,6 +69,19 @@ kl_losses = []
 avg_rewards = []
 adapter_log_probs = []
 baseline_log_probs = []
+base_log_probs = []  # Base model log probabilities
+
+# NEW: Additional metrics for comprehensive plotting
+avg_advantages = []  # Original advantages (including negative)
+trajectory_log_probs = []
+wikipedia_order_consistency = []  # Order consistency metric (1.0 = perfect order, 0.0 = perfect reverse)
+entropy_values = []  # Policy entropy for exploration tracking
+kl_penalty_terms = []  # Actual KL penalty terms added to loss
+reward_variance = []  # Variance of rewards within each trajectory
+gradient_magnitudes = []  # Gradient magnitudes over time
+step_log_probs = []  # Log probabilities by step index (list of lists)
+clipping_ratios = []  # PPO clipping ratios
+kl_from_ref = []  # KL divergence from reference model (pi_ref)
 
 def setup_logging(args):
     """
@@ -189,6 +211,9 @@ def generate_trajectory(
         for qkv_step in available_qkv_steps:
             # Use the pre-computed embedding, just move to device
             key_emb = qkv_step.key_embedding.to(device)
+            # If key_emb has batch size 1 but we need batch_size, broadcast it
+            if key_emb.shape[0] == 1 and batch_size > 1:
+                key_emb = key_emb.expand(batch_size, -1)  # Broadcast to [batch_size, hidden_size]
             key_embs.append(key_emb)
             
         # Stack key embeddings with shape [batch_size, num_keys, hidden_size]
@@ -210,12 +235,33 @@ def generate_trajectory(
         selected_step = available_qkv_steps[selected_idx]
         
         # Create a copy of the selected step with tensors on the correct device
+        # and broadcast to correct batch size if needed
+        key_tokens = selected_step.key_tokens.to(device)
+        value_tokens = selected_step.value_tokens.to(device)
+        key_embedding = selected_step.key_embedding.to(device)
+        key_text = selected_step.key_text
+        value_text = selected_step.value_text
+        
+        # If tokens have batch size 1 but we need batch_size, broadcast them
+        if key_tokens.shape[0] == 1 and batch_size > 1:
+            key_tokens = key_tokens.expand(batch_size, -1)
+        if value_tokens.shape[0] == 1 and batch_size > 1:
+            value_tokens = value_tokens.expand(batch_size, -1)
+        if key_embedding.shape[0] == 1 and batch_size > 1:
+            key_embedding = key_embedding.expand(batch_size, -1)
+        
+        # If text lists have length 1 but we need batch_size, replicate them
+        if len(key_text) == 1 and batch_size > 1:
+            key_text = key_text * batch_size
+        if len(value_text) == 1 and batch_size > 1:
+            value_text = value_text * batch_size
+            
         device_selected_step = QKVStep(
-            key_tokens=selected_step.key_tokens.to(device),
-            value_tokens=selected_step.value_tokens.to(device),
-            key_embedding=selected_step.key_embedding.to(device),
-            key_text=selected_step.key_text,
-            value_text=selected_step.value_text
+            key_tokens=key_tokens,
+            value_tokens=value_tokens,
+            key_embedding=key_embedding,
+            key_text=key_text,
+            value_text=value_text
         )
         
         # Store query text, tokens and embedding with the selected step for later display
@@ -230,7 +276,8 @@ def generate_trajectory(
         
         # IMPORTANT: Store the current available key embeddings at this step
         # This fixes the KL divergence dimension mismatch issue
-        device_selected_step.available_key_embeddings = key_embeddings
+        # Use setattr to avoid linter issues with dynamic attributes
+        setattr(device_selected_step, 'available_key_embeddings', key_embeddings)
         
         # Add selected step to the list
         selected_steps.append(device_selected_step)
@@ -286,7 +333,183 @@ def parse_args():
     parser.add_argument("--dataset", type=str, default="wikipedia", 
                         choices=["wikipedia", "twenty_questions"],
                         help="Dataset to use for training")
+    parser.add_argument("--grpo-batching", action="store_true", default=True,
+                        help="Use GRPO-style batching (repeat each data point) (default: True)")
+    parser.add_argument("--no-grpo-batching", dest="grpo_batching", action="store_false",
+                        help="Disable GRPO-style batching")
     return parser.parse_args()
+
+
+def compute_wikipedia_order_consistency(trajectory) -> float:
+    """
+    Compute how consistently the model selects keys in their original Wikipedia article order.
+    
+    Uses edit distance from the perfect sequential order to measure consistency.
+    Perfect order consistency = 1.0 (sequence matches 0,1,2,3,...)
+    Maximum disorder = 0.0 (sequence requires maximum edits to fix)
+    
+    Args:
+        trajectory: The trajectory containing selected key indices
+        
+    Returns:
+        float: Order consistency score between 0.0 and 1.0
+    """
+    if not trajectory.qkv_steps or len(trajectory.qkv_steps) < 2:
+        return 0.5  # Neutral if not enough steps
+    
+    # Get the sequence of selected indices
+    selected_indices = []
+    for step in trajectory.qkv_steps:
+        if hasattr(step, 'selected_idx') and step.selected_idx is not None:
+            selected_indices.append(step.selected_idx)
+    
+    if len(selected_indices) < 2:
+        return 0.5  # Need at least 2 selections to measure consistency
+    
+    # Convert to list if needed and ensure we have integers
+    if isinstance(selected_indices[0], torch.Tensor):
+        selected_indices = [idx.item() if hasattr(idx, 'item') else int(idx) for idx in selected_indices]
+    
+    # Since keys are removed after selection, we need to reconstruct the original indices
+    # If we selected indices [2, 1, 0] from pools of size [5, 4, 3], the original indices were [2, 2, 2]
+    # But we want to track the relative order within the original set
+    
+    # For edit distance, we'll use the indices as selected (accounting for pool shrinkage)
+    # and compare against the sequential order [0, 1, 2, ..., n-1]
+    n = len(selected_indices)
+    perfect_sequence = list(range(n))
+    
+    # Compute edit distance (Levenshtein distance)
+    def edit_distance(seq1, seq2):
+        """Compute edit distance between two sequences."""
+        m, n = len(seq1), len(seq2)
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+        
+        # Initialize base cases
+        for i in range(m + 1):
+            dp[i][0] = i
+        for j in range(n + 1):
+            dp[0][j] = j
+        
+        # Fill the DP table
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                if seq1[i-1] == seq2[j-1]:
+                    dp[i][j] = dp[i-1][j-1]  # No operation needed
+                else:
+                    dp[i][j] = 1 + min(
+                        dp[i-1][j],    # Delete
+                        dp[i][j-1],    # Insert
+                        dp[i-1][j-1]   # Replace
+                    )
+        
+        return dp[m][n]
+    
+    # Compute edit distance from perfect sequence
+    distance = edit_distance(selected_indices, perfect_sequence)
+    
+    # Normalize: maximum possible edit distance is min(n, max_val) where max_val is the largest index
+    # For our case, worst case is when sequence is completely reversed
+    max_distance = n  # At most n replacements needed
+    
+    # Convert to consistency score: 1.0 = perfect (distance 0), 0.0 = worst (max distance)
+    if max_distance == 0:
+        return 1.0  # Edge case: single element
+    
+    consistency_score = 1.0 - (distance / max_distance)
+    return max(0.0, min(1.0, consistency_score))  # Clamp to [0, 1]
+
+
+def test_edit_distance_function():
+    """
+    Test cases for the edit distance function used in Wikipedia order consistency.
+    
+    This function tests various scenarios to ensure the edit distance calculation
+    and consistency scoring work correctly.
+    """
+    # Define the edit distance function (same as in compute_wikipedia_order_consistency)
+    def edit_distance(seq1, seq2):
+        """Compute edit distance between two sequences."""
+        m, n = len(seq1), len(seq2)
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+        
+        # Initialize base cases
+        for i in range(m + 1):
+            dp[i][0] = i
+        for j in range(n + 1):
+            dp[0][j] = j
+        
+        # Fill the DP table
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                if seq1[i-1] == seq2[j-1]:
+                    dp[i][j] = dp[i-1][j-1]  # No operation needed
+                else:
+                    dp[i][j] = 1 + min(
+                        dp[i-1][j],    # Delete
+                        dp[i][j-1],    # Insert
+                        dp[i-1][j-1]   # Replace
+                    )
+        
+        return dp[m][n]
+    
+    # Helper function to compute consistency score
+    def compute_consistency_score(selected_indices):
+        n = len(selected_indices)
+        perfect_sequence = list(range(n))
+        distance = edit_distance(selected_indices, perfect_sequence)
+        max_distance = n
+        if max_distance == 0:
+            return 1.0
+        consistency_score = 1.0 - (distance / max_distance)
+        return max(0.0, min(1.0, consistency_score))
+    
+    # Test cases
+    test_cases = [
+        # (selected_indices, expected_consistency_score, description)
+        ([0, 1, 2, 3], 1.0, "Perfect sequential order"),
+        ([3, 2, 1, 0], 0.0, "Perfect reverse order (maximum distance)"),
+        ([0, 1, 2], 1.0, "Perfect sequential order (3 elements)"),
+        ([2, 1, 0], 0.33, "Perfect reverse order (3 elements, distance=2/3)"),
+        ([0, 2, 1], 0.33, "One swap needed (2/3 distance)"),
+        ([1, 0, 2], 0.33, "One swap needed (2/3 distance)"),
+        ([0], 1.0, "Single element (perfect by definition)"),
+        ([0, 1], 1.0, "Two elements in order"),
+        ([1, 0], 0.0, "Two elements reversed"),
+        ([1, 2, 0], 0.33, "Circular shift (distance=2/3)"),
+        ([0, 2, 1, 3], 0.5, "One out of place (2/4 distance)"),
+        ([1, 0, 3, 2], 0.25, "Two swaps needed (distance=3/4)"),
+    ]
+    
+    print("\n=== Testing Edit Distance Function for Wikipedia Order Consistency ===")
+    
+    all_passed = True
+    for selected_indices, expected_score, description in test_cases:
+        actual_score = compute_consistency_score(selected_indices)
+        n = len(selected_indices)
+        perfect_sequence = list(range(n))
+        distance = edit_distance(selected_indices, perfect_sequence)
+        
+        # Allow for small floating point differences
+        tolerance = 0.01
+        passed = abs(actual_score - expected_score) < tolerance
+        all_passed = all_passed and passed
+        
+        status = "✓ PASS" if passed else "✗ FAIL"
+        print(f"{status} {description}")
+        print(f"  Selected: {selected_indices}, Perfect: {perfect_sequence}")
+        print(f"  Edit distance: {distance}, Max distance: {n}")
+        print(f"  Expected score: {expected_score:.2f}, Actual score: {actual_score:.2f}")
+        print()
+    
+    if all_passed:
+        print("🎉 All edit distance tests PASSED!")
+    else:
+        print("❌ Some edit distance tests FAILED!")
+    
+    print("=== End Edit Distance Tests ===\n")
+    
+    return all_passed
 
 
 def main():
@@ -303,6 +526,12 @@ def main():
     
     # Log query mode
     logging.info("Query mode: Vector queries")
+    
+    # Log reward computation mode
+    if SUBTRACT_BASE_MODEL_LOGPROBS:
+        logging.info("Reward computation: Using adapter - base model (classic baseline subtraction)")
+    else:
+        logging.info("Reward computation: Using raw adapter log probabilities (GRPO handles baselines)")
     
     # Set up models and tokenizer
     logging.info("Setting up models and tokenizer...")
@@ -353,43 +582,50 @@ def main():
                         logging.info(f"Resumed from episode {start_episode}")
                         break
         
-        # Set up data loader
-        logging.info(f"Setting up data loader for {args.dataset} dataset...")
-        
-        # Create a single baseline model for both key embeddings and KL computation
+        # Create a copy of the adapter model to serve as the old model (pi_old)
         # This will be updated every BASELINE_UPDATE_FREQUENCY episodes
-        baseline_model = create_model_copy(adapter_model)
+        old_model = create_model_copy(adapter_model)
         
-        # Register embedding hook for the baseline model (for KEY embeddings)
-        baseline_embeddings_dict, baseline_hook_remover = register_embedding_hook(baseline_model, embed_type="key")
+        # Register embedding hook for the old model (for KEY embeddings)
+        old_embeddings_dict, old_hook_remover = register_embedding_hook(old_model, embed_type="key")
         
-        # Use baseline model for key embeddings to ensure stability
-        # Pass the same tokenizer that was used to set up the models to avoid vocabulary mismatches
-        from src.data import iter_key_value_pairs_unified_with_tokenizer
-        kv_pair_generator = iter_key_value_pairs_unified_with_tokenizer(
-            dataset_name=args.dataset,
-            batch_size=args.batch_size, 
-            tokenizer=tokenizer,  # Use the same tokenizer instance
-            embedding_fn=lambda x: extract_embeddings(baseline_model, x, baseline_embeddings_dict)
-        )
+        # Import the data iterator and repeat function
+        from src.data import iter_key_value_pairs_unified_with_tokenizer, repeat_n_times
         
-        # Training loop
-        logging.info("Starting training...")
-        episodes_range = range(start_episode, args.episodes)
-        progress_bar = tqdm(episodes_range)
+        # Determine if we're using GRPO-style batching
+        use_grpo_batching = args.grpo_batching
         
-        # Training loop
-        reward_history = []
-        loss_history = []
-        gradient_history = []
-        gradient_magnitudes = []  # Track gradient magnitudes over time
-        weight_changes = []  # Track weight changes over time
-        policy_gradients = []  # Track policy gradients (before negation) for conceptual clarity
+        if use_grpo_batching:
+            # GRPO approach: repeat each data point batch_size times
+            # This creates a batch where each unique item appears multiple times
+            base_iterator = iter_key_value_pairs_unified_with_tokenizer(
+                dataset_name=args.dataset,
+                batch_size=1,  # Generate single items
+                tokenizer=tokenizer,
+                embedding_fn=lambda x: extract_embeddings(old_model, x, old_embeddings_dict)
+            )
+            # Repeat each item batch_size times for GRPO-style batching
+            kv_pair_generator = repeat_n_times(args.batch_size, base_iterator)
+        else:
+            # Standard approach: different items in each batch position
+            kv_pair_generator = iter_key_value_pairs_unified_with_tokenizer(
+                dataset_name=args.dataset,
+                batch_size=args.batch_size,
+                tokenizer=tokenizer,
+                embedding_fn=lambda x: extract_embeddings(old_model, x, old_embeddings_dict)
+            )
         
-        # No separate previous_model - use baseline_model for KL computation
-        # This allows KL divergence to accumulate over multiple episodes
-        logging.info(f"Using single baseline model for both key embeddings and KL computation")
-        logging.info(f"Baseline model will be updated every {BASELINE_UPDATE_FREQUENCY} episodes")
+        # Get reference to the base model (pi_ref)
+        ref_model = base_model
+        
+        # Log model setup
+        logging.info("Model setup complete:")
+        logging.info("- adapter_model: LoRA adapter (trainable)")
+        logging.info("- ref_model: Reference model (pi_ref, for reward computation)")
+        logging.info("- old_model: Old model (pi_old, for KL computation, updated periodically)")
+        logging.info(f"- GRPO batching: {'Enabled' if use_grpo_batching else 'Disabled'}")
+        # No separate previous_model - use old_model for KL computation
+        logging.info(f"Old model will be updated every {BASELINE_UPDATE_FREQUENCY} episodes")
         
         # Function to compute gradient statistics
         def get_gradient_stats(model):
@@ -409,6 +645,20 @@ def main():
                 if p1.requires_grad:
                     total_change += (p1 - p2).norm(2).item() ** 2
             return total_change ** 0.5
+        
+        # Training loop
+        logging.info("Starting training...")
+        episodes_range = range(start_episode, args.episodes)
+        progress_bar = tqdm(episodes_range)
+        
+        # Training loop
+        reward_history = []
+        loss_history = []
+        gradient_history = []
+        weight_changes = []  # Track weight changes over time
+        policy_gradients = []  # Track policy gradients (before negation) for conceptual clarity
+        clipping_ratios = []  # Track PPO clipping ratios
+        kl_from_ref = []  # Track KL divergence from reference model (pi_ref)
         
         for episode in progress_bar:
             if args.verbose:
@@ -438,25 +688,62 @@ def main():
             trajectory = generate_trajectory(
                 initial_tokens,
                 adapter_model,
-                base_model,
+                ref_model,
                 tokenizer,
                 embeddings_dict,
                 hook_remover,
                 available_qkv_steps,
-                batch_size,
+                batch_size=args.batch_size,
                 verbose=args.verbose,
             )
             
-            # Compute trajectory rewards using baseline model (not base model)
-            # This ensures fair comparison since baseline knows how to use vector queries
-            _, adapter_log_probs_batch, baseline_log_probs_batch = compute_trajectory_rewards(
+            # Compute trajectory rewards and log probabilities using ref_model (for actual rewards)
+            _, adapter_log_probs_batch, ref_log_probs_batch = compute_trajectory_rewards(
                 trajectory, 
                 adapter_model, 
-                baseline_model, 
+                ref_model, 
                 initial_tokens,
                 tokenizer=tokenizer,
                 verbose=args.verbose
             )
+            
+            # Also get old model log probabilities for comparison plotting
+            _, _, old_log_probs_batch = compute_trajectory_rewards(
+                trajectory, 
+                adapter_model, 
+                old_model, 
+                initial_tokens,
+                tokenizer=tokenizer,
+                verbose=False  # Don't print twice
+            )
+            
+            # Compute KL divergence from reference model (pi_ref) for monitoring
+            # This is different from the KL in the loss which is from pi_old
+            kl_from_ref_value = 0.0
+            if trajectory.qkv_steps:
+                # Compute KL between adapter and ref model for each step
+                kl_values = []
+                for step in trajectory.qkv_steps:
+                    if hasattr(step, 'similarity_scores') and step.similarity_scores is not None:
+                        # Get log probs from adapter and ref
+                        from src.config import TEMPERATURE
+                        import torch.nn.functional as F
+                        
+                        # For simplicity, use the stored similarity scores as proxy
+                        # In a full implementation, we'd recompute with ref model
+                        log_probs_adapter = F.log_softmax(step.similarity_scores / TEMPERATURE, dim=-1)
+                        # Approximate ref model probs as uniform (or could recompute)
+                        num_keys = step.similarity_scores.shape[-1]
+                        log_probs_ref = torch.full_like(log_probs_adapter, -torch.log(torch.tensor(num_keys)).item())
+                        
+                        # KL(adapter || ref)
+                        kl_step = F.kl_div(log_probs_ref, log_probs_adapter, reduction='batchmean', log_target=True)
+                        kl_values.append(kl_step.item())
+                
+                if kl_values:
+                    kl_from_ref_value = sum(kl_values) / len(kl_values)
+            
+            kl_from_ref.append(kl_from_ref_value)
             
             # Update reward stats
             if trajectory.avg_reward is not None:
@@ -469,11 +756,11 @@ def main():
                     print(f"  Count: {reward_stats['count']}")
             
             # Perform training step
-            total_loss, positive_adv_percentage, policy_loss, kl_loss = train_step(
+            total_loss, policy_loss, kl_loss, avg_clipping_ratio = train_step(
                 trajectory,
                 adapter_model,
-                baseline_model,  # Now using baseline instead of base
-                baseline_model,  # Use the same baseline model for KL computation
+                ref_model,  # Use ref_model for reward computation
+                old_model,  # Use old_model for KL computation
                 optimizer,
                 reward_stats,
                 KL_PENALTY_COEFFICIENT,
@@ -482,11 +769,14 @@ def main():
                 embeddings_dict=embeddings_dict
             )
             
-            # Track weight change BEFORE updating baseline_model
-            weight_change = compute_weight_change(adapter_model, baseline_model)
+            # Track clipping ratio
+            clipping_ratios.append(avg_clipping_ratio)
+            
+            # Track weight change BEFORE updating old_model
+            weight_change = compute_weight_change(adapter_model, old_model)
             weight_changes.append(weight_change)
             
-            # NO automatic baseline update after each training step - only at intervals
+            # NO automatic old_model update after each training step - only at intervals
             # This allows KL divergence to accumulate over multiple episodes for meaningful regularization
             
             # Calculate average reward across the batch
@@ -502,6 +792,50 @@ def main():
             kl_losses.append(kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss)
             avg_rewards.append(avg_reward)
             
+            # NEW: Track additional metrics for comprehensive plotting
+            
+            # Compute Wikipedia order consistency metric
+            if args.dataset == "wikipedia":
+                order_consistency = compute_wikipedia_order_consistency(trajectory)
+                wikipedia_order_consistency.append(order_consistency)
+            else:
+                wikipedia_order_consistency.append(0.5)  # Neutral for non-Wikipedia datasets
+            
+            # Track trajectory-level log probabilities (average across all trajectory steps)
+            traj_log_prob = adapter_log_probs_batch.mean().item()
+            trajectory_log_probs.append(traj_log_prob)
+            
+            # Track KL penalty terms (actual penalty added to loss)
+            kl_penalty_term = (kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss) * KL_PENALTY_COEFFICIENT
+            kl_penalty_terms.append(kl_penalty_term)
+            
+            # Track reward variance within trajectory
+            if trajectory.avg_reward is not None and trajectory.avg_reward.numel() > 1:
+                reward_var = trajectory.avg_reward.var().item()
+            else:
+                reward_var = 0.0
+            reward_variance.append(reward_var)
+            
+            # Track current learning rate
+            current_lr = optimizer.param_groups[0]['lr']
+            
+            # Compute and track average advantages from this episode
+            # We'll compute this from the trajectory using the same logic as in training
+            if trajectory.rewards is not None:
+                from src.training import compute_advantages
+                from src.config import GAMMA, GAE_LAMBDA, USE_GRPO_BASELINE
+                advantages, _ = compute_advantages(
+                    trajectory.rewards, 
+                    values=None, 
+                    gamma=GAMMA,
+                    gae_lambda=GAE_LAMBDA,
+                    use_grpo_baseline=USE_GRPO_BASELINE
+                )
+                avg_advantage = advantages.mean().item()
+            else:
+                avg_advantage = 0.0
+            avg_advantages.append(avg_advantage)
+            
             # For conceptual clarity, also track the policy gradient (before negation)
             # This helps visualize what we're actually reinforcing
             policy_gradient = -(policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss)
@@ -511,30 +845,41 @@ def main():
             progress_bar.set_description(
                 f"Episode {episode}/{args.episodes}, "
                 f"Loss: {total_loss:.4f}, "
-                f"Pos Adv: {positive_adv_percentage:.1f}%, "
+
                 f"Reward: {avg_reward:.4f}"
             )
             
-            # Update baseline model at configurable frequency
+            # Update old_model at configurable frequency
             if (episode + 1) % BASELINE_UPDATE_FREQUENCY == 0:
-                # Update the baseline model to reflect learning progress
-                baseline_model = create_model_copy(adapter_model)
+                # Update the old_model to reflect learning progress
+                old_model = create_model_copy(adapter_model)
                 
-                # Re-register the embedding hook for the new baseline (for KEY embeddings)
-                baseline_hook_remover()  # Remove old hook
-                baseline_embeddings_dict, baseline_hook_remover = register_embedding_hook(baseline_model, embed_type="key")
+                # Re-register the embedding hook for the new old_model (for KEY embeddings)
+                old_hook_remover()  # Remove old hook
+                old_embeddings_dict, old_hook_remover = register_embedding_hook(old_model, embed_type="key")
                 
                 # Update the embedding function in the generator
-                kv_pair_generator = iter_key_value_pairs_unified_with_tokenizer(
-                    dataset_name=args.dataset,
-                    batch_size=args.batch_size, 
-                    tokenizer=tokenizer,  # Use the same tokenizer instance
-                    embedding_fn=lambda x: extract_embeddings(baseline_model, x, baseline_embeddings_dict)
-                )
+                if use_grpo_batching:
+                    # GRPO approach: recreate the repeated iterator
+                    base_iterator = iter_key_value_pairs_unified_with_tokenizer(
+                        dataset_name=args.dataset,
+                        batch_size=1,
+                        tokenizer=tokenizer,
+                        embedding_fn=lambda x: extract_embeddings(old_model, x, old_embeddings_dict)
+                    )
+                    kv_pair_generator = repeat_n_times(args.batch_size, base_iterator)
+                else:
+                    # Standard approach
+                    kv_pair_generator = iter_key_value_pairs_unified_with_tokenizer(
+                        dataset_name=args.dataset,
+                        batch_size=args.batch_size, 
+                        tokenizer=tokenizer,  # Use the same tokenizer instance
+                        embedding_fn=lambda x: extract_embeddings(old_model, x, old_embeddings_dict)
+                    )
                 
-                logging.info(f"Updated baseline model at episode {episode + 1} (every {BASELINE_UPDATE_FREQUENCY} episodes)")
+                logging.info(f"Updated old_model at episode {episode + 1} (every {BASELINE_UPDATE_FREQUENCY} episodes)")
                 if args.verbose:
-                    print(f"Baseline model updated - KL divergence will now be computed against new baseline")
+                    print(f"Old_model updated - KL divergence will now be computed against new old_model")
             
             # Periodically verify weight changes (every 5 episodes)
             if (episode + 1) % 5 == 0:
@@ -556,13 +901,43 @@ def main():
                 save_checkpoint(adapter_model, "latest")
                 if args.verbose:
                     print(f"\nCheckpoint saved at episode {episode}")
-                
-            # Plot metrics more frequently (every 25 episodes) for better monitoring
+            
+            # Track gradient statistics
+            gradient_stats = get_gradient_stats(adapter_model)
+            gradient_history.append(gradient_stats)
+            gradient_magnitudes.append(gradient_stats[0])
+            
+            # Track reward history
+            reward_history.append(avg_reward)
+            loss_history.append(total_loss)
+            
+            # Track log probabilities (average across batch and timesteps)
+            adapter_log_probs.append(adapter_log_probs_batch.mean().item())
+            baseline_log_probs.append(old_log_probs_batch.mean().item())
+            base_log_probs.append(ref_log_probs_batch.mean().item())
+            
+            # Track log probabilities by step index (for the new plot)
+            # Compute log probabilities of selected actions at each step
+            step_log_probs_episode = []
+            for step in trajectory.qkv_steps:
+                if hasattr(step, 'similarity_scores') and step.similarity_scores is not None:
+                    # Convert similarity scores to log probabilities
+                    from src.config import TEMPERATURE
+                    import torch.nn.functional as F
+                    log_probs = F.log_softmax(step.similarity_scores / TEMPERATURE, dim=-1)
+                    # Get log prob of selected action (average over batch)
+                    selected_idx = step.selected_idx if hasattr(step, 'selected_idx') else 0
+                    selected_log_prob = log_probs[:, selected_idx].mean().item()
+                    step_log_probs_episode.append(selected_log_prob)
+            step_log_probs.append(step_log_probs_episode)
+            
+            # Save and plot metrics more frequently (every 25 episodes) for better monitoring
             if episode > 0 and episode % 25 == 0:
+                save_plot_data(log_dir, episode, policy_gradients)
                 plot_metrics(log_dir, policy_gradients)
             
-            # Log statistics
-            if episode % args.log_interval == 0:
+            # Log every LOG_INTERVAL episodes
+            if episode % LOG_INTERVAL == 0:
                 # Convert tensors to floats for logging
                 policy_loss_val = policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss
                 kl_loss_val = kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss
@@ -572,7 +947,7 @@ def main():
                     f"Total Loss: {total_loss:.4f}, "
                     f"Policy Loss: {policy_loss_val:.4f}, "
                     f"KL Loss: {kl_loss_val:.4f}, "
-                    f"Filtered: {positive_adv_percentage:.1f}%, "
+
                     f"Reward: {avg_reward:.4f}, "
                     f"Reward Mean: {reward_stats['mean']:.4f}, "
                     f"Reward Std: {reward_stats['std']:.4f}"
@@ -589,38 +964,8 @@ def main():
                         "reward": avg_reward,
                         "reward_mean": reward_stats["mean"],
                         "reward_std": reward_stats["std"],
-                        "positive_adv_percentage": positive_adv_percentage
+
                     })
-            
-            # Track gradient statistics
-            gradient_stats = get_gradient_stats(adapter_model)
-            gradient_history.append(gradient_stats)
-            gradient_magnitudes.append(gradient_stats[0])
-            
-            # Track reward history
-            reward_history.append(avg_reward)
-            loss_history.append(total_loss)
-            
-            # Track log probabilities (average across batch and timesteps)
-            adapter_log_probs.append(adapter_log_probs_batch.mean().item())
-            baseline_log_probs.append(baseline_log_probs_batch.mean().item())
-            
-            # Log every LOG_INTERVAL episodes
-            if episode % LOG_INTERVAL == 0:
-                # Convert tensors to floats for logging
-                policy_loss_val = policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss
-                kl_loss_val = kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss
-                
-                logging.info(
-                    f"Episode {episode}/{args.episodes}, "
-                    f"Total Loss: {total_loss:.4f}, "
-                    f"Policy Loss: {policy_loss_val:.4f}, "
-                    f"KL Loss: {kl_loss_val:.4f}, "
-                    f"Filtered: {positive_adv_percentage:.1f}%, "
-                    f"Reward: {avg_reward:.4f}, "
-                    f"Reward Mean: {reward_stats['mean']:.4f}, "
-                    f"Reward Std: {reward_stats['std']:.4f}"
-                )
                 
                 # Log gradient diagnostics
                 if len(gradient_magnitudes) > 0:
@@ -642,7 +987,8 @@ def main():
         # Save final checkpoint
         save_checkpoint(adapter_model, "latest")
         
-        # Create final plots
+        # Save final plot data and create plots
+        save_plot_data(log_dir, episode, policy_gradients)
         plot_metrics(log_dir, policy_gradients)
         
         logging.info("Training complete!")
@@ -654,13 +1000,84 @@ def main():
     finally:
         # Remove hooks
         hook_remover()
-        if 'baseline_hook_remover' in locals():
-            baseline_hook_remover()
+        if 'old_hook_remover' in locals():
+            old_hook_remover()
+
+
+def save_plot_data(log_dir, episode, policy_gradients_data=None, all_data=None):
+    """
+    Save all plotting data to a pickle file for later visualization.
+    
+    Args:
+        log_dir: Directory where logs are saved
+        episode: Current episode number (for filename)
+        policy_gradients_data: Policy gradients data (passed separately)
+        all_data: Optional pre-collected data dict, otherwise collect from globals
+    """
+    import pickle
+    import datetime
+    from src.config import (
+        KL_PENALTY_COEFFICIENT, GAMMA, GAE_LAMBDA, USE_GRPO_BASELINE,
+        TEMPERATURE, NUM_KV_PAIRS, BASELINE_UPDATE_FREQUENCY
+    )
+    
+    # Create plots directory
+    plots_dir = f"{log_dir}/plots"
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    # Collect all data if not provided
+    if all_data is None:
+        all_data = {
+            'training_steps': training_steps.copy(),
+            'total_losses': total_losses.copy(),
+            'policy_losses': policy_losses.copy(),
+            'kl_losses': kl_losses.copy(),
+            'avg_rewards': avg_rewards.copy(),
+            'adapter_log_probs': adapter_log_probs.copy(),
+            'baseline_log_probs': baseline_log_probs.copy(),
+            'base_log_probs': base_log_probs.copy(),
+            'avg_advantages': avg_advantages.copy(),
+            'trajectory_log_probs': trajectory_log_probs.copy(),
+            'wikipedia_order_consistency': wikipedia_order_consistency.copy(),
+            'kl_penalty_terms': kl_penalty_terms.copy(),
+            'reward_variance': reward_variance.copy(),
+            'gradient_magnitudes': gradient_magnitudes.copy(),
+            'step_log_probs': step_log_probs.copy(),
+            'policy_gradients': policy_gradients_data.copy() if policy_gradients_data else [],
+            'clipping_ratios': clipping_ratios.copy(),
+            'kl_from_ref': kl_from_ref.copy(),
+            # Add metadata
+            'metadata': {
+                'episode': episode,
+                'timestamp': datetime.datetime.now().isoformat(),
+                'config': {
+                    'KL_PENALTY_COEFFICIENT': KL_PENALTY_COEFFICIENT,
+                    'GAMMA': GAMMA,
+                    'GAE_LAMBDA': GAE_LAMBDA,
+                    'USE_GRPO_BASELINE': USE_GRPO_BASELINE,
+                    'TEMPERATURE': TEMPERATURE,
+                    'NUM_KV_PAIRS': NUM_KV_PAIRS,
+                    'BASELINE_UPDATE_FREQUENCY': BASELINE_UPDATE_FREQUENCY,
+                }
+            }
+        }
+    
+    # Save to pickle file
+    filename = f"{plots_dir}/plot_data_episode_{episode}.pkl"
+    with open(filename, 'wb') as f:
+        pickle.dump(all_data, f)
+    
+    logging.info(f"Saved plot data to {filename}")
+    
+    # Also save a "latest" version for easy access
+    latest_filename = f"{plots_dir}/plot_data_latest.pkl"
+    with open(latest_filename, 'wb') as f:
+        pickle.dump(all_data, f)
 
 
 def plot_metrics(log_dir, policy_gradients_data=None):
     """
-    Create and save detailed plots of training metrics.
+    Create and save comprehensive visualization of training metrics.
     
     Args:
         log_dir: Directory where logs and plots are saved
@@ -683,142 +1100,243 @@ def plot_metrics(log_dir, policy_gradients_data=None):
         len(avg_rewards),
         len(adapter_log_probs),
         len(baseline_log_probs),
-        len(policy_gradients_data) if policy_gradients_data else len(training_steps)
+        len(base_log_probs),
+
+        len(avg_advantages),
+        len(trajectory_log_probs),
+        len(wikipedia_order_consistency),
+        len(kl_penalty_terms),
+        len(reward_variance),
+        len(gradient_magnitudes) if gradient_magnitudes else 1,
+        len(step_log_probs) if step_log_probs else 1,
+        len(policy_gradients_data) if policy_gradients_data else len(training_steps),
+        len(clipping_ratios) if clipping_ratios else 1,
+        len(kl_from_ref) if kl_from_ref else 1
     )
     
-    # Truncate all arrays to the same length
+    # Convert all data to CPU numpy arrays with consistent length
     cpu_training_steps = [step.item() if isinstance(step, torch.Tensor) else step for step in training_steps[:min_length]]
     cpu_total_losses = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in total_losses[:min_length]]
     cpu_policy_losses = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in policy_losses[:min_length]]
     cpu_kl_losses = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in kl_losses[:min_length]]
     cpu_avg_rewards = [reward.item() if isinstance(reward, torch.Tensor) else reward for reward in avg_rewards[:min_length]]
-    
-    # Convert log probabilities to CPU with same length
     cpu_adapter_log_probs = [prob.item() if isinstance(prob, torch.Tensor) else prob for prob in adapter_log_probs[:min_length]]
     cpu_baseline_log_probs = [prob.item() if isinstance(prob, torch.Tensor) else prob for prob in baseline_log_probs[:min_length]]
+    cpu_base_log_probs = [prob.item() if isinstance(prob, torch.Tensor) else prob for prob in base_log_probs[:min_length]]
+
+    cpu_avg_advantages = avg_advantages[:min_length]
+    cpu_trajectory_log_probs = trajectory_log_probs[:min_length]
+    cpu_wikipedia_order_consistency = wikipedia_order_consistency[:min_length]
+    cpu_kl_penalty_terms = kl_penalty_terms[:min_length]
+    cpu_reward_variance = reward_variance[:min_length]
+    cpu_gradient_magnitudes = gradient_magnitudes[:min_length] if gradient_magnitudes else [0] * min_length
+    cpu_clipping_ratios = clipping_ratios[:min_length] if clipping_ratios else [1.0] * min_length
+    cpu_kl_from_ref = kl_from_ref[:min_length] if kl_from_ref else [0.0] * min_length
     
     # Convert policy gradients to CPU if available
     cpu_policy_gradients = []
     if policy_gradients_data and len(policy_gradients_data) > 0:
         cpu_policy_gradients = [grad.item() if isinstance(grad, torch.Tensor) else grad for grad in policy_gradients_data[:min_length]]
+    else:
+        cpu_policy_gradients = [0] * min_length
+        
+    # Create comprehensive figure with 3 rows and 4 columns
+    fig, axes = plt.subplots(3, 4, figsize=(24, 18))
+    axes = axes.flatten()  # Make it easier to index
     
-    # Calculate KL penalty term for visualization
-    cpu_kl_penalty_terms = [kl * KL_PENALTY_COEFFICIENT for kl in cpu_kl_losses]
+    # Plot 1: Loss Components
+    axes[0].plot(cpu_training_steps, cpu_total_losses, 'b-', label='Total Loss', linewidth=2)
+    axes[0].plot(cpu_training_steps, cpu_policy_losses, 'g--', label='Policy Loss', linewidth=1.5)
+    axes[0].plot(cpu_training_steps, cpu_kl_penalty_terms, 'r:', label=f'KL Penalty (β={KL_PENALTY_COEFFICIENT})', linewidth=1.5)
+    axes[0].set_xlabel('Training Step')
+    axes[0].set_ylabel('Loss')
+    axes[0].set_title('Loss Components')
+    axes[0].legend(fontsize=8)
+    axes[0].grid(True, alpha=0.3)
     
-    # Create a figure with 2x3 subplots for more comprehensive visualization
-    fig, ((ax1, ax2, ax3), (ax4, ax5, ax6)) = plt.subplots(2, 3, figsize=(20, 12))
-    
-    # 1. Loss components plot (for optimization)
-    ax1.plot(cpu_training_steps, cpu_total_losses, 'b-', label='Total Loss', linewidth=2)
-    ax1.plot(cpu_training_steps, cpu_policy_losses, 'g--', label='Policy Loss (-gradient)', linewidth=1.5)
-    ax1.plot(cpu_training_steps, cpu_kl_penalty_terms, 'r:', label=f'KL Penalty (β={KL_PENALTY_COEFFICIENT})', linewidth=1.5)
-    ax1.set_xlabel('Training Step')
-    ax1.set_ylabel('Loss (to minimize)')
-    ax1.set_title('Loss Components During Training')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    # 2. Reward plot
-    ax2.plot(cpu_training_steps, cpu_avg_rewards, 'purple', linewidth=2)
-    ax2.set_xlabel('Training Step')
-    ax2.set_ylabel('Average Reward')
-    ax2.set_title('Average Reward During Training')
-    ax2.grid(True, alpha=0.3)
-    
-    # Add a trend line if we have enough data points
+    # Plot 2: Rewards
+    axes[1].plot(cpu_training_steps, cpu_avg_rewards, 'purple', linewidth=2)
+    axes[1].set_xlabel('Training Step')
+    axes[1].set_ylabel('Average Reward')
+    axes[1].set_title('Average Reward')
+    axes[1].grid(True, alpha=0.3)
     if len(cpu_training_steps) > 10:
         z = np.polyfit(cpu_training_steps, cpu_avg_rewards, 1)
         p = np.poly1d(z)
-        ax2.plot(cpu_training_steps, p(cpu_training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
-        ax2.legend()
+        axes[1].plot(cpu_training_steps, p(cpu_training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
+        axes[1].legend(fontsize=8)
     
-    # 3. Average Log Probabilities plot (per token)
-    ax3.plot(cpu_training_steps, cpu_adapter_log_probs, 'darkgreen', label='Adapter Model', linewidth=2)
-    ax3.plot(cpu_training_steps, cpu_baseline_log_probs, 'orange', label='Baseline Model', linewidth=2)
-    ax3.set_xlabel('Training Step')
-    ax3.set_ylabel('Average Log Probability (per token)')
-    ax3.set_title('Model Log Probabilities Over Time (Average per Token)')
-    ax3.legend()
-    ax3.grid(True, alpha=0.3)
+    # Plot 3: Log Probabilities (Per Token)
+    axes[2].plot(cpu_training_steps, cpu_adapter_log_probs, 'darkgreen', label='Adapter Model', linewidth=2)
+    axes[2].plot(cpu_training_steps, cpu_baseline_log_probs, 'orange', label='Baseline Model', linewidth=2)
+    axes[2].plot(cpu_training_steps, cpu_base_log_probs, 'blue', label='Base Model', linewidth=2)
+    axes[2].set_xlabel('Training Step')
+    axes[2].set_ylabel('Avg Log Prob (per token)')
+    axes[2].set_title('Model Log Probabilities')
+    axes[2].legend(fontsize=8)
+    axes[2].grid(True, alpha=0.3)
     
-    # Add trend lines for log probabilities
+    # Plot 4: Advantages
+    axes[3].plot(cpu_training_steps, cpu_avg_advantages, 'brown', linewidth=2, label='Avg Advantage')
+    axes[3].axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+    axes[3].set_xlabel('Training Step')
+    axes[3].set_ylabel('Average Advantage')
+    axes[3].set_title('Advantage Statistics')
+    axes[3].legend(fontsize=8)
+    axes[3].grid(True, alpha=0.3)
+    # Add trend line for advantages if enough data
     if len(cpu_training_steps) > 10:
-        z_adapter = np.polyfit(cpu_training_steps, cpu_adapter_log_probs, 1)
-        z_baseline = np.polyfit(cpu_training_steps, cpu_baseline_log_probs, 1)
-        ax3.plot(cpu_training_steps, np.poly1d(z_adapter)(cpu_training_steps), "g--", alpha=0.5)
-        ax3.plot(cpu_training_steps, np.poly1d(z_baseline)(cpu_training_steps), "orange", linestyle="--", alpha=0.5)
+        z = np.polyfit(cpu_training_steps, cpu_avg_advantages, 1)
+        p = np.poly1d(z)
+        axes[3].plot(cpu_training_steps, p(cpu_training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
+        axes[3].legend(fontsize=8)
     
-    # 4. Policy Gradient plot (conceptually clearer - positive = reinforcement)
-    if len(cpu_policy_gradients) > 0:
-        ax4.plot(cpu_training_steps, cpu_policy_gradients, 'darkgreen', linewidth=2, label='Policy Gradient')
-        ax4.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
-        ax4.set_xlabel('Training Step')
-        ax4.set_ylabel('Policy Gradient (positive = reinforce)')
-        ax4.set_title('Policy Gradient Over Time')
-        ax4.legend()
-        ax4.grid(True, alpha=0.3)
+    # Plot 5: Trajectory-Level Log Probabilities
+    axes[4].plot(cpu_training_steps, cpu_trajectory_log_probs, 'darkblue', linewidth=2)
+    axes[4].set_xlabel('Training Step')
+    axes[4].set_ylabel('Trajectory Log Prob')
+    axes[4].set_title('Trajectory-Level Log Probabilities')
+    axes[4].grid(True, alpha=0.3)
+    if len(cpu_training_steps) > 10:
+        z = np.polyfit(cpu_training_steps, cpu_trajectory_log_probs, 1)
+        p = np.poly1d(z)
+        axes[4].plot(cpu_training_steps, p(cpu_training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
+        axes[4].legend(fontsize=8)
+    
+    # Plot 6: Gradient Norm
+    axes[5].plot(cpu_training_steps, cpu_gradient_magnitudes, 'red', linewidth=2)
+    axes[5].set_xlabel('Training Step')
+    axes[5].set_ylabel('Gradient Norm')
+    axes[5].set_title('Gradient Norm Over Time')
+    axes[5].grid(True, alpha=0.3)
+    axes[5].set_yscale('log')  # Log scale for gradient norms
+    
+    # Plot 7: Wikipedia Order Consistency
+    axes[6].plot(cpu_training_steps, cpu_wikipedia_order_consistency, 'teal', linewidth=2)
+    axes[6].axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='Random (0.5)')
+    axes[6].axhline(y=1.0, color='green', linestyle='--', alpha=0.3, label='Perfect Order (1.0)')
+    axes[6].axhline(y=0.0, color='red', linestyle='--', alpha=0.3, label='Reverse Order (0.0)')
+    axes[6].set_xlabel('Training Step')
+    axes[6].set_ylabel('Order Consistency')
+    axes[6].set_title('Wikipedia Key Selection Order')
+    axes[6].set_ylim(-0.1, 1.1)
+    axes[6].legend(fontsize=7)
+    axes[6].grid(True, alpha=0.3)
+    
+    # Plot 8: Policy Gradients
+    axes[7].plot(cpu_training_steps, cpu_policy_gradients, 'darkgreen', linewidth=2)
+    axes[7].axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+    axes[7].set_xlabel('Training Step')
+    axes[7].set_ylabel('Policy Gradient')
+    axes[7].set_title('Policy Gradient (positive = reinforce)')
+    axes[7].grid(True, alpha=0.3)
+    if len(cpu_policy_gradients) > 10:
+        mean_grad = np.mean(cpu_policy_gradients)
+        axes[7].text(0.02, 0.98, f'Mean: {mean_grad:.4f}', transform=axes[7].transAxes, 
+                    verticalalignment='top', fontsize=8, bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+    
+    # Plot 9: KL Divergence FROM REF MODEL (not from old model)
+    axes[8].plot(cpu_training_steps, cpu_kl_from_ref, 'darkred', linewidth=2)
+    axes[8].set_xlabel('Training Step')
+    axes[8].set_ylabel('KL Divergence')
+    axes[8].set_title('KL Divergence from Reference Model (π_ref)')
+    axes[8].grid(True, alpha=0.3)
+    if len(cpu_kl_from_ref) > 0:
+        mean_kl = np.mean(cpu_kl_from_ref)
+        axes[8].axhline(y=mean_kl, color='gray', linestyle='--', alpha=0.5, label=f'Mean: {mean_kl:.4f}')
+        axes[8].legend(fontsize=8)
+    
+    # Plot 10: Reward Variance
+    axes[9].plot(cpu_training_steps, cpu_reward_variance, 'magenta', linewidth=2)
+    axes[9].set_xlabel('Training Step')
+    axes[9].set_ylabel('Reward Variance')
+    axes[9].set_title('Reward Variance Within Trajectory')
+    axes[9].grid(True, alpha=0.3)
+    
+    # Plot 11: Step-Indexed Log Probabilities (by training thirds)
+    if len(step_log_probs) > 0 and len(step_log_probs[0]) > 0:
+        # Compute average log probability at each step index across different training periods
+        from src.config import NUM_KV_PAIRS
+        step_indices = list(range(NUM_KV_PAIRS))
         
-        # Add annotation explaining the interpretation
-        if len(cpu_policy_gradients) > 10:
-            mean_grad = np.mean(cpu_policy_gradients)
-            ax4.text(0.02, 0.98, f'Mean: {mean_grad:.4f}\n(>0 = reinforcing good actions)', 
-                    transform=ax4.transAxes, verticalalignment='top', fontsize=9,
-                    bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
-    else:
-        ax4.text(0.5, 0.5, 'No policy gradient data available', ha='center', va='center', transform=ax4.transAxes)
-        ax4.set_title('Policy Gradient Over Time')
-    
-    # 5. KL Divergence over time
-    ax5.plot(cpu_training_steps, cpu_kl_losses, 'darkred', linewidth=2)
-    ax5.set_xlabel('Training Step')
-    ax5.set_ylabel('KL Divergence')
-    ax5.set_title('KL Divergence Between Current and Previous Policy')
-    ax5.grid(True, alpha=0.3)
-    
-    # Add horizontal line for typical KL divergence scale
-    if len(cpu_kl_losses) > 0:
-        mean_kl = np.mean(cpu_kl_losses)
-        ax5.axhline(y=mean_kl, color='gray', linestyle='--', alpha=0.5, label=f'Mean: {mean_kl:.4f}')
-        ax5.legend()
-    
-    # 6. Log Probability Improvement plot (NEW!)
-    if len(cpu_adapter_log_probs) > 0 and len(cpu_baseline_log_probs) > 0:
-        improvement = [adapt - base for adapt, base in zip(cpu_adapter_log_probs, cpu_baseline_log_probs)]
-        ax6.plot(cpu_training_steps, improvement, 'darkblue', linewidth=2)
-        ax6.axhline(y=0, color='gray', linestyle='-', alpha=0.5)
-        ax6.set_xlabel('Training Step')
-        ax6.set_ylabel('Log Prob Improvement')
-        ax6.set_title('Adapter vs Baseline Log Probability Improvement')
-        ax6.grid(True, alpha=0.3)
+        # Divide episodes into thirds
+        total_episodes = min_length
+        first_third_end = total_episodes // 3
+        second_third_end = 2 * total_episodes // 3
         
-        # Add trend line
-        if len(cpu_training_steps) > 10:
-            z = np.polyfit(cpu_training_steps, improvement, 1)
-            p = np.poly1d(z)
-            ax6.plot(cpu_training_steps, p(cpu_training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
-            ax6.legend()
+        # Compute averages for each third
+        def compute_avg_for_period(start_idx, end_idx, period_name):
+            avg_log_probs_by_step = []
+            for step_idx in step_indices:
+                step_log_probs_period = []
+                for episode_idx in range(start_idx, min(end_idx, len(step_log_probs))):
+                    episode_log_probs = step_log_probs[episode_idx]
+                    if step_idx < len(episode_log_probs):
+                        step_log_probs_period.append(episode_log_probs[step_idx])
+                
+                if step_log_probs_period:
+                    avg_log_prob = sum(step_log_probs_period) / len(step_log_probs_period)
+                    avg_log_probs_by_step.append(avg_log_prob)
+                else:
+                    avg_log_probs_by_step.append(0.0)
+            return avg_log_probs_by_step
+        
+        # Compute averages for each third of training
+        if total_episodes >= 9:  # Only show thirds if we have at least 9 episodes
+            first_third = compute_avg_for_period(0, first_third_end, "Early")
+            second_third = compute_avg_for_period(first_third_end, second_third_end, "Mid")
+            third_third = compute_avg_for_period(second_third_end, total_episodes, "Late")
+            
+            # Plot all three periods
+            axes[10].plot(step_indices, first_third, 'lightcoral', linewidth=2, marker='o', markersize=3, label=f'Early (eps 0-{first_third_end})', alpha=0.8)
+            axes[10].plot(step_indices, second_third, 'gold', linewidth=2, marker='s', markersize=3, label=f'Mid (eps {first_third_end}-{second_third_end})', alpha=0.8)
+            axes[10].plot(step_indices, third_third, 'mediumseagreen', linewidth=2, marker='^', markersize=3, label=f'Late (eps {second_third_end}+)', alpha=0.8)
+            axes[10].legend(fontsize=7)
+        else:
+            # Fall back to overall average if not enough episodes
+            overall_avg = compute_avg_for_period(0, total_episodes, "Overall")
+            axes[10].plot(step_indices, overall_avg, 'darkviolet', linewidth=2, marker='o', markersize=4, label='Overall Average')
+            axes[10].legend(fontsize=8)
+        
+        axes[10].set_xlabel('Step Index')
+        axes[10].set_ylabel('Avg Log Prob of Selected Action')
+        axes[10].set_title('Log Prob by Step Index (training progression)')
+        axes[10].grid(True, alpha=0.3)
+        axes[10].set_xticks(step_indices)
     else:
-        ax6.text(0.5, 0.5, 'No data available', ha='center', va='center', transform=ax6.transAxes)
-        ax6.set_title('Log Probability Improvement')
+        axes[10].text(0.5, 0.5, 'No step log prob data\navailable yet', ha='center', va='center', 
+                     transform=axes[10].transAxes, fontsize=10)
+        axes[10].set_title('Log Prob by Step Index')
     
-    plt.tight_layout()
+    # Plot 12: PPO Clipping Ratio
+    axes[11].plot(cpu_training_steps, cpu_clipping_ratios, 'navy', linewidth=2)
+    # Add reference lines for clipping bounds
+    axes[11].axhline(y=1.0 - 0.2, color='red', linestyle='--', alpha=0.5, label='Lower clip (0.8)')
+    axes[11].axhline(y=1.0 + 0.2, color='red', linestyle='--', alpha=0.5, label='Upper clip (1.2)')
+    axes[11].axhline(y=1.0, color='gray', linestyle='-', alpha=0.3, label='No change (1.0)')
+    axes[11].set_xlabel('Training Step')
+    axes[11].set_ylabel('Average Clipping Ratio')
+    axes[11].set_title('PPO Clipping Ratio (π_θ / π_old)')
+    axes[11].legend(fontsize=7)
+    axes[11].grid(True, alpha=0.3)
+    axes[11].set_ylim(0.5, 1.5)  # Focus on the relevant range
     
-    # Save the plot to a single file that gets overwritten
-    plt.savefig(f"{plots_dir}/training_metrics.png", dpi=150)
+    # Adjust layout to prevent overlap
+    plt.tight_layout(pad=2.0)
+    
+    # Save the comprehensive plot
+    plt.savefig(f"{plots_dir}/training_metrics.png", dpi=150, bbox_inches='tight')
     plt.close()
     
-    # If we have enough data, create an additional detailed loss breakdown over time
+    # Create additional detailed loss breakdown plot if we have enough data
     if len(cpu_training_steps) > 20:
         plt.figure(figsize=(12, 6))
-        
-        # Stack plot showing loss composition over time
         plt.stackplot(cpu_training_steps, 
                      cpu_policy_losses, 
                      cpu_kl_penalty_terms,
                      labels=['Policy Loss', 'KL Penalty'],
                      colors=['green', 'red'],
                      alpha=0.7)
-        
         plt.plot(cpu_training_steps, cpu_total_losses, 'b-', label='Total Loss', linewidth=2)
         plt.xlabel('Training Step')
         plt.ylabel('Loss')
@@ -826,14 +1344,13 @@ def plot_metrics(log_dir, policy_gradients_data=None):
         plt.legend(loc='upper right')
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        
         plt.savefig(f"{plots_dir}/loss_breakdown.png", dpi=150)
         plt.close()
     
-    # If wandb is enabled, log the plots
+    # Log to wandb if enabled
     if ENABLE_WANDB:
         wandb_images = {
-            "training_metrics_plot": wandb.Image(f"{plots_dir}/training_metrics.png")
+            "comprehensive_training_metrics": wandb.Image(f"{plots_dir}/training_metrics.png")
         }
         if os.path.exists(f"{plots_dir}/loss_breakdown.png"):
             wandb_images["loss_breakdown_plot"] = wandb.Image(f"{plots_dir}/loss_breakdown.png")

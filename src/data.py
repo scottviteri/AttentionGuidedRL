@@ -24,6 +24,7 @@ from src.config import (
     KV_EVERY_N,
     QUERY_VEC_TOKEN,
     USE_STANDARD_QUERY_TOKEN,
+    KEY_EMBEDDING_BATCH_SIZE,
 )
 
 
@@ -45,6 +46,7 @@ class QKVStep:
         query_mean: Optional mean vector for stochastic queries [batch_size, query_dim]
         similarity_scores: Optional similarity scores between query and all keys [batch_size, num_keys]
         selected_idx: Optional index of the selected key
+        available_key_embeddings: Optional embeddings for all available keys [batch_size, num_keys, embedding_dim]
     """
 
     key_tokens: torch.Tensor  # Shape: [batch_size, TOKENS_PER_KEY]
@@ -59,6 +61,7 @@ class QKVStep:
     query_mean: torch.Tensor = None  # Optional mean vector for stochastic queries [batch_size, query_dim]
     similarity_scores: torch.Tensor = None  # Optional similarity scores [batch_size, num_keys]
     selected_idx: int = None  # Optional selected key index
+    available_key_embeddings: torch.Tensor = None  # Optional embeddings for all available keys [batch_size, num_keys, embedding_dim]
 
     def __post_init__(self):
         """Validate tensor shapes and types."""
@@ -259,7 +262,12 @@ def iter_key_value_pairs(
             batch_tokens.size(0) == batch_size
         ), f"Expected batch size {batch_size}, got {batch_tokens.size(0)}"
 
-        # Instead of aggregating all key-value pairs, yield a QKVStep for each chunk
+        # Extract all key-value pairs first
+        all_keys = []
+        all_values = []
+        all_key_texts = []
+        all_value_texts = []
+        
         for i in range(NUM_KV_PAIRS):
             j = i * KV_EVERY_N  # compute the starting index multiplier
             start_idx = j * chunk_size
@@ -274,20 +282,52 @@ def iter_key_value_pairs(
             key_text_list = tokenizer.batch_decode(pair_keys.tolist(), clean_up_tokenization_spaces=False)
             value_text_list = tokenizer.batch_decode(pair_values.tolist(), clean_up_tokenization_spaces=False)
 
-            # Compute embeddings for the key tokens if embedding_fn is provided
-            if embedding_fn is not None:
-                # embedding_fn should handle the device placement internally
-                key_embedding = embedding_fn(pair_keys)  
-            else:
-                embedding_dim = 768  # Default embedding dimension
-                key_embedding = torch.zeros((batch_size, embedding_dim), device=DEVICE)
+            all_keys.append(pair_keys)
+            all_values.append(pair_values)
+            all_key_texts.append(key_text_list)
+            all_value_texts.append(value_text_list)
 
+        # Batch process key embeddings if embedding_fn is provided
+        if embedding_fn is not None:
+            all_key_embeddings = []
+            
+            # Process keys in batches of KEY_EMBEDDING_BATCH_SIZE
+            for start_idx in range(0, NUM_KV_PAIRS, KEY_EMBEDDING_BATCH_SIZE):
+                end_idx = min(start_idx + KEY_EMBEDDING_BATCH_SIZE, NUM_KV_PAIRS)
+                
+                # Stack keys for this batch: [KEY_EMBEDDING_BATCH_SIZE, batch_size, TOKENS_PER_KEY]
+                key_batch = torch.stack(all_keys[start_idx:end_idx], dim=0)
+                
+                # Reshape to [KEY_EMBEDDING_BATCH_SIZE * batch_size, TOKENS_PER_KEY] for processing
+                key_batch_flat = key_batch.view(-1, TOKENS_PER_KEY)
+                
+                # Process this batch of keys
+                embeddings_batch_flat = embedding_fn(key_batch_flat)
+                
+                # Reshape back to [KEY_EMBEDDING_BATCH_SIZE, batch_size, embedding_dim]
+                embeddings_batch = embeddings_batch_flat.view(
+                    end_idx - start_idx, batch_size, -1
+                )
+                
+                # Add embeddings for each key in this batch
+                for i in range(embeddings_batch.shape[0]):
+                    all_key_embeddings.append(embeddings_batch[i])
+        else:
+            # Default embeddings if no embedding function
+            embedding_dim = 768  # Default embedding dimension
+            all_key_embeddings = [
+                torch.zeros((batch_size, embedding_dim), device=DEVICE) 
+                for _ in range(NUM_KV_PAIRS)
+            ]
+
+        # Yield QKVStep objects one by one
+        for i in range(NUM_KV_PAIRS):
             yield QKVStep(
-                key_tokens=pair_keys,
-                value_tokens=pair_values,
-                key_embedding=key_embedding,
-                key_text=key_text_list,
-                value_text=value_text_list,
+                key_tokens=all_keys[i],
+                value_tokens=all_values[i],
+                key_embedding=all_key_embeddings[i],
+                key_text=all_key_texts[i],
+                value_text=all_value_texts[i],
             )
 
 
@@ -369,7 +409,12 @@ def iter_twenty_questions_pairs(
             # Here we choose to skip incomplete batches
             break
         
-        # For each question index, yield a batch of question-answer pairs
+        # Extract all question-answer pairs first
+        all_key_tokens = []
+        all_value_tokens = []
+        all_key_texts = []
+        all_value_texts = []
+        
         for q_idx in range(min(len(questions), NUM_KV_PAIRS)):
             # Prepare batch data
             key_texts = []
@@ -400,19 +445,53 @@ def iter_twenty_questions_pairs(
                 return_tensors="pt",
             )["input_ids"].to(DEVICE)
             
-            # Compute embeddings for the key tokens if embedding_fn is provided
-            if embedding_fn is not None:
-                key_embedding = embedding_fn(key_tokens)
-            else:
-                embedding_dim = 768  # Default embedding dimension
-                key_embedding = torch.zeros((batch_size, embedding_dim), device=DEVICE)
+            all_key_tokens.append(key_tokens)
+            all_value_tokens.append(value_tokens)
+            all_key_texts.append(key_texts)
+            all_value_texts.append(value_texts)
+
+        # Batch process key embeddings if embedding_fn is provided
+        if embedding_fn is not None:
+            all_key_embeddings = []
+            num_questions = len(all_key_tokens)
             
+            # Process keys in batches of KEY_EMBEDDING_BATCH_SIZE
+            for start_idx in range(0, num_questions, KEY_EMBEDDING_BATCH_SIZE):
+                end_idx = min(start_idx + KEY_EMBEDDING_BATCH_SIZE, num_questions)
+                
+                # Stack keys for this batch: [KEY_EMBEDDING_BATCH_SIZE, batch_size, TOKENS_PER_KEY]
+                key_batch = torch.stack(all_key_tokens[start_idx:end_idx], dim=0)
+                
+                # Reshape to [KEY_EMBEDDING_BATCH_SIZE * batch_size, TOKENS_PER_KEY] for processing
+                key_batch_flat = key_batch.view(-1, TOKENS_PER_KEY)
+                
+                # Process this batch of keys
+                embeddings_batch_flat = embedding_fn(key_batch_flat)
+                
+                # Reshape back to [KEY_EMBEDDING_BATCH_SIZE, batch_size, embedding_dim]
+                embeddings_batch = embeddings_batch_flat.view(
+                    end_idx - start_idx, batch_size, -1
+                )
+                
+                # Add embeddings for each key in this batch
+                for i in range(embeddings_batch.shape[0]):
+                    all_key_embeddings.append(embeddings_batch[i])
+        else:
+            # Default embeddings if no embedding function
+            embedding_dim = 768  # Default embedding dimension
+            all_key_embeddings = [
+                torch.zeros((batch_size, embedding_dim), device=DEVICE) 
+                for _ in range(len(all_key_tokens))
+            ]
+
+        # Yield QKVStep objects one by one
+        for i in range(len(all_key_tokens)):
             yield QKVStep(
-                key_tokens=key_tokens,
-                value_tokens=value_tokens,
-                key_embedding=key_embedding,
-                key_text=key_texts,
-                value_text=value_texts,
+                key_tokens=all_key_tokens[i],
+                value_tokens=all_value_tokens[i],
+                key_embedding=all_key_embeddings[i],
+                key_text=all_key_texts[i],
+                value_text=all_value_texts[i],
             )
 
 
@@ -519,7 +598,12 @@ def iter_key_value_pairs_with_tokenizer(
             batch_tokens.size(0) == batch_size
         ), f"Expected batch size {batch_size}, got {batch_tokens.size(0)}"
 
-        # Instead of aggregating all key-value pairs, yield a QKVStep for each chunk
+        # Extract all key-value pairs first
+        all_keys = []
+        all_values = []
+        all_key_texts = []
+        all_value_texts = []
+        
         for i in range(NUM_KV_PAIRS):
             j = i * KV_EVERY_N  # compute the starting index multiplier
             start_idx = j * chunk_size
@@ -534,20 +618,52 @@ def iter_key_value_pairs_with_tokenizer(
             key_text_list = tokenizer.batch_decode(pair_keys.tolist(), clean_up_tokenization_spaces=False)
             value_text_list = tokenizer.batch_decode(pair_values.tolist(), clean_up_tokenization_spaces=False)
 
-            # Compute embeddings for the key tokens if embedding_fn is provided
-            if embedding_fn is not None:
-                # embedding_fn should handle the device placement internally
-                key_embedding = embedding_fn(pair_keys)  
-            else:
-                embedding_dim = 768  # Default embedding dimension
-                key_embedding = torch.zeros((batch_size, embedding_dim), device=DEVICE)
+            all_keys.append(pair_keys)
+            all_values.append(pair_values)
+            all_key_texts.append(key_text_list)
+            all_value_texts.append(value_text_list)
 
+        # Batch process key embeddings if embedding_fn is provided
+        if embedding_fn is not None:
+            all_key_embeddings = []
+            
+            # Process keys in batches of KEY_EMBEDDING_BATCH_SIZE
+            for start_idx in range(0, NUM_KV_PAIRS, KEY_EMBEDDING_BATCH_SIZE):
+                end_idx = min(start_idx + KEY_EMBEDDING_BATCH_SIZE, NUM_KV_PAIRS)
+                
+                # Stack keys for this batch: [KEY_EMBEDDING_BATCH_SIZE, batch_size, TOKENS_PER_KEY]
+                key_batch = torch.stack(all_keys[start_idx:end_idx], dim=0)
+                
+                # Reshape to [KEY_EMBEDDING_BATCH_SIZE * batch_size, TOKENS_PER_KEY] for processing
+                key_batch_flat = key_batch.view(-1, TOKENS_PER_KEY)
+                
+                # Process this batch of keys
+                embeddings_batch_flat = embedding_fn(key_batch_flat)
+                
+                # Reshape back to [KEY_EMBEDDING_BATCH_SIZE, batch_size, embedding_dim]
+                embeddings_batch = embeddings_batch_flat.view(
+                    end_idx - start_idx, batch_size, -1
+                )
+                
+                # Add embeddings for each key in this batch
+                for i in range(embeddings_batch.shape[0]):
+                    all_key_embeddings.append(embeddings_batch[i])
+        else:
+            # Default embeddings if no embedding function
+            embedding_dim = 768  # Default embedding dimension
+            all_key_embeddings = [
+                torch.zeros((batch_size, embedding_dim), device=DEVICE) 
+                for _ in range(NUM_KV_PAIRS)
+            ]
+
+        # Yield QKVStep objects one by one
+        for i in range(NUM_KV_PAIRS):
             yield QKVStep(
-                key_tokens=pair_keys,
-                value_tokens=pair_values,
-                key_embedding=key_embedding,
-                key_text=key_text_list,
-                value_text=value_text_list,
+                key_tokens=all_keys[i],
+                value_tokens=all_values[i],
+                key_embedding=all_key_embeddings[i],
+                key_text=all_key_texts[i],
+                value_text=all_value_texts[i],
             )
 
 
@@ -597,7 +713,12 @@ def iter_twenty_questions_pairs_with_tokenizer(
             # Here we choose to skip incomplete batches
             break
         
-        # For each question index, yield a batch of question-answer pairs
+        # Extract all question-answer pairs first
+        all_key_tokens = []
+        all_value_tokens = []
+        all_key_texts = []
+        all_value_texts = []
+        
         for q_idx in range(min(len(questions), NUM_KV_PAIRS)):
             # Prepare batch data
             key_texts = []
@@ -628,17 +749,195 @@ def iter_twenty_questions_pairs_with_tokenizer(
                 return_tensors="pt",
             )["input_ids"].to(DEVICE)
             
-            # Compute embeddings for the key tokens if embedding_fn is provided
-            if embedding_fn is not None:
-                key_embedding = embedding_fn(key_tokens)
-            else:
-                embedding_dim = 768  # Default embedding dimension
-                key_embedding = torch.zeros((batch_size, embedding_dim), device=DEVICE)
+            all_key_tokens.append(key_tokens)
+            all_value_tokens.append(value_tokens)
+            all_key_texts.append(key_texts)
+            all_value_texts.append(value_texts)
+
+        # Batch process key embeddings if embedding_fn is provided
+        if embedding_fn is not None:
+            all_key_embeddings = []
+            num_questions = len(all_key_tokens)
             
+            # Process keys in batches of KEY_EMBEDDING_BATCH_SIZE
+            for start_idx in range(0, num_questions, KEY_EMBEDDING_BATCH_SIZE):
+                end_idx = min(start_idx + KEY_EMBEDDING_BATCH_SIZE, num_questions)
+                
+                # Stack keys for this batch: [KEY_EMBEDDING_BATCH_SIZE, batch_size, TOKENS_PER_KEY]
+                key_batch = torch.stack(all_key_tokens[start_idx:end_idx], dim=0)
+                
+                # Reshape to [KEY_EMBEDDING_BATCH_SIZE * batch_size, TOKENS_PER_KEY] for processing
+                key_batch_flat = key_batch.view(-1, TOKENS_PER_KEY)
+                
+                # Process this batch of keys
+                embeddings_batch_flat = embedding_fn(key_batch_flat)
+                
+                # Reshape back to [KEY_EMBEDDING_BATCH_SIZE, batch_size, embedding_dim]
+                embeddings_batch = embeddings_batch_flat.view(
+                    end_idx - start_idx, batch_size, -1
+                )
+                
+                # Add embeddings for each key in this batch
+                for i in range(embeddings_batch.shape[0]):
+                    all_key_embeddings.append(embeddings_batch[i])
+        else:
+            # Default embeddings if no embedding function
+            embedding_dim = 768  # Default embedding dimension
+            all_key_embeddings = [
+                torch.zeros((batch_size, embedding_dim), device=DEVICE) 
+                for _ in range(len(all_key_tokens))
+            ]
+
+        # Yield QKVStep objects one by one
+        for i in range(len(all_key_tokens)):
             yield QKVStep(
-                key_tokens=key_tokens,
-                value_tokens=value_tokens,
-                key_embedding=key_embedding,
-                key_text=key_texts,
-                value_text=value_texts,
+                key_tokens=all_key_tokens[i],
+                value_tokens=all_value_tokens[i],
+                key_embedding=all_key_embeddings[i],
+                key_text=all_key_texts[i],
+                value_text=all_value_texts[i],
             )
+
+
+def repeat_n_times(n: int, stream: Iterator) -> Iterator:
+    """
+    Stream operator that repeats each item from the input stream n times.
+    
+    This is useful for GRPO-style batching where we want multiple copies
+    of the same data point in our batch.
+    
+    Args:
+        n: Number of times to repeat each item
+        stream: Input iterator/generator
+        
+    Yields:
+        Each item from the stream, repeated n times
+    """
+    for item in stream:
+        for _ in range(n):
+            yield item
+
+
+def iter_key_value_pairs_unified_with_repeat(
+    dataset_name: str = "wikipedia",
+    batch_size: int = 1,
+    repeat_count: int = 1,
+    tokenizer: PreTrainedTokenizer = None,
+    embedding_fn=None
+) -> Iterator[QKVStep]:
+    """
+    Unified iterator with optional repetition for GRPO-style batching.
+    
+    Args:
+        dataset_name: Name of the dataset ('wikipedia' or 'twenty_questions')
+        batch_size: Number of items to process in each batch
+        repeat_count: Number of times to repeat each item (for GRPO)
+        tokenizer: Specific tokenizer instance to use
+        embedding_fn: Optional function to compute embeddings
+        
+    Returns:
+        Iterator[QKVStep]: Iterator yielding batched QKVStep objects
+    """
+    # Get the base iterator
+    base_iterator = iter_key_value_pairs_unified_with_tokenizer(
+        dataset_name=dataset_name,
+        batch_size=1,  # Generate single items first
+        tokenizer=tokenizer,
+        embedding_fn=embedding_fn
+    )
+    
+    # Apply repetition if requested
+    if repeat_count > 1:
+        repeated_iterator = repeat_n_times(repeat_count, base_iterator)
+        
+        # Now batch the repeated items
+        batched_iterator = batch_iterator(repeated_iterator, batch_size)
+        
+        # Process batches to create QKVStep objects
+        for batch in batched_iterator:
+            if len(batch) == batch_size:
+                # Stack the batch elements into single QKVStep
+                yield stack_qkv_batch(batch)
+    else:
+        # Use the original iterator with its own batching
+        return iter_key_value_pairs_unified_with_tokenizer(
+            dataset_name=dataset_name,
+            batch_size=batch_size,
+            tokenizer=tokenizer,
+            embedding_fn=embedding_fn
+        )
+
+
+def batch_iterator(stream: Iterator, batch_size: int) -> Iterator[List]:
+    """
+    Batch items from a stream into groups of batch_size.
+    
+    Args:
+        stream: Input iterator
+        batch_size: Size of each batch
+        
+    Yields:
+        Lists of items with size batch_size
+    """
+    batch = []
+    for item in stream:
+        batch.append(item)
+        if len(batch) == batch_size:
+            yield batch
+            batch = []
+    # Don't yield incomplete batches
+
+
+def stack_qkv_batch(batch: List[QKVStep]) -> QKVStep:
+    """
+    Stack a list of QKVStep objects into a single batched QKVStep.
+    
+    Args:
+        batch: List of QKVStep objects to stack
+        
+    Returns:
+        Single QKVStep with batched tensors
+    """
+    if not batch:
+        raise ValueError("Cannot stack empty batch")
+    
+    # Get device from first item
+    device = batch[0].key_tokens.device
+    
+    # Stack all tensor fields
+    key_tokens = torch.stack([step.key_tokens.squeeze(0) for step in batch], dim=0)
+    value_tokens = torch.stack([step.value_tokens.squeeze(0) for step in batch], dim=0)
+    key_embedding = torch.stack([step.key_embedding.squeeze(0) for step in batch], dim=0)
+    
+    # Combine text fields
+    key_text = []
+    value_text = []
+    for step in batch:
+        key_text.extend(step.key_text)
+        value_text.extend(step.value_text)
+    
+    # Create batched QKVStep
+    batched_step = QKVStep(
+        key_tokens=key_tokens,
+        value_tokens=value_tokens,
+        key_embedding=key_embedding,
+        key_text=key_text,
+        value_text=value_text
+    )
+    
+    # Handle optional fields
+    if batch[0].query_text is not None:
+        query_text = []
+        for step in batch:
+            query_text.extend(step.query_text)
+        batched_step.query_text = query_text
+    
+    if batch[0].query_tokens is not None:
+        query_tokens = torch.stack([step.query_tokens.squeeze(0) for step in batch], dim=0)
+        batched_step.query_tokens = query_tokens
+    
+    if batch[0].query_embedding is not None:
+        query_embedding = torch.stack([step.query_embedding.squeeze(0) for step in batch], dim=0)
+        batched_step.query_embedding = query_embedding
+    
+    return batched_step

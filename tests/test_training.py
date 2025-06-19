@@ -190,40 +190,7 @@ def test_update_reward_stats():
     assert updated_stats["std"] == 1.0
 
 
-def test_filter_trajectories_grpo():
-    """Test filtering batch elements using GRPO baseline."""
-    # Import here to avoid circular imports
-    from src.training import filter_trajectories_grpo
-    from src.training import Trajectory
-    from src.data import KeyValuePair, QKVStep
-    from src.config import TOKENS_PER_KEY, TOKENS_PER_VALUE
-    
-    # Create a trajectory with batch dimensions
-    batch_size = 3
-    kv_pair = KeyValuePair(
-        key_tokens=torch.randint(0, 1000, (batch_size, 10)),
-        value_tokens=torch.randint(0, 1000, (batch_size, 10)),
-        key_embedding=torch.zeros(batch_size, 10),
-        key_text=["key1", "key2", "key3"],
-        value_text=["value1", "value2", "value3"]
-    )
-    
-    trajectory = Trajectory(qkv_steps=[kv_pair])
-    
-    # Set rewards with different values for each batch element
-    # First element has lower returns than average, others higher
-    trajectory.rewards = torch.tensor([[0.5], [1.5], [2.0]])
-    trajectory.avg_reward = torch.tensor([0.5, 1.5, 2.0])
-    
-    # Call GRPO filter
-    filtered = filter_trajectories_grpo(trajectory)
-    
-    # With GRPO, elements with positive advantage (above batch average) are kept
-    # Average reward at timestep 0 is (0.5 + 1.5 + 2.0) / 3 = 1.33
-    # So we expect to keep elements with rewards > 1.33 (i.e., [1.5] and [2.0])
-    assert filtered is not None
-    assert filtered.avg_reward.shape[0] == 2, f"Expected 2 elements, got {filtered.avg_reward.shape[0]}: {filtered.avg_reward}"
-    assert torch.allclose(filtered.avg_reward, torch.tensor([1.5, 2.0]))
+
 
 
 def test_compute_policy_loss(mock_trajectory, mock_models):
@@ -257,7 +224,7 @@ def test_compute_policy_loss(mock_trajectory, mock_models):
     previous_model.return_value = MagicMock(logits=previous_logits)
     
     # Call function
-    total_loss, policy_loss, kl_loss, positive_adv_percentage = compute_policy_loss(
+    total_loss, policy_loss, kl_loss, positive_adv_percentage, avg_clipping_ratio = compute_policy_loss(
         mock_trajectory,
         adapter_model,
         previous_model,
@@ -282,24 +249,22 @@ def test_train_step(mock_models, mock_trajectory):
     optimizer = MagicMock()
     
     # Mock compute_policy_loss
-    with patch("src.training.compute_policy_loss", return_value=(torch.tensor(1.0, requires_grad=True), torch.tensor(0.7, requires_grad=True), torch.tensor(0.3, requires_grad=True), 75.0)):
-        # Mock filter_trajectories_grpo to return the trajectory with filtered batch elements
-        with patch("src.training.filter_trajectories_grpo", return_value=mock_trajectory):
-            # Call function
-            total_loss, positive_adv_percentage, policy_loss, kl_loss = train_step(
-                mock_trajectory, 
-                adapter_model, 
-                base_model,
-                previous_model,
-                optimizer, 
-                {"mean": 0.0, "std": 1.0, "count": 10},
-                KL_PENALTY_COEFFICIENT,
-                verbose=False
-            )
+    with patch("src.training.compute_policy_loss", return_value=(torch.tensor(1.0, requires_grad=True), torch.tensor(0.7, requires_grad=True), torch.tensor(0.3, requires_grad=True), 75.0, 1.2)):
+        # Call function (no filtering now)
+        total_loss, positive_adv_percentage, policy_loss, kl_loss, avg_clipping_ratio = train_step(
+            mock_trajectory, 
+            adapter_model, 
+            base_model,
+            previous_model,
+            optimizer, 
+            {"mean": 0.0, "std": 1.0, "count": 10},
+            KL_PENALTY_COEFFICIENT,
+            verbose=False
+        )
     
     # Check outputs
     assert isinstance(total_loss, float)
-    assert isinstance(positive_adv_percentage, float)
+    assert isinstance(avg_clipping_ratio, float)
     assert isinstance(policy_loss, torch.Tensor)
     assert isinstance(kl_loss, torch.Tensor)
     assert optimizer.zero_grad.called
@@ -413,10 +378,11 @@ def test_model_behavior_during_training():
     with patch("src.training.filter_trajectories_grpo", return_value=trajectory):
         with patch('src.training.compute_policy_loss') as mock_compute_policy_loss:
             # Create tensors that require grad for the backward pass
+            device = gpt2_model.device
             mock_total_loss = torch.tensor([0.1], device=device, requires_grad=True)
             mock_policy_loss = torch.tensor([0.07], device=device, requires_grad=True)
             mock_kl_loss = torch.tensor([0.03], device=device, requires_grad=True)
-            mock_compute_policy_loss.return_value = (mock_total_loss, mock_policy_loss, mock_kl_loss, 75.0)
+            mock_compute_policy_loss.return_value = (mock_total_loss, mock_policy_loss, mock_kl_loss, 1.2)
             
             train_step(
                 trajectory,
@@ -545,7 +511,7 @@ def test_train_step_with_real_model(gpt2_model):
         mock_compute_policy_loss.return_value = (mock_total_loss, mock_policy_loss, mock_kl_loss, 75.0)
         
         # Run train step
-        total_loss, positive_adv_percentage, policy_loss, kl_loss = train_step(
+                    total_loss, policy_loss, kl_loss, avg_clipping_ratio = train_step(
             trajectory,
             adapter_model,
             gpt2_model,

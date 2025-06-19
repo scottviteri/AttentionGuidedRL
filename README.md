@@ -96,16 +96,16 @@ The previous 4-model setup caused KL loss to always be 0. The new simplified arc
 #### Baseline Update Configuration:
 
 ```bash
-# Default: Update baseline every 25 episodes
-export BASELINE_UPDATE_FREQUENCY=25
-python -m src.main
-
-# More frequent updates (faster adaptation, less KL accumulation)
-export BASELINE_UPDATE_FREQUENCY=10
-python -m src.main
-
-# Less frequent updates (more KL accumulation, more stability)
+# Default baseline update frequency (every 50 episodes)
 export BASELINE_UPDATE_FREQUENCY=50
+python -m src.main
+
+# Less frequent updates for more KL accumulation (every 75 episodes)
+export BASELINE_UPDATE_FREQUENCY=75
+python -m src.main
+
+# More frequent updates for faster adaptation (every 25 episodes)
+export BASELINE_UPDATE_FREQUENCY=25
 python -m src.main
 ```
 
@@ -113,6 +113,26 @@ python -m src.main
 - KL accumulates over episodes until baseline update (no longer always 0!)
 - Higher frequencies = faster adaptation but less regularization
 - Lower frequencies = more regularization but slower adaptation to learning progress
+
+### KL Regularization Configuration
+```bash
+# Default KL penalty coefficient (0.1 - 10x stronger than original)
+export KL_PENALTY_COEFFICIENT=0.1
+python -m src.main
+
+# Stronger KL regularization for more stability
+export KL_PENALTY_COEFFICIENT=0.2
+python -m src.main
+
+# Weaker KL regularization for faster learning
+export KL_PENALTY_COEFFICIENT=0.05
+python -m src.main
+
+# Combined KL and baseline configuration
+export KL_PENALTY_COEFFICIENT=0.15
+export BASELINE_UPDATE_FREQUENCY=75
+python -m src.main
+```
 
 ### Training with Wikipedia
 
@@ -191,6 +211,90 @@ Embeddings are extracted from the last attention layer of the model, with differ
 ### Checkpointing
 
 The model is saved periodically (every 100 episodes by default) and at the end of training. Training can be resumed from the latest checkpoint using the `--resume` flag.
+
+## Plotting and Visualization
+
+### Automatic Plot Data Saving
+
+**NEW**: The training now automatically saves all plotting data to pickle files, allowing you to regenerate plots or create custom visualizations without re-running training.
+
+During training, plot data is saved:
+- Every 25 episodes: `logs/<timestamp>/plots/plot_data_episode_<N>.pkl`
+- At the end of training: `logs/<timestamp>/plots/plot_data_latest.pkl`
+
+### Regenerating Plots
+
+Use the standalone plotting script to regenerate plots from saved data:
+
+```bash
+# Generate plots from the latest run
+python generate_plots.py logs/*/plots/plot_data_latest.pkl
+
+# Generate plots with custom output directory
+python generate_plots.py logs/*/plots/plot_data_episode_100.pkl -o custom_plots/
+
+# Override configuration for labels
+python generate_plots.py data.pkl --kl-coef 0.2
+```
+
+### Creating Custom Plots
+
+Use the example script to create custom visualizations:
+
+```bash
+# Run the custom plotting examples
+python custom_plot_example.py
+```
+
+This will generate:
+- `custom_reward_plot.png` - Reward plot with variance shading and smoothing
+- `loss_analysis.png` - Detailed loss component analysis
+- `advantage_dist.png` - Advantage distribution analysis
+- `comparison_plot.png` - Multi-run comparison (if multiple runs exist)
+
+### Custom Plot Examples
+
+```python
+import pickle
+import matplotlib.pyplot as plt
+
+# Load saved data
+with open('logs/latest/plots/plot_data_latest.pkl', 'rb') as f:
+    data = pickle.load(f)
+
+# Access any metric
+training_steps = data['training_steps']
+rewards = data['avg_rewards']
+advantages = data['avg_advantages']
+
+# Create your own plots
+plt.figure(figsize=(10, 6))
+plt.plot(training_steps, rewards, 'b-', label='Rewards')
+plt.plot(training_steps, advantages, 'r--', label='Advantages')
+plt.xlabel('Episode')
+plt.ylabel('Value')
+plt.legend()
+plt.savefig('my_custom_plot.png')
+```
+
+### Available Metrics in Saved Data
+
+The pickle files contain all training metrics:
+- `training_steps` - Episode numbers
+- `total_losses`, `policy_losses`, `kl_losses` - Loss components
+- `avg_rewards` - Average rewards per episode
+- `adapter_log_probs`, `baseline_log_probs`, `base_log_probs` - Model log probabilities
+- `avg_advantages` - Average advantages
+- `trajectory_log_probs` - Trajectory-level log probabilities
+- `wikipedia_order_consistency` - Order consistency metric (Wikipedia dataset)
+- `kl_penalty_terms` - KL penalty values
+- `reward_variance` - Variance within trajectories
+- `gradient_magnitudes` - Gradient norms
+- `step_log_probs` - Log probabilities by step index
+- `policy_gradients` - Policy gradient values
+- `clipping_ratios` - PPO clipping ratios
+- `kl_from_ref` - KL divergence from reference model
+- `metadata` - Training configuration and timestamp
 
 ## License
 
