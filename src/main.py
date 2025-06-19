@@ -602,7 +602,7 @@ def main():
                 dataset_name=args.dataset,
                 batch_size=1,  # Generate single items
                 tokenizer=tokenizer,
-                embedding_fn=lambda x: extract_embeddings(old_model, x, old_embeddings_dict)
+                embedding_fn=None  # embeddings computed later
             )
             # Repeat each item batch_size times for GRPO-style batching
             kv_pair_generator = repeat_n_times(args.batch_size, base_iterator)
@@ -610,9 +610,9 @@ def main():
             # Standard approach: different items in each batch position
             kv_pair_generator = iter_key_value_pairs_unified_with_tokenizer(
                 dataset_name=args.dataset,
-                batch_size=args.batch_size,
+                batch_size=args.batch_size, 
                 tokenizer=tokenizer,
-                embedding_fn=lambda x: extract_embeddings(old_model, x, old_embeddings_dict)
+                embedding_fn=None
             )
         
         # Get reference to the base model (pi_ref)
@@ -858,28 +858,8 @@ def main():
                 old_hook_remover()  # Remove old hook
                 old_embeddings_dict, old_hook_remover = register_embedding_hook(old_model, embed_type="key")
                 
-                # Update the embedding function in the generator
-                if use_grpo_batching:
-                    # GRPO approach: recreate the repeated iterator
-                    base_iterator = iter_key_value_pairs_unified_with_tokenizer(
-                        dataset_name=args.dataset,
-                        batch_size=1,
-                        tokenizer=tokenizer,
-                        embedding_fn=lambda x: extract_embeddings(old_model, x, old_embeddings_dict)
-                    )
-                    kv_pair_generator = repeat_n_times(args.batch_size, base_iterator)
-                else:
-                    # Standard approach
-                    kv_pair_generator = iter_key_value_pairs_unified_with_tokenizer(
-                        dataset_name=args.dataset,
-                        batch_size=args.batch_size, 
-                        tokenizer=tokenizer,  # Use the same tokenizer instance
-                        embedding_fn=lambda x: extract_embeddings(old_model, x, old_embeddings_dict)
-                    )
-                
-                logging.info(f"Updated old_model at episode {episode + 1} (every {BASELINE_UPDATE_FREQUENCY} episodes)")
-                if args.verbose:
-                    print(f"Old_model updated - KL divergence will now be computed against new old_model")
+                # NO need to recreate kv_pair_generator; embeddings will be recomputed on-the-fly
+                logging.info("Old_model updated; KV generator preserved to avoid data repetition")
             
             # Periodically verify weight changes (every 5 episodes)
             if (episode + 1) % 5 == 0:
@@ -901,7 +881,7 @@ def main():
                 save_checkpoint(adapter_model, "latest")
                 if args.verbose:
                     print(f"\nCheckpoint saved at episode {episode}")
-            
+                
             # Track gradient statistics
             gradient_stats = get_gradient_stats(adapter_model)
             gradient_history.append(gradient_stats)
@@ -1077,284 +1057,59 @@ def save_plot_data(log_dir, episode, policy_gradients_data=None, all_data=None):
 
 def plot_metrics(log_dir, policy_gradients_data=None):
     """
-    Create and save comprehensive visualization of training metrics.
+    Create and save comprehensive visualization of training metrics by calling generate_plots.py.
     
     Args:
         log_dir: Directory where logs and plots are saved
-        policy_gradients_data: List of policy gradient values for plotting
+        policy_gradients_data: List of policy gradient values for plotting (unused, kept for compatibility)
     """
-    # Create plots directory
+    import subprocess
+    
+    # Get the latest plot data file
     plots_dir = f"{log_dir}/plots"
-    os.makedirs(plots_dir, exist_ok=True)
+    latest_pickle = f"{plots_dir}/plot_data_latest.pkl"
     
-    # Make sure all arrays have data and same length
-    if len(training_steps) == 0:
-        return  # No data to plot yet
+    if not os.path.exists(latest_pickle):
+        logging.warning(f"No plot data found at {latest_pickle}")
+        return
     
-    # Ensure all arrays have the same length by taking the minimum
-    min_length = min(
-        len(training_steps),
-        len(total_losses), 
-        len(policy_losses),
-        len(kl_losses),
-        len(avg_rewards),
-        len(adapter_log_probs),
-        len(baseline_log_probs),
-        len(base_log_probs),
-
-        len(avg_advantages),
-        len(trajectory_log_probs),
-        len(wikipedia_order_consistency),
-        len(kl_penalty_terms),
-        len(reward_variance),
-        len(gradient_magnitudes) if gradient_magnitudes else 1,
-        len(step_log_probs) if step_log_probs else 1,
-        len(policy_gradients_data) if policy_gradients_data else len(training_steps),
-        len(clipping_ratios) if clipping_ratios else 1,
-        len(kl_from_ref) if kl_from_ref else 1
-    )
+    # Get the absolute path to generate_plots.py
+    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    generate_plots_script = os.path.join(script_dir, "generate_plots.py")
     
-    # Convert all data to CPU numpy arrays with consistent length
-    cpu_training_steps = [step.item() if isinstance(step, torch.Tensor) else step for step in training_steps[:min_length]]
-    cpu_total_losses = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in total_losses[:min_length]]
-    cpu_policy_losses = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in policy_losses[:min_length]]
-    cpu_kl_losses = [loss.item() if isinstance(loss, torch.Tensor) else loss for loss in kl_losses[:min_length]]
-    cpu_avg_rewards = [reward.item() if isinstance(reward, torch.Tensor) else reward for reward in avg_rewards[:min_length]]
-    cpu_adapter_log_probs = [prob.item() if isinstance(prob, torch.Tensor) else prob for prob in adapter_log_probs[:min_length]]
-    cpu_baseline_log_probs = [prob.item() if isinstance(prob, torch.Tensor) else prob for prob in baseline_log_probs[:min_length]]
-    cpu_base_log_probs = [prob.item() if isinstance(prob, torch.Tensor) else prob for prob in base_log_probs[:min_length]]
-
-    cpu_avg_advantages = avg_advantages[:min_length]
-    cpu_trajectory_log_probs = trajectory_log_probs[:min_length]
-    cpu_wikipedia_order_consistency = wikipedia_order_consistency[:min_length]
-    cpu_kl_penalty_terms = kl_penalty_terms[:min_length]
-    cpu_reward_variance = reward_variance[:min_length]
-    cpu_gradient_magnitudes = gradient_magnitudes[:min_length] if gradient_magnitudes else [0] * min_length
-    cpu_clipping_ratios = clipping_ratios[:min_length] if clipping_ratios else [1.0] * min_length
-    cpu_kl_from_ref = kl_from_ref[:min_length] if kl_from_ref else [0.0] * min_length
+    if not os.path.exists(generate_plots_script):
+        logging.error(f"generate_plots.py not found at {generate_plots_script}")
+        return
     
-    # Convert policy gradients to CPU if available
-    cpu_policy_gradients = []
-    if policy_gradients_data and len(policy_gradients_data) > 0:
-        cpu_policy_gradients = [grad.item() if isinstance(grad, torch.Tensor) else grad for grad in policy_gradients_data[:min_length]]
-    else:
-        cpu_policy_gradients = [0] * min_length
+    # Call generate_plots.py with the latest data
+    try:
+        # Run the script and capture output
+        result = subprocess.run(
+            [sys.executable, generate_plots_script, latest_pickle],
+            capture_output=True,
+            text=True,
+            check=True
+        )
         
-    # Create comprehensive figure with 3 rows and 4 columns
-    fig, axes = plt.subplots(3, 4, figsize=(24, 18))
-    axes = axes.flatten()  # Make it easier to index
-    
-    # Plot 1: Loss Components
-    axes[0].plot(cpu_training_steps, cpu_total_losses, 'b-', label='Total Loss', linewidth=2)
-    axes[0].plot(cpu_training_steps, cpu_policy_losses, 'g--', label='Policy Loss', linewidth=1.5)
-    axes[0].plot(cpu_training_steps, cpu_kl_penalty_terms, 'r:', label=f'KL Penalty (β={KL_PENALTY_COEFFICIENT})', linewidth=1.5)
-    axes[0].set_xlabel('Training Step')
-    axes[0].set_ylabel('Loss')
-    axes[0].set_title('Loss Components')
-    axes[0].legend(fontsize=8)
-    axes[0].grid(True, alpha=0.3)
-    
-    # Plot 2: Rewards
-    axes[1].plot(cpu_training_steps, cpu_avg_rewards, 'purple', linewidth=2)
-    axes[1].set_xlabel('Training Step')
-    axes[1].set_ylabel('Average Reward')
-    axes[1].set_title('Average Reward')
-    axes[1].grid(True, alpha=0.3)
-    if len(cpu_training_steps) > 10:
-        z = np.polyfit(cpu_training_steps, cpu_avg_rewards, 1)
-        p = np.poly1d(z)
-        axes[1].plot(cpu_training_steps, p(cpu_training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
-        axes[1].legend(fontsize=8)
-    
-    # Plot 3: Log Probabilities (Per Token)
-    axes[2].plot(cpu_training_steps, cpu_adapter_log_probs, 'darkgreen', label='Adapter Model', linewidth=2)
-    axes[2].plot(cpu_training_steps, cpu_baseline_log_probs, 'orange', label='Baseline Model', linewidth=2)
-    axes[2].plot(cpu_training_steps, cpu_base_log_probs, 'blue', label='Base Model', linewidth=2)
-    axes[2].set_xlabel('Training Step')
-    axes[2].set_ylabel('Avg Log Prob (per token)')
-    axes[2].set_title('Model Log Probabilities')
-    axes[2].legend(fontsize=8)
-    axes[2].grid(True, alpha=0.3)
-    
-    # Plot 4: Advantages
-    axes[3].plot(cpu_training_steps, cpu_avg_advantages, 'brown', linewidth=2, label='Avg Advantage')
-    axes[3].axhline(y=0, color='gray', linestyle='-', alpha=0.5)
-    axes[3].set_xlabel('Training Step')
-    axes[3].set_ylabel('Average Advantage')
-    axes[3].set_title('Advantage Statistics')
-    axes[3].legend(fontsize=8)
-    axes[3].grid(True, alpha=0.3)
-    # Add trend line for advantages if enough data
-    if len(cpu_training_steps) > 10:
-        z = np.polyfit(cpu_training_steps, cpu_avg_advantages, 1)
-        p = np.poly1d(z)
-        axes[3].plot(cpu_training_steps, p(cpu_training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
-        axes[3].legend(fontsize=8)
-    
-    # Plot 5: Trajectory-Level Log Probabilities
-    axes[4].plot(cpu_training_steps, cpu_trajectory_log_probs, 'darkblue', linewidth=2)
-    axes[4].set_xlabel('Training Step')
-    axes[4].set_ylabel('Trajectory Log Prob')
-    axes[4].set_title('Trajectory-Level Log Probabilities')
-    axes[4].grid(True, alpha=0.3)
-    if len(cpu_training_steps) > 10:
-        z = np.polyfit(cpu_training_steps, cpu_trajectory_log_probs, 1)
-        p = np.poly1d(z)
-        axes[4].plot(cpu_training_steps, p(cpu_training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
-        axes[4].legend(fontsize=8)
-    
-    # Plot 6: Gradient Norm
-    axes[5].plot(cpu_training_steps, cpu_gradient_magnitudes, 'red', linewidth=2)
-    axes[5].set_xlabel('Training Step')
-    axes[5].set_ylabel('Gradient Norm')
-    axes[5].set_title('Gradient Norm Over Time')
-    axes[5].grid(True, alpha=0.3)
-    axes[5].set_yscale('log')  # Log scale for gradient norms
-    
-    # Plot 7: Wikipedia Order Consistency
-    axes[6].plot(cpu_training_steps, cpu_wikipedia_order_consistency, 'teal', linewidth=2)
-    axes[6].axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='Random (0.5)')
-    axes[6].axhline(y=1.0, color='green', linestyle='--', alpha=0.3, label='Perfect Order (1.0)')
-    axes[6].axhline(y=0.0, color='red', linestyle='--', alpha=0.3, label='Reverse Order (0.0)')
-    axes[6].set_xlabel('Training Step')
-    axes[6].set_ylabel('Order Consistency')
-    axes[6].set_title('Wikipedia Key Selection Order')
-    axes[6].set_ylim(-0.1, 1.1)
-    axes[6].legend(fontsize=7)
-    axes[6].grid(True, alpha=0.3)
-    
-    # Plot 8: Policy Gradients
-    axes[7].plot(cpu_training_steps, cpu_policy_gradients, 'darkgreen', linewidth=2)
-    axes[7].axhline(y=0, color='gray', linestyle='-', alpha=0.5)
-    axes[7].set_xlabel('Training Step')
-    axes[7].set_ylabel('Policy Gradient')
-    axes[7].set_title('Policy Gradient (positive = reinforce)')
-    axes[7].grid(True, alpha=0.3)
-    if len(cpu_policy_gradients) > 10:
-        mean_grad = np.mean(cpu_policy_gradients)
-        axes[7].text(0.02, 0.98, f'Mean: {mean_grad:.4f}', transform=axes[7].transAxes, 
-                    verticalalignment='top', fontsize=8, bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
-    
-    # Plot 9: KL Divergence FROM REF MODEL (not from old model)
-    axes[8].plot(cpu_training_steps, cpu_kl_from_ref, 'darkred', linewidth=2)
-    axes[8].set_xlabel('Training Step')
-    axes[8].set_ylabel('KL Divergence')
-    axes[8].set_title('KL Divergence from Reference Model (π_ref)')
-    axes[8].grid(True, alpha=0.3)
-    if len(cpu_kl_from_ref) > 0:
-        mean_kl = np.mean(cpu_kl_from_ref)
-        axes[8].axhline(y=mean_kl, color='gray', linestyle='--', alpha=0.5, label=f'Mean: {mean_kl:.4f}')
-        axes[8].legend(fontsize=8)
-    
-    # Plot 10: Reward Variance
-    axes[9].plot(cpu_training_steps, cpu_reward_variance, 'magenta', linewidth=2)
-    axes[9].set_xlabel('Training Step')
-    axes[9].set_ylabel('Reward Variance')
-    axes[9].set_title('Reward Variance Within Trajectory')
-    axes[9].grid(True, alpha=0.3)
-    
-    # Plot 11: Step-Indexed Log Probabilities (by training thirds)
-    if len(step_log_probs) > 0 and len(step_log_probs[0]) > 0:
-        # Compute average log probability at each step index across different training periods
-        from src.config import NUM_KV_PAIRS
-        step_indices = list(range(NUM_KV_PAIRS))
-        
-        # Divide episodes into thirds
-        total_episodes = min_length
-        first_third_end = total_episodes // 3
-        second_third_end = 2 * total_episodes // 3
-        
-        # Compute averages for each third
-        def compute_avg_for_period(start_idx, end_idx, period_name):
-            avg_log_probs_by_step = []
-            for step_idx in step_indices:
-                step_log_probs_period = []
-                for episode_idx in range(start_idx, min(end_idx, len(step_log_probs))):
-                    episode_log_probs = step_log_probs[episode_idx]
-                    if step_idx < len(episode_log_probs):
-                        step_log_probs_period.append(episode_log_probs[step_idx])
-                
-                if step_log_probs_period:
-                    avg_log_prob = sum(step_log_probs_period) / len(step_log_probs_period)
-                    avg_log_probs_by_step.append(avg_log_prob)
-                else:
-                    avg_log_probs_by_step.append(0.0)
-            return avg_log_probs_by_step
-        
-        # Compute averages for each third of training
-        if total_episodes >= 9:  # Only show thirds if we have at least 9 episodes
-            first_third = compute_avg_for_period(0, first_third_end, "Early")
-            second_third = compute_avg_for_period(first_third_end, second_third_end, "Mid")
-            third_third = compute_avg_for_period(second_third_end, total_episodes, "Late")
-            
-            # Plot all three periods
-            axes[10].plot(step_indices, first_third, 'lightcoral', linewidth=2, marker='o', markersize=3, label=f'Early (eps 0-{first_third_end})', alpha=0.8)
-            axes[10].plot(step_indices, second_third, 'gold', linewidth=2, marker='s', markersize=3, label=f'Mid (eps {first_third_end}-{second_third_end})', alpha=0.8)
-            axes[10].plot(step_indices, third_third, 'mediumseagreen', linewidth=2, marker='^', markersize=3, label=f'Late (eps {second_third_end}+)', alpha=0.8)
-            axes[10].legend(fontsize=7)
-        else:
-            # Fall back to overall average if not enough episodes
-            overall_avg = compute_avg_for_period(0, total_episodes, "Overall")
-            axes[10].plot(step_indices, overall_avg, 'darkviolet', linewidth=2, marker='o', markersize=4, label='Overall Average')
-            axes[10].legend(fontsize=8)
-        
-        axes[10].set_xlabel('Step Index')
-        axes[10].set_ylabel('Avg Log Prob of Selected Action')
-        axes[10].set_title('Log Prob by Step Index (training progression)')
-        axes[10].grid(True, alpha=0.3)
-        axes[10].set_xticks(step_indices)
-    else:
-        axes[10].text(0.5, 0.5, 'No step log prob data\navailable yet', ha='center', va='center', 
-                     transform=axes[10].transAxes, fontsize=10)
-        axes[10].set_title('Log Prob by Step Index')
-    
-    # Plot 12: PPO Clipping Ratio
-    axes[11].plot(cpu_training_steps, cpu_clipping_ratios, 'navy', linewidth=2)
-    # Add reference lines for clipping bounds
-    axes[11].axhline(y=1.0 - 0.2, color='red', linestyle='--', alpha=0.5, label='Lower clip (0.8)')
-    axes[11].axhline(y=1.0 + 0.2, color='red', linestyle='--', alpha=0.5, label='Upper clip (1.2)')
-    axes[11].axhline(y=1.0, color='gray', linestyle='-', alpha=0.3, label='No change (1.0)')
-    axes[11].set_xlabel('Training Step')
-    axes[11].set_ylabel('Average Clipping Ratio')
-    axes[11].set_title('PPO Clipping Ratio (π_θ / π_old)')
-    axes[11].legend(fontsize=7)
-    axes[11].grid(True, alpha=0.3)
-    axes[11].set_ylim(0.5, 1.5)  # Focus on the relevant range
-    
-    # Adjust layout to prevent overlap
-    plt.tight_layout(pad=2.0)
-    
-    # Save the comprehensive plot
-    plt.savefig(f"{plots_dir}/training_metrics.png", dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    # Create additional detailed loss breakdown plot if we have enough data
-    if len(cpu_training_steps) > 20:
-        plt.figure(figsize=(12, 6))
-        plt.stackplot(cpu_training_steps, 
-                     cpu_policy_losses, 
-                     cpu_kl_penalty_terms,
-                     labels=['Policy Loss', 'KL Penalty'],
-                     colors=['green', 'red'],
-                     alpha=0.7)
-        plt.plot(cpu_training_steps, cpu_total_losses, 'b-', label='Total Loss', linewidth=2)
-        plt.xlabel('Training Step')
-        plt.ylabel('Loss')
-        plt.title('Loss Composition Over Time')
-        plt.legend(loc='upper right')
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(f"{plots_dir}/loss_breakdown.png", dpi=150)
-        plt.close()
-    
-    # Log to wandb if enabled
-    if ENABLE_WANDB:
-        wandb_images = {
-            "comprehensive_training_metrics": wandb.Image(f"{plots_dir}/training_metrics.png")
-        }
-        if os.path.exists(f"{plots_dir}/loss_breakdown.png"):
-            wandb_images["loss_breakdown_plot"] = wandb.Image(f"{plots_dir}/loss_breakdown.png")
-        wandb.log(wandb_images)
+        # Log any output from the script
+        if result.stdout:
+            for line in result.stdout.strip().split('\n'):
+                if line:
+                    logging.info(f"generate_plots.py: {line}")
+                    
+        if result.stderr:
+            for line in result.stderr.strip().split('\n'):
+                if line:
+                    logging.warning(f"generate_plots.py stderr: {line}")
+                    
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Failed to run generate_plots.py: {e}")
+        if e.stdout:
+            logging.error(f"stdout: {e.stdout}")
+        if e.stderr:
+            logging.error(f"stderr: {e.stderr}")
+    except Exception as e:
+        logging.error(f"Unexpected error running generate_plots.py: {e}")
 
 
 if __name__ == "__main__":

@@ -10,8 +10,10 @@ import argparse
 import pickle
 import os
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend (same as main training)
 import matplotlib.pyplot as plt
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 
 def load_plot_data(filename: str) -> Dict[str, Any]:
@@ -21,7 +23,7 @@ def load_plot_data(filename: str) -> Dict[str, Any]:
     return data
 
 
-def generate_plots(data: Dict[str, Any], output_dir: str = None, custom_config: Dict = None):
+def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custom_config: Optional[Dict[str, Any]] = None):
     """
     Generate all plots from the saved data.
     
@@ -292,7 +294,7 @@ def main():
     parser = argparse.ArgumentParser(description='Generate plots from saved training data')
     parser.add_argument('data_file', help='Path to the pickle file containing plot data')
     parser.add_argument('--output-dir', '-o', default=None,
-                       help='Directory to save plots (default: current directory)')
+                       help='Directory to save plots (default: same directory as input file)')
     parser.add_argument('--kl-coef', type=float, default=None,
                        help='Override KL penalty coefficient for labels')
     
@@ -307,6 +309,10 @@ def main():
     print(f"Data from episode: {metadata.get('episode', 'unknown')}")
     print(f"Timestamp: {metadata.get('timestamp', 'unknown')}")
     print(f"Number of training steps: {len(data.get('training_steps', []))}")
+    
+    # If no output directory specified, use the directory of the input file
+    if args.output_dir is None:
+        args.output_dir = os.path.dirname(os.path.abspath(args.data_file))
     
     # Prepare custom config if needed
     custom_config = {}

@@ -5,7 +5,7 @@ Contains data structures and utilities for loading, processing, and batching dat
 """
 
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Tuple, Union
+from typing import Dict, Iterator, List, Tuple, Union, Optional
 import json
 import os
 import random
@@ -54,15 +54,15 @@ class QKVStep:
     key_embedding: torch.Tensor  # Shape: [batch_size, embedding_dim]
     key_text: List[str]  # For logging and debugging
     value_text: List[str]  # For logging and debugging
-    query_text: List[str] = None  # Optional query text that selected this pair
-    query_tokens: torch.Tensor = None  # Optional tokenized query
-    query_embedding: torch.Tensor = None  # Optional query embedding
-    query_log_probs: torch.Tensor = None  # Optional log probabilities for vector queries [batch_size]
-    query_mean: torch.Tensor = None  # Optional mean vector for stochastic queries [batch_size, query_dim]
-    similarity_scores: torch.Tensor = None  # Optional similarity scores [batch_size, num_keys]
-    selected_idx: int = None  # Optional selected key index
-    available_key_embeddings: torch.Tensor = None  # Optional embeddings for all available keys [batch_size, num_keys, embedding_dim]
 
+    query_text: Optional[List[str]] = None  # Optional query text that selected this pair
+    query_tokens: Optional[torch.Tensor] = None  # Optional tokenized query
+    query_embedding: Optional[torch.Tensor] = None  # Optional query embedding
+    query_log_probs: Optional[torch.Tensor] = None  # Optional log probabilities for vector queries [batch_size]
+    query_mean: Optional[torch.Tensor] = None  # Optional mean vector for stochastic queries [batch_size, query_dim]
+    similarity_scores: Optional[torch.Tensor] = None  # Optional similarity scores [batch_size, num_keys]
+    selected_idx: Optional[int] = None  # Optional selected key index
+    available_key_embeddings: Optional[torch.Tensor] = None  # Optional embeddings for all available keys [batch_size, num_keys, embedding_dim]
     def __post_init__(self):
         """Validate tensor shapes and types."""
         batch_size = self.key_tokens.shape[0]
@@ -669,7 +669,7 @@ def iter_key_value_pairs_with_tokenizer(
 
 def iter_twenty_questions_pairs_with_tokenizer(
     batch_size: int = 1, 
-    tokenizer: PreTrainedTokenizer = None, 
+    tokenizer: Optional[PreTrainedTokenizer] = None, 
     embedding_fn=None
 ) -> Iterator[QKVStep]:
     """
