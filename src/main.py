@@ -861,20 +861,24 @@ def main():
                 # NO need to recreate kv_pair_generator; embeddings will be recomputed on-the-fly
                 logging.info("Old_model updated; KV generator preserved to avoid data repetition")
             
-            # Periodically verify weight changes (every 5 episodes)
+            # Periodically verify weight changes (every 5 episodes) – check LoRA params correctly
             if (episode + 1) % 5 == 0:
-                # Check that adapter model weights are changing
-                adapter_weights_changed = False
+                # Build initial snapshot of LoRA params if not already
+                if 'initial_lora_weights' not in locals():
+                    initial_lora_weights = {name: p.data.clone() for name, p in adapter_model.named_parameters() if 'lora' in name}
+
+                # Check any LoRA param diverged from initial snapshot
+                any_changed = False
                 for name, param in adapter_model.named_parameters():
-                    if 'lora' in name and name in initial_base_weights:
-                        if not torch.allclose(initial_base_weights[name], param.data):
-                            adapter_weights_changed = True
+                    if 'lora' in name and name in initial_lora_weights:
+                        if not torch.allclose(initial_lora_weights[name], param.data):
+                            any_changed = True
                             break
-                
-                if adapter_weights_changed:
-                    logging.info("Adapter model weights verification: CHANGED (correct)")
+
+                if any_changed:
+                    logging.info("Adapter LoRA weights are changing as expected ✅")
                 else:
-                    logging.warning("Adapter model weights are NOT changing! This may indicate a training issue.")
+                    logging.warning("Adapter LoRA weights have not changed – investigate optimizer/grad flow ⚠️")
             
             # Save checkpoint if needed
             if episode > 0 and episode % CHECKPOINT_INTERVAL == 0:
@@ -911,8 +915,8 @@ def main():
                     step_log_probs_episode.append(selected_log_prob)
             step_log_probs.append(step_log_probs_episode)
             
-            # Save and plot metrics more frequently (every 25 episodes) for better monitoring
-            if episode > 0 and episode % 25 == 0:
+            # Save and plot metrics more frequently (every 15 episodes) for better monitoring
+            if episode > 0 and episode % 15 == 0:
                 save_plot_data(log_dir, episode, policy_gradients)
                 plot_metrics(log_dir, policy_gradients)
             
