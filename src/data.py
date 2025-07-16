@@ -25,88 +25,133 @@ from src.config import (
     QUERY_VEC_TOKEN,
     USE_STANDARD_QUERY_TOKEN,
     KEY_EMBEDDING_BATCH_SIZE,
+    KEY_PREFIX,
 )
 
 
-@dataclass
-class QKVStep:
+@dataclass(frozen=True)
+class KVPair:
     """
-    Dataclass for a complete query-key-value step in the trajectory.
-
+    Immutable representation of key-value data before any query processing or selection.
+    
+    This represents the raw, initial state of a key-value pair extracted from data.
+    All fields are required and the object is immutable after creation.
+    
     Attributes:
         key_tokens: Tokenized keys [batch_size, TOKENS_PER_KEY]
         value_tokens: Tokenized values [batch_size, TOKENS_PER_VALUE]
         key_embedding: Precomputed embeddings for keys [batch_size, embedding_dim]
         key_text: Original text of keys (for logging/debugging)
         value_text: Original text of values (for logging/debugging)
-        query_text: Optional query text that led to selecting this key-value pair
-        query_tokens: Optional tokenized query that led to selecting this pair
-        query_embedding: Optional embeddings for the query [batch_size, embedding_dim]
-        query_log_probs: Optional log probabilities for stochastic vector queries [batch_size]
-        query_mean: Optional mean vector for stochastic queries [batch_size, query_dim]
-        similarity_scores: Optional similarity scores between query and all keys [batch_size, num_keys]
-        selected_idx: Optional index of the selected key
-        available_key_embeddings: Optional embeddings for all available keys [batch_size, num_keys, embedding_dim]
     """
-
     key_tokens: torch.Tensor  # Shape: [batch_size, TOKENS_PER_KEY]
     value_tokens: torch.Tensor  # Shape: [batch_size, TOKENS_PER_VALUE]
     key_embedding: torch.Tensor  # Shape: [batch_size, embedding_dim]
     key_text: List[str]  # For logging and debugging
     value_text: List[str]  # For logging and debugging
 
-    query_text: Optional[List[str]] = None  # Optional query text that selected this pair
-    query_tokens: Optional[torch.Tensor] = None  # Optional tokenized query
-    query_embedding: Optional[torch.Tensor] = None  # Optional query embedding
-    query_log_probs: Optional[torch.Tensor] = None  # Optional log probabilities for vector queries [batch_size]
-    query_mean: Optional[torch.Tensor] = None  # Optional mean vector for stochastic queries [batch_size, query_dim]
-    similarity_scores: Optional[torch.Tensor] = None  # Optional similarity scores [batch_size, num_keys]
-    selected_idx: Optional[int] = None  # Optional selected key index
-    available_key_embeddings: Optional[torch.Tensor] = None  # Optional embeddings for all available keys [batch_size, num_keys, embedding_dim]
     def __post_init__(self):
         """Validate tensor shapes and types."""
         batch_size = self.key_tokens.shape[0]
 
         assert isinstance(self.key_tokens, torch.Tensor), "key_tokens must be a tensor"
-        assert isinstance(
-            self.value_tokens, torch.Tensor
-        ), "value_tokens must be a tensor"
-        assert isinstance(
-            self.key_embedding, torch.Tensor
-        ), "key_embedding must be a tensor"
+        assert isinstance(self.value_tokens, torch.Tensor), "value_tokens must be a tensor"
+        assert isinstance(self.key_embedding, torch.Tensor), "key_embedding must be a tensor"
         assert isinstance(self.key_text, list), "key_text must be a list"
         assert isinstance(self.value_text, list), "value_text must be a list"
 
-        assert self.key_tokens.shape == (
-            batch_size,
-            TOKENS_PER_KEY,
-        ), f"key_tokens shape should be ({batch_size}, {TOKENS_PER_KEY})"
-        assert self.value_tokens.shape == (
-            batch_size,
-            TOKENS_PER_VALUE,
-        ), f"value_tokens shape should be ({batch_size}, {TOKENS_PER_VALUE})"
-        assert (
-            self.key_embedding.shape[0] == batch_size
-        ), f"key_embedding first dimension should be {batch_size}"
-        assert (
-            len(self.key_text) == batch_size
-        ), f"key_text length should be {batch_size}"
-        assert (
-            len(self.value_text) == batch_size
-        ), f"value_text length should be {batch_size}"
+        assert self.key_tokens.shape == (batch_size, TOKENS_PER_KEY), \
+            f"key_tokens shape should be ({batch_size}, {TOKENS_PER_KEY})"
+        assert self.value_tokens.shape == (batch_size, TOKENS_PER_VALUE), \
+            f"value_tokens shape should be ({batch_size}, {TOKENS_PER_VALUE})"
+        assert self.key_embedding.shape[0] == batch_size, \
+            f"key_embedding first dimension should be {batch_size}"
+        assert len(self.key_text) == batch_size, \
+            f"key_text length should be {batch_size}"
+        assert len(self.value_text) == batch_size, \
+            f"value_text length should be {batch_size}"
+
+
+@dataclass(frozen=True)
+class QKVSelection:
+    """
+    Immutable representation of a complete query-key-value selection.
+    
+    This represents the final state after a query has been generated, similarities computed,
+    and a key-value pair has been selected. All data is immutable after creation.
+    
+    Attributes:
+        data: The selected KVPair that was chosen
+        query_text: Query text that led to selecting this key-value pair
+        query_tokens: Tokenized query that led to selecting this pair
+        query_embedding: Query embeddings [batch_size, embedding_dim]
+        similarity_scores: Similarity scores between query and all available keys [batch_size, num_keys]
+        selected_idx: Index of the selected key in the original pool
+    """
+    # Core selected data
+    data: KVPair
+    
+    # Query information
+    query_text: List[str]
+    query_tokens: torch.Tensor
+    query_embedding: torch.Tensor  # Shape: [batch_size, embedding_dim]
+    
+    # Selection metadata
+    similarity_scores: torch.Tensor  # Shape: [batch_size, num_keys]
+    selected_idx: torch.Tensor  # Index of the selected key in the original pool (or tensor of indices)
+    available_mask: torch.Tensor  # Mask of available keys at selection time [batch_size, num_keys] (0 for available, -inf for masked)
+
+    def __post_init__(self):
+        """Validate tensor shapes and types."""
+        batch_size = self.data.key_tokens.shape[0]
         
-        # Validate query_embedding if present
-        if self.query_embedding is not None:
-            assert isinstance(
-                self.query_embedding, torch.Tensor
-            ), "query_embedding must be a tensor"
-            assert (
-                self.query_embedding.shape[0] == batch_size
-            ), f"query_embedding first dimension should be {batch_size}"
+        # Validate query data
+        assert isinstance(self.query_embedding, torch.Tensor), "query_embedding must be a tensor"
+        assert self.query_embedding.shape[0] == batch_size, \
+            f"query_embedding first dimension should be {batch_size}"
+            
+        # Validate selection metadata
+        assert isinstance(self.similarity_scores, torch.Tensor), "similarity_scores must be a tensor"
+        assert self.similarity_scores.shape[0] == batch_size, \
+            f"similarity_scores first dimension should be {batch_size}"
+            
+        # Validate selected_idx - must be a tensor
+        assert isinstance(self.selected_idx, torch.Tensor), "selected_idx must be a torch.Tensor"
+        assert self.selected_idx.shape == (batch_size,) or self.selected_idx.shape == torch.Size([batch_size]), \
+            f"selected_idx tensor should have shape ({batch_size},), got {self.selected_idx.shape}"
+
+        # Validate available_mask
+        assert isinstance(self.available_mask, torch.Tensor), "available_mask must be a torch.Tensor"
+        assert self.available_mask.shape == self.similarity_scores.shape, \
+            "available_mask must have same shape as similarity_scores"
+
+    # Convenience properties to access the underlying data
+    @property
+    def key_tokens(self) -> torch.Tensor:
+        return self.data.key_tokens
+    
+    @property
+    def value_tokens(self) -> torch.Tensor:
+        return self.data.value_tokens
+    
+    @property
+    def key_embedding(self) -> torch.Tensor:
+        return self.data.key_embedding
+    
+    @property
+    def key_text(self) -> List[str]:
+        return self.data.key_text
+    
+    @property
+    def value_text(self) -> List[str]:
+        return self.data.value_text
 
 
-# Maintain KeyValuePair for backward compatibility
-KeyValuePair = QKVStep
+# Maintain backward compatibility
+QKVStep = QKVSelection  # Alias for existing code
+QKVStepWithSelection = QKVSelection  # Transition alias
+QKVData = KVPair  # Transition alias  
+KeyValuePair = KVPair  # Update the old alias
 
 
 def get_tokenizer() -> PreTrainedTokenizer:
@@ -163,7 +208,7 @@ def format_prompt_with_kv_pairs(pairs: List[Tuple[str, str]]) -> str:
     Returns:
         str: The formatted prompt
     """
-    from src.config import KEY_PREFIX
+    # KEY_PREFIX is already imported at module level; removed redundant import
     prompt = ""
     for key, value in pairs:
         prompt += f"{KEY_PREFIX}{key} {VALUE_PREFIX}{value} "
@@ -215,16 +260,16 @@ def filter_articles_by_length(tokenizer: PreTrainedTokenizer) -> Iterator[Dict]:
 
 def iter_key_value_pairs(
     batch_size: int = 1, embedding_fn=None
-) -> Iterator[QKVStep]:
+) -> Iterator[KVPair]:
     """
-    Create an iterator that yields batches of query-key-value steps.
+    Create an iterator that yields batches of query-key-value data.
 
     Args:
         batch_size: Number of articles to process in each batch
         embedding_fn: Optional function to compute embeddings
 
     Returns:
-        Iterator[QKVStep]: Iterator yielding a batched QKVStep object
+        Iterator[KVPair]: Iterator yielding a batched KVPair object
     """
     tokenizer = get_tokenizer()
 
@@ -320,9 +365,9 @@ def iter_key_value_pairs(
                 for _ in range(NUM_KV_PAIRS)
             ]
 
-        # Yield QKVStep objects one by one
+        # Yield KVPair objects one by one
         for i in range(NUM_KV_PAIRS):
-            yield QKVStep(
+            yield KVPair(
                 key_tokens=all_keys[i],
                 value_tokens=all_values[i],
                 key_embedding=all_key_embeddings[i],
@@ -370,16 +415,16 @@ def iter_twenty_questions() -> Iterator[Dict]:
 
 def iter_twenty_questions_pairs(
     batch_size: int = 1, embedding_fn=None
-) -> Iterator[QKVStep]:
+) -> Iterator[KVPair]:
     """
-    Create an iterator that yields batches of query-key-value steps from the twenty questions dataset.
+    Create an iterator that yields batches of query-key-value data from the twenty questions dataset.
 
     Args:
         batch_size: Number of games to process in each batch
         embedding_fn: Optional function to compute embeddings
 
     Returns:
-        Iterator[QKVStep]: Iterator yielding a batched QKVStep object
+        Iterator[KVPair]: Iterator yielding a batched KVPair object
     """
     tokenizer = get_tokenizer()
     dataset = load_twenty_questions_dataset()
@@ -484,9 +529,9 @@ def iter_twenty_questions_pairs(
                 for _ in range(len(all_key_tokens))
             ]
 
-        # Yield QKVStep objects one by one
+        # Yield KVPair objects one by one
         for i in range(len(all_key_tokens)):
-            yield QKVStep(
+            yield KVPair(
                 key_tokens=all_key_tokens[i],
                 value_tokens=all_value_tokens[i],
                 key_embedding=all_key_embeddings[i],
@@ -499,7 +544,7 @@ def iter_key_value_pairs_unified(
     dataset_name: str = "wikipedia",
     batch_size: int = 1,
     embedding_fn=None
-) -> Iterator[QKVStep]:
+) -> Iterator[KVPair]:
     """
     Unified iterator for different datasets.
 
@@ -509,7 +554,7 @@ def iter_key_value_pairs_unified(
         embedding_fn: Optional function to compute embeddings
 
     Returns:
-        Iterator[QKVStep]: Iterator yielding batched QKVStep objects
+        Iterator[KVPair]: Iterator yielding batched KVPair objects
     """
     if dataset_name == "wikipedia":
         return iter_key_value_pairs(batch_size, embedding_fn)
@@ -524,7 +569,7 @@ def iter_key_value_pairs_unified_with_tokenizer(
     batch_size: int = 1,
     tokenizer: PreTrainedTokenizer = None,
     embedding_fn=None
-) -> Iterator[QKVStep]:
+) -> Iterator[KVPair]:
     """
     Unified iterator for different datasets that accepts a specific tokenizer instance.
 
@@ -535,7 +580,7 @@ def iter_key_value_pairs_unified_with_tokenizer(
         embedding_fn: Optional function to compute embeddings
 
     Returns:
-        Iterator[QKVStep]: Iterator yielding batched QKVStep objects
+        Iterator[KVPair]: Iterator yielding batched KVPair objects
     """
     if dataset_name == "wikipedia":
         return iter_key_value_pairs_with_tokenizer(batch_size, tokenizer, embedding_fn)
@@ -549,9 +594,9 @@ def iter_key_value_pairs_with_tokenizer(
     batch_size: int = 1, 
     tokenizer: PreTrainedTokenizer = None, 
     embedding_fn=None
-) -> Iterator[QKVStep]:
+) -> Iterator[KVPair]:
     """
-    Create an iterator that yields batches of query-key-value steps with a specific tokenizer.
+    Create an iterator that yields batches of query-key-value data with a specific tokenizer.
 
     Args:
         batch_size: Number of articles to process in each batch
@@ -559,7 +604,7 @@ def iter_key_value_pairs_with_tokenizer(
         embedding_fn: Optional function to compute embeddings
 
     Returns:
-        Iterator[QKVStep]: Iterator yielding a batched QKVStep object
+        Iterator[KVPair]: Iterator yielding a batched KVPair object
     """
     if tokenizer is None:
         tokenizer = get_tokenizer()
@@ -656,9 +701,9 @@ def iter_key_value_pairs_with_tokenizer(
                 for _ in range(NUM_KV_PAIRS)
             ]
 
-        # Yield QKVStep objects one by one
+        # Yield KVPair objects one by one
         for i in range(NUM_KV_PAIRS):
-            yield QKVStep(
+            yield KVPair(
                 key_tokens=all_keys[i],
                 value_tokens=all_values[i],
                 key_embedding=all_key_embeddings[i],
@@ -671,9 +716,9 @@ def iter_twenty_questions_pairs_with_tokenizer(
     batch_size: int = 1, 
     tokenizer: Optional[PreTrainedTokenizer] = None, 
     embedding_fn=None
-) -> Iterator[QKVStep]:
+) -> Iterator[KVPair]:
     """
-    Create an iterator that yields batches of query-key-value steps from the twenty questions dataset with a specific tokenizer.
+    Create an iterator that yields batches of query-key-value data from the twenty questions dataset with a specific tokenizer.
 
     Args:
         batch_size: Number of games to process in each batch
@@ -681,7 +726,7 @@ def iter_twenty_questions_pairs_with_tokenizer(
         embedding_fn: Optional function to compute embeddings
 
     Returns:
-        Iterator[QKVStep]: Iterator yielding a batched QKVStep object
+        Iterator[KVPair]: Iterator yielding a batched KVPair object
     """
     if tokenizer is None:
         tokenizer = get_tokenizer()
@@ -788,9 +833,9 @@ def iter_twenty_questions_pairs_with_tokenizer(
                 for _ in range(len(all_key_tokens))
             ]
 
-        # Yield QKVStep objects one by one
+        # Yield KVPair objects one by one
         for i in range(len(all_key_tokens)):
-            yield QKVStep(
+            yield KVPair(
                 key_tokens=all_key_tokens[i],
                 value_tokens=all_value_tokens[i],
                 key_embedding=all_key_embeddings[i],
@@ -824,7 +869,7 @@ def iter_key_value_pairs_unified_with_repeat(
     repeat_count: int = 1,
     tokenizer: PreTrainedTokenizer = None,
     embedding_fn=None
-) -> Iterator[QKVStep]:
+) -> Iterator[KVPair]:
     """
     Unified iterator with optional repetition for GRPO-style batching.
     
@@ -836,7 +881,7 @@ def iter_key_value_pairs_unified_with_repeat(
         embedding_fn: Optional function to compute embeddings
         
     Returns:
-        Iterator[QKVStep]: Iterator yielding batched QKVStep objects
+        Iterator[KVPair]: Iterator yielding batched KVPair objects
     """
     # Get the base iterator
     base_iterator = iter_key_value_pairs_unified_with_tokenizer(
@@ -853,10 +898,10 @@ def iter_key_value_pairs_unified_with_repeat(
         # Now batch the repeated items
         batched_iterator = batch_iterator(repeated_iterator, batch_size)
         
-        # Process batches to create QKVStep objects
+        # Process batches to create KVPair objects
         for batch in batched_iterator:
             if len(batch) == batch_size:
-                # Stack the batch elements into single QKVStep
+                # Stack the batch elements into single KVPair
                 yield stack_qkv_batch(batch)
     else:
         # Use the original iterator with its own batching
@@ -888,15 +933,15 @@ def batch_iterator(stream: Iterator, batch_size: int) -> Iterator[List]:
     # Don't yield incomplete batches
 
 
-def stack_qkv_batch(batch: List[QKVStep]) -> QKVStep:
+def stack_qkv_batch(batch: List[KVPair]) -> KVPair:
     """
-    Stack a list of QKVStep objects into a single batched QKVStep.
+    Stack a list of KVPair objects into a single batched KVPair.
     
     Args:
-        batch: List of QKVStep objects to stack
+        batch: List of KVPair objects to stack
         
     Returns:
-        Single QKVStep with batched tensors
+        Single KVPair with batched tensors
     """
     if not batch:
         raise ValueError("Cannot stack empty batch")
@@ -905,19 +950,19 @@ def stack_qkv_batch(batch: List[QKVStep]) -> QKVStep:
     device = batch[0].key_tokens.device
     
     # Stack all tensor fields
-    key_tokens = torch.stack([step.key_tokens.squeeze(0) for step in batch], dim=0)
-    value_tokens = torch.stack([step.value_tokens.squeeze(0) for step in batch], dim=0)
-    key_embedding = torch.stack([step.key_embedding.squeeze(0) for step in batch], dim=0)
+    key_tokens = torch.stack([item.key_tokens.squeeze(0) for item in batch], dim=0)
+    value_tokens = torch.stack([item.value_tokens.squeeze(0) for item in batch], dim=0)
+    key_embedding = torch.stack([item.key_embedding.squeeze(0) for item in batch], dim=0)
     
     # Combine text fields
     key_text = []
     value_text = []
-    for step in batch:
-        key_text.extend(step.key_text)
-        value_text.extend(step.value_text)
+    for item in batch:
+        key_text.extend(item.key_text)
+        value_text.extend(item.value_text)
     
-    # Create batched QKVStep
-    batched_step = QKVStep(
+    # Create batched KVPair
+    batched_data = KVPair(
         key_tokens=key_tokens,
         value_tokens=value_tokens,
         key_embedding=key_embedding,
@@ -925,19 +970,4 @@ def stack_qkv_batch(batch: List[QKVStep]) -> QKVStep:
         value_text=value_text
     )
     
-    # Handle optional fields
-    if batch[0].query_text is not None:
-        query_text = []
-        for step in batch:
-            query_text.extend(step.query_text)
-        batched_step.query_text = query_text
-    
-    if batch[0].query_tokens is not None:
-        query_tokens = torch.stack([step.query_tokens.squeeze(0) for step in batch], dim=0)
-        batched_step.query_tokens = query_tokens
-    
-    if batch[0].query_embedding is not None:
-        query_embedding = torch.stack([step.query_embedding.squeeze(0) for step in batch], dim=0)
-        batched_step.query_embedding = query_embedding
-    
-    return batched_step
+    return batched_data

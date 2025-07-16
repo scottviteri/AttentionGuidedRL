@@ -10,6 +10,9 @@ import logging
 import argparse
 import torch
 import torch.optim as optim
+import math
+from collections import Counter
+import torch.nn.functional as F
 from tqdm import tqdm
 from datetime import datetime
 from typing import List, Optional, Dict, Callable, Any, Tuple
@@ -41,9 +44,10 @@ from src.config import (
     NUM_KV_PAIRS,
     BASELINE_UPDATE_FREQUENCY,
     SUBTRACT_BASE_MODEL_LOGPROBS,
+    TEMPERATURE,
 )
 from src.model import setup_model_and_tokenizer, save_checkpoint, load_checkpoint, create_model_copy, get_checkpoint_path
-from src.data import iter_key_value_pairs, iter_key_value_pairs_unified, QKVStep, repeat_n_times
+from src.data import iter_key_value_pairs, iter_key_value_pairs_unified, KVPair, QKVSelection, repeat_n_times
 from src.embeddings import register_embedding_hook, extract_embeddings, compute_similarity, sample_key_value
 from src.training import (
     Trajectory,
@@ -82,6 +86,8 @@ gradient_magnitudes = []  # Gradient magnitudes over time
 step_log_probs = []  # Log probabilities by step index (list of lists)
 clipping_ratios = []  # PPO clipping ratios
 kl_from_ref = []  # KL divergence from reference model (pi_ref)
+batch_selection_entropy = []  # Entropy of key selection orders within each batch
+trajectory_samples = []  # Sample trajectories for detailed analysis
 
 def setup_logging(args):
     """
@@ -148,7 +154,7 @@ def generate_trajectory(
     tokenizer: Any,
     embeddings_dict: Dict,
     hook_remover: Callable,
-    available_qkv_steps: List[QKVStep],
+    available_qkv_steps: List[KVPair],
     batch_size: int,
     verbose: bool = False,
 ) -> Trajectory:
@@ -185,10 +191,15 @@ def generate_trajectory(
     # Initialize selected steps list
     selected_steps = []
     
+    # Initialize per-batch available indices (to handle independent removals)
+    # Each batch item starts with the full set of indices
+    num_keys = len(available_qkv_steps)
+    available_indices_per_batch = [list(range(num_keys)) for _ in range(batch_size)]
+    
     # Save all key embeddings at the beginning to store at trajectory level
     all_initial_key_embeddings = []
-    for qkv_step in available_qkv_steps:
-        key_emb = qkv_step.key_embedding.to(device)
+    for qkv_data in available_qkv_steps:
+        key_emb = qkv_data.key_embedding.to(device)
         all_initial_key_embeddings.append(key_emb)
     trajectory_key_embeddings = torch.stack(all_initial_key_embeddings, dim=1)  # [batch_size, num_keys, embedding_dim]
     
@@ -208,9 +219,9 @@ def generate_trajectory(
         
         # Use pre-computed key embeddings from available steps
         key_embs = []
-        for qkv_step in available_qkv_steps:
+        for qkv_data in available_qkv_steps:
             # Use the pre-computed embedding, just move to device
-            key_emb = qkv_step.key_embedding.to(device)
+            key_emb = qkv_data.key_embedding.to(device)
             # If key_emb has batch size 1 but we need batch_size, broadcast it
             if key_emb.shape[0] == 1 and batch_size > 1:
                 key_emb = key_emb.expand(batch_size, -1)  # Broadcast to [batch_size, hidden_size]
@@ -223,67 +234,87 @@ def generate_trajectory(
         similarity_scores = compute_similarity(query_embeddings, key_embeddings, adapter_model)
                    
         # Sample next step
-        available_indices = list(range(len(available_qkv_steps)))
+        # Pass available_indices_per_batch to sample_key_value
         sampled_indices, _ = sample_key_value(
             similarity_scores, 
-            [available_indices] * batch_size,
+            available_indices_per_batch,
             batch_size
         )
         
-        # For simplicity, use the first batch item's choice
-        selected_idx = sampled_indices[0]
-        selected_step = available_qkv_steps[selected_idx]
-        
-        # Create a copy of the selected step with tensors on the correct device
-        # and broadcast to correct batch size if needed
-        key_tokens = selected_step.key_tokens.to(device)
-        value_tokens = selected_step.value_tokens.to(device)
-        key_embedding = selected_step.key_embedding.to(device)
-        key_text = selected_step.key_text
-        value_text = selected_step.value_text
-        
-        # If tokens have batch size 1 but we need batch_size, broadcast them
-        if key_tokens.shape[0] == 1 and batch_size > 1:
-            key_tokens = key_tokens.expand(batch_size, -1)
-        if value_tokens.shape[0] == 1 and batch_size > 1:
-            value_tokens = value_tokens.expand(batch_size, -1)
-        if key_embedding.shape[0] == 1 and batch_size > 1:
-            key_embedding = key_embedding.expand(batch_size, -1)
-        
-        # If text lists have length 1 but we need batch_size, replicate them
-        if len(key_text) == 1 and batch_size > 1:
-            key_text = key_text * batch_size
-        if len(value_text) == 1 and batch_size > 1:
-            value_text = value_text * batch_size
+        # Use the full sampled_indices (one per batch item) instead of just the first
+        selected_indices = sampled_indices  # List or tensor of shape [batch_size]
+
+        # Since available_qkv_steps is a list of KVPair (each with shape [1, ...] in GRPO mode),
+        # we need to select different KV for each batch item, potentially allowing duplicates
+        # if sampling the same index (to explore different orders)
+
+        # To handle batch-wise selection without modifying the shared list,
+        # we'll gather the selected data for each batch item independently
+        selected_key_tokens = []
+        selected_value_tokens = []
+        selected_key_embeddings = []
+        selected_key_texts = []
+        selected_value_texts = []
+
+        for b in range(batch_size):
+            sel_idx = selected_indices[b]
+            selected_data = available_qkv_steps[sel_idx]
             
-        device_selected_step = QKVStep(
-            key_tokens=key_tokens,
-            value_tokens=value_tokens,
-            key_embedding=key_embedding,
-            key_text=key_text,
-            value_text=value_text
+            # Extract for this batch item (since data might be [1, ...], squeeze and unsqueeze)
+            selected_key_tokens.append(selected_data.key_tokens[0])  # Shape [seq_len]
+            selected_value_tokens.append(selected_data.value_tokens[0])
+            selected_key_embeddings.append(selected_data.key_embedding[0])
+            selected_key_texts.append(selected_data.key_text[0])
+            selected_value_texts.append(selected_data.value_text[0])
+
+        # Stack back to batched tensors
+        selected_key_tokens = torch.stack(selected_key_tokens, dim=0)  # [batch_size, seq_len]
+        selected_value_tokens = torch.stack(selected_value_tokens, dim=0)
+        selected_key_embedding = torch.stack(selected_key_embeddings, dim=0)
+        selected_key_text = selected_key_texts
+        selected_value_text = selected_value_texts
+
+        # Note: To allow exploration of different orders, we DON'T remove from available_qkv_steps
+        # This permits duplicate selections if sampled, which is fine for order exploration
+        # If you want to prevent duplicates per trajectory, we'd need per-batch available masks
+
+        # Create the batched KVPair
+        step_data = KVPair(
+            key_tokens=selected_key_tokens,
+            value_tokens=selected_value_tokens,
+            key_embedding=selected_key_embedding,
+            key_text=selected_key_text,
+            value_text=selected_value_text
+        )
+
+        # Create QKVSelection with batched selected_idx
+        # Store the available indices mask for proper policy gradient computation
+        available_mask = torch.full((batch_size, num_keys), float('-inf'), device=device)
+        for b in range(batch_size):
+            available_mask[b, available_indices_per_batch[b]] = 0.0
+        
+        completed_step = QKVSelection(
+            data=step_data,
+            query_text=query_text,
+            query_tokens=query_tokens,
+            query_embedding=query_embeddings,
+            similarity_scores=similarity_scores,
+            selected_idx=torch.tensor(selected_indices),  # Now a tensor [batch_size]
+            available_mask=available_mask  # Store mask for policy gradient computation
         )
         
-        # Store query text, tokens and embedding with the selected step for later display
-        device_selected_step.query_text = query_text
-        device_selected_step.query_tokens = query_tokens
-        device_selected_step.query_embedding = query_embeddings
-        
-        # Store the softmax probabilities for policy gradient
-        # We'll compute log probabilities from the softmax distribution
-        device_selected_step.similarity_scores = similarity_scores
-        device_selected_step.selected_idx = selected_idx
-        
-        # IMPORTANT: Store the current available key embeddings at this step
-        # This fixes the KL divergence dimension mismatch issue
-        # Use setattr to avoid linter issues with dynamic attributes
-        setattr(device_selected_step, 'available_key_embeddings', key_embeddings)
-        
         # Add selected step to the list
-        selected_steps.append(device_selected_step)
+        selected_steps.append(completed_step)
         
-        # Remove the selected step from available steps
-        available_qkv_steps.pop(selected_idx)
+        # Remove the selected index from each batch item's available indices
+        for b in range(batch_size):
+            sel_idx = selected_indices[b]
+            if sel_idx in available_indices_per_batch[b]:
+                available_indices_per_batch[b].remove(sel_idx)  # Remove to prevent duplicates
+            else:
+                # This shouldn't happen, but log a warning if it does
+                if verbose:
+                    print(f"Warning: Batch {b} tried to select index {sel_idx} which was already removed")
         
         # Update context for next iteration
         # For vector queries, we don't add query tokens to context
@@ -294,9 +325,9 @@ def generate_trajectory(
         current_context = torch.cat([
             current_context,
             key_prefix_tokens, 
-            device_selected_step.key_tokens,
+            completed_step.key_tokens,
             value_prefix_tokens,
-            device_selected_step.value_tokens
+            completed_step.value_tokens
         ], dim=1)
         
         # Update context text
@@ -320,7 +351,7 @@ def generate_trajectory(
 
 def parse_args():
     """Parse command-line arguments."""
-    from src.config import TRAINING_BATCH_SIZE
+    # TRAINING_BATCH_SIZE already imported at module level – redundant
     
     parser = argparse.ArgumentParser(description="Train a model using Attention-Guided RL")
     parser.add_argument("--batch-size", type=int, default=TRAINING_BATCH_SIZE, help="Batch size for training")
@@ -335,8 +366,17 @@ def parse_args():
                         help="Dataset to use for training")
     parser.add_argument("--grpo-batching", action="store_true", default=True,
                         help="Use GRPO-style batching (repeat each data point) (default: True)")
-    parser.add_argument("--no-grpo-batching", dest="grpo_batching", action="store_false",
-                        help="Disable GRPO-style batching")
+    parser.add_argument("--model-type", type=str, default='gpt2', choices=['gpt2', 'llama'], help='Model type to use')
+    parser.add_argument('--use-grpo-baseline', action='store_true', default=True, help='Use GRPO baseline in advantages')
+    
+    # Add new CLI flags for previously env-var configs
+    parser.add_argument('--key-embedding-batch-size', type=int, default=4, help='Number of keys to process together in forward pass')
+    parser.add_argument('--kl-penalty-coef', type=float, default=0.1, help='KL penalty coefficient for regularization')
+    parser.add_argument('--enable-wandb', action='store_true', default=False, help='Enable Weights & Biases logging')
+    parser.add_argument('--ppo-clip-epsilon', type=float, default=0.2, help='PPO clipping parameter (epsilon)')
+    parser.add_argument('--baseline-update-freq', type=int, default=10, help='How often to update baseline model (episodes)')
+    parser.add_argument('--subtract-base-logprobs', action='store_true', default=False, help='Subtract base model logprobs in reward computation')
+    
     return parser.parse_args()
 
 
@@ -354,32 +394,20 @@ def compute_wikipedia_order_consistency(trajectory) -> float:
     Returns:
         float: Order consistency score between 0.0 and 1.0
     """
-    if not trajectory.qkv_steps or len(trajectory.qkv_steps) < 2:
-        return 0.5  # Neutral if not enough steps
+    # import torch  # redundant (already at module level)
+    if not trajectory.qkv_steps:
+        raise ValueError("Trajectory must contain qkv_steps")
+
+    first_step = trajectory.qkv_steps[0]
+    if not isinstance(first_step.selected_idx, torch.Tensor):
+        raise TypeError("selected_idx must be a torch.Tensor")
+    if first_step.selected_idx.numel() == 0:
+        raise ValueError("selected_idx tensor is empty")
     
-    # Get the sequence of selected indices
-    selected_indices = []
-    for step in trajectory.qkv_steps:
-        if hasattr(step, 'selected_idx') and step.selected_idx is not None:
-            selected_indices.append(step.selected_idx)
-    
-    if len(selected_indices) < 2:
-        return 0.5  # Need at least 2 selections to measure consistency
-    
-    # Convert to list if needed and ensure we have integers
-    if isinstance(selected_indices[0], torch.Tensor):
-        selected_indices = [idx.item() if hasattr(idx, 'item') else int(idx) for idx in selected_indices]
-    
-    # Since keys are removed after selection, we need to reconstruct the original indices
-    # If we selected indices [2, 1, 0] from pools of size [5, 4, 3], the original indices were [2, 2, 2]
-    # But we want to track the relative order within the original set
-    
-    # For edit distance, we'll use the indices as selected (accounting for pool shrinkage)
-    # and compare against the sequential order [0, 1, 2, ..., n-1]
-    n = len(selected_indices)
-    perfect_sequence = list(range(n))
-    
-    # Compute edit distance (Levenshtein distance)
+    batch_size = trajectory.qkv_steps[0].selected_idx.shape[0]
+    all_batch_consistency_scores = []
+
+    # Define the edit_distance function locally for clarity
     def edit_distance(seq1, seq2):
         """Compute edit distance between two sequences."""
         m, n = len(seq1), len(seq2)
@@ -404,20 +432,98 @@ def compute_wikipedia_order_consistency(trajectory) -> float:
                     )
         
         return dp[m][n]
+
+    for b in range(batch_size):
+        selected_indices_for_batch_item = []
+        for step in trajectory.qkv_steps:
+            if hasattr(step, 'selected_idx') and isinstance(step.selected_idx, torch.Tensor):
+                selected_indices_for_batch_item.append(step.selected_idx[b].item())
+        
+        if len(selected_indices_for_batch_item) < 2:
+            all_batch_consistency_scores.append(0.5) # Neutral if not enough steps for this batch item
+            continue
+        
+        n = len(selected_indices_for_batch_item)
+        perfect_sequence = list(range(n))
+        
+        # Compute edit distance from perfect sequence
+        distance = edit_distance(selected_indices_for_batch_item, perfect_sequence)
+        
+        # Normalize: maximum possible edit distance is n (for complete reversal or large differences)
+        max_distance = n
+        
+        if max_distance == 0:
+            consistency_score = 1.0  # Edge case: single element
+        else:
+            consistency_score = 1.0 - (distance / max_distance)
+        
+        all_batch_consistency_scores.append(max(0.0, min(1.0, consistency_score)))  # Clamp to [0, 1]
+
+    return sum(all_batch_consistency_scores) / len(all_batch_consistency_scores) if all_batch_consistency_scores else 0.5
+
+
+def compute_batch_selection_entropy(trajectory) -> float:
+    """
+    Compute the entropy of key selection orders within a batch.
     
-    # Compute edit distance from perfect sequence
-    distance = edit_distance(selected_indices, perfect_sequence)
+    High entropy indicates diverse selection patterns across batch items.
+    Low entropy indicates similar/identical selection patterns.
     
-    # Normalize: maximum possible edit distance is min(n, max_val) where max_val is the largest index
-    # For our case, worst case is when sequence is completely reversed
-    max_distance = n  # At most n replacements needed
+    Args:
+        trajectory: The trajectory containing selected key indices for all batch items
+        
+    Returns:
+        float: Shannon entropy of the selection order distribution
+    """
+    # Redundant local imports removed – all symbols available at module level
+    # import math
+    # from collections import Counter
+    # import torch
+
+    if not trajectory.qkv_steps:
+        raise ValueError("Trajectory must contain qkv_steps")
+
+    if not isinstance(trajectory.qkv_steps[0].selected_idx, torch.Tensor):
+        raise TypeError("selected_idx must be a torch.Tensor")
+
+    if trajectory.qkv_steps[0].selected_idx.numel() == 0:
+        raise ValueError("selected_idx tensor is empty")
+
+    batch_size = trajectory.qkv_steps[0].selected_idx.shape[0]
+
+    if batch_size <= 1:
+        return 0.0
     
-    # Convert to consistency score: 1.0 = perfect (distance 0), 0.0 = worst (max distance)
-    if max_distance == 0:
-        return 1.0  # Edge case: single element
+    all_batch_sequences = [] # List of tuples, each inner tuple is a sequence for one batch item
     
-    consistency_score = 1.0 - (distance / max_distance)
-    return max(0.0, min(1.0, consistency_score))  # Clamp to [0, 1]
+    # For each batch item, build its selection sequence of scalar indices
+    for b in range(batch_size):
+        sequence = []
+        for step in trajectory.qkv_steps:
+            if hasattr(step, 'selected_idx') and isinstance(step.selected_idx, torch.Tensor):
+                sequence.append(step.selected_idx[b].item())
+        all_batch_sequences.append(tuple(sequence)) # Convert to tuple for hashing
+    
+    if not all_batch_sequences:
+        return 0.0
+    
+    # Count unique sequences and their frequencies
+    sequence_counts = Counter(all_batch_sequences)
+    
+    # Compute Shannon entropy
+    total_sequences = len(all_batch_sequences)
+    entropy_val = 0.0
+    
+    for count in sequence_counts.values():
+        if count > 0:
+            p = count / total_sequences
+            entropy_val -= p * math.log2(p) # Using log2 for bits
+    
+    # Normalize by maximum possible entropy, which is log2(batch_size) if all sequences are unique
+    max_entropy = math.log2(batch_size) 
+    normalized_entropy = entropy_val / max_entropy if max_entropy > 0 else 0.0
+    
+    return normalized_entropy
 
 
 def test_edit_distance_function():
@@ -471,6 +577,7 @@ def test_edit_distance_function():
         ([3, 2, 1, 0], 0.0, "Perfect reverse order (maximum distance)"),
         ([0, 1, 2], 1.0, "Perfect sequential order (3 elements)"),
         ([2, 1, 0], 0.33, "Perfect reverse order (3 elements, distance=2/3)"),
+        ([0, 1, 2], 1.0, "Perfect sequential order (3 elements)"),
         ([0, 2, 1], 0.33, "One swap needed (2/3 distance)"),
         ([1, 0, 2], 0.33, "One swap needed (2/3 distance)"),
         ([0], 1.0, "Single element (perfect by definition)"),
@@ -512,6 +619,93 @@ def test_edit_distance_function():
     return all_passed
 
 
+def compute_kl_from_reference(
+    trajectory: "Trajectory",
+    adapter_model: torch.nn.Module,
+    ref_model: torch.nn.Module,
+    tokenizer,
+) -> float:
+    """Compute KL(adapter || ref) over the key-selection distribution for an entire trajectory.
+
+    The adapter distribution is already stored in ``step.similarity_scores``.
+    We rebuild the reference distribution by generating a query vector with ``ref_model``
+    at each timestep and re-using the stored key embeddings / availability mask.
+
+    Returns
+    -------
+    float
+        Average KL divergence across all steps in the trajectory (batch-mean inside each step).
+    """
+    # Redundant local imports removed – all symbols available at module level
+    # import torch
+    # import torch.nn.functional as F
+    # from src.embeddings import compute_similarity
+    # from src.training import generate_query_vector
+    # from src.config import INITIAL_PROMPT, KEY_PREFIX, VALUE_PREFIX, TEMPERATURE
+
+    # Early exit if trajectory lacks steps or key embeddings (e.g., in unit-tests with mocks)
+    if (not trajectory.qkv_steps):
+        return 0.0
+
+    # import torch  # redundant (already at module level)
+    all_key_embs = getattr(trajectory, "all_key_embeddings", None)
+    if not isinstance(all_key_embs, torch.Tensor):
+        raise TypeError("trajectory.all_key_embeddings must be a torch.Tensor")
+
+    # Ensure context_tokens from tokenizer is a real tensor (unit-tests may return MagicMocks)
+    device = next(adapter_model.parameters()).device
+    batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
+
+    context_tokens_obj = tokenizer(
+        [INITIAL_PROMPT] * batch_size,
+        return_tensors="pt",
+        padding=True,
+        add_special_tokens=False,
+    )
+
+    if not hasattr(context_tokens_obj, "input_ids") or not isinstance(context_tokens_obj.input_ids, torch.Tensor):
+        raise TypeError("Tokenizer must return an object with a tensor 'input_ids' field")
+
+    context_tokens = context_tokens_obj.input_ids.to(device)
+
+    kl_vals = []
+
+    # Iterate step-by-step so we respect the autoregressive context growth
+    for step in trajectory.qkv_steps:
+        # 1) Adapter distribution (already computed)
+        adapter_log_probs = F.log_softmax(step.similarity_scores / TEMPERATURE, dim=-1)
+
+        # 2) Reference distribution – build a query vector, compute similarities, apply mask
+        with torch.no_grad():
+            ref_query = generate_query_vector(ref_model, tokenizer, context_tokens, layer_idx=-2)
+            key_embs_full = all_key_embs.to(device)
+            ref_sims = compute_similarity(ref_query, key_embs_full, ref_model)  # [B, K]
+
+        if hasattr(step, "available_mask") and step.available_mask is not None:
+            ref_sims = ref_sims + step.available_mask.to(device)
+
+        ref_log_probs = F.log_softmax(ref_sims / TEMPERATURE, dim=-1)
+
+        # 3) KL(adapter || ref) in log-space.  "log_target=True" expects both inputs are log-probs.
+        kl_step = F.kl_div(ref_log_probs, adapter_log_probs, reduction="batchmean", log_target=True)
+        kl_vals.append(kl_step.item())
+
+        # 4) Advance context for next timestep
+        kp = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        vp = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        context_tokens = torch.cat([
+            context_tokens,
+            kp,
+            step.key_tokens.to(device),
+            vp,
+            step.value_tokens.to(device),
+        ], dim=1)
+
+    if not kl_vals:
+        return 0.0
+    return sum(kl_vals) / len(kl_vals)
+
+
 def main():
     """Main training function."""
     # Parse arguments
@@ -545,6 +739,27 @@ def main():
     logging.info(f"  Total tokens per round: {config.TOKENS_PER_ROUND}")
     logging.info(f"  Initial prompt tokens: {config.INITIAL_PROMPT_TOKENS}")
     logging.info(f"  Number of KV pairs: {config.NUM_KV_PAIRS}")
+    
+    # Set model type and names based on args
+    config.MODEL_TYPE = args.model_type
+    if config.MODEL_TYPE == 'llama':
+        config.MODEL_NAME = 'meta-llama/Llama-3.2-3B'
+        config.TOKENIZER_NAME = 'meta-llama/Llama-3.2-3B'
+    elif config.MODEL_TYPE == 'gpt2':
+        config.MODEL_NAME = 'gpt2'
+        config.TOKENIZER_NAME = 'gpt2'
+    else:
+        raise ValueError(f'Invalid model type: {config.MODEL_TYPE}')
+
+    config.USE_GRPO_BASELINE = args.use_grpo_baseline
+    
+    # Set additional config values from CLI args
+    config.KEY_EMBEDDING_BATCH_SIZE = args.key_embedding_batch_size
+    config.KL_PENALTY_COEFFICIENT = args.kl_penalty_coef
+    config.ENABLE_WANDB = args.enable_wandb
+    config.PPO_CLIP_EPSILON = args.ppo_clip_epsilon
+    config.BASELINE_UPDATE_FREQUENCY = args.baseline_update_freq
+    config.SUBTRACT_BASE_MODEL_LOGPROBS = args.subtract_base_logprobs
     
     # Register embedding hooks
     embeddings_dict, hook_remover = register_embedding_hook(adapter_model)
@@ -684,8 +899,8 @@ def main():
                 add_special_tokens=False
             ).input_ids.to(device)
             
-            # Generate a trajectory
-            trajectory = generate_trajectory(
+            # Generate a *raw* trajectory (no rewards yet)
+            raw_traj = generate_trajectory(
                 initial_tokens,
                 adapter_model,
                 ref_model,
@@ -697,9 +912,9 @@ def main():
                 verbose=args.verbose,
             )
             
-            # Compute trajectory rewards and log probabilities using ref_model (for actual rewards)
-            _, adapter_log_probs_batch, ref_log_probs_batch = compute_trajectory_rewards(
-                trajectory, 
+            # Promote raw -> full trajectory and compute log probs using reference model
+            trajectory, adapter_log_probs_batch, ref_log_probs_batch = compute_trajectory_rewards(
+                raw_traj, 
                 adapter_model, 
                 ref_model, 
                 initial_tokens,
@@ -709,51 +924,31 @@ def main():
             
             # Also get old model log probabilities for comparison plotting
             _, _, old_log_probs_batch = compute_trajectory_rewards(
-                trajectory, 
+                raw_traj, 
                 adapter_model, 
                 old_model, 
                 initial_tokens,
                 tokenizer=tokenizer,
                 verbose=False  # Don't print twice
             )
-            
-            # Compute KL divergence from reference model (pi_ref) for monitoring
-            # This is different from the KL in the loss which is from pi_old
-            kl_from_ref_value = 0.0
-            if trajectory.qkv_steps:
-                # Compute KL between adapter and ref model for each step
-                kl_values = []
-                for step in trajectory.qkv_steps:
-                    if hasattr(step, 'similarity_scores') and step.similarity_scores is not None:
-                        # Get log probs from adapter and ref
-                        from src.config import TEMPERATURE
-                        import torch.nn.functional as F
-                        
-                        # For simplicity, use the stored similarity scores as proxy
-                        # In a full implementation, we'd recompute with ref model
-                        log_probs_adapter = F.log_softmax(step.similarity_scores / TEMPERATURE, dim=-1)
-                        # Approximate ref model probs as uniform (or could recompute)
-                        num_keys = step.similarity_scores.shape[-1]
-                        log_probs_ref = torch.full_like(log_probs_adapter, -torch.log(torch.tensor(num_keys)).item())
-                        
-                        # KL(adapter || ref)
-                        kl_step = F.kl_div(log_probs_ref, log_probs_adapter, reduction='batchmean', log_target=True)
-                        kl_values.append(kl_step.item())
-                
-                if kl_values:
-                    kl_from_ref_value = sum(kl_values) / len(kl_values)
-            
+
+            # Exact KL(adapter || reference) over key-selection distribution
+            kl_from_ref_value = compute_kl_from_reference(
+                trajectory,
+                adapter_model,
+                ref_model,
+                tokenizer,
+            )
+
             kl_from_ref.append(kl_from_ref_value)
             
             # Update reward stats
-            if trajectory.avg_reward is not None:
-                reward_stats = update_reward_stats(reward_stats, trajectory.avg_reward)
-                
-                if args.verbose:
-                    print(f"\nUpdated reward stats:")
-                    print(f"  Mean: {reward_stats['mean']:.4f}")
-                    print(f"  Std: {reward_stats['std']:.4f}")
-                    print(f"  Count: {reward_stats['count']}")
+            reward_stats = update_reward_stats(reward_stats, trajectory.avg_reward)
+            if args.verbose:
+                print(f"\nUpdated reward stats:")
+                print(f"  Mean: {reward_stats['mean']:.4f}")
+                print(f"  Std: {reward_stats['std']:.4f}")
+                print(f"  Count: {reward_stats['count']}")
             
             # Perform training step
             total_loss, policy_loss, kl_loss, avg_clipping_ratio = train_step(
@@ -780,10 +975,7 @@ def main():
             # This allows KL divergence to accumulate over multiple episodes for meaningful regularization
             
             # Calculate average reward across the batch
-            if trajectory.avg_reward is not None and trajectory.avg_reward.numel() > 0:
-                avg_reward = trajectory.avg_reward.mean().item()
-            else:
-                avg_reward = 0.0
+            avg_reward = trajectory.avg_reward.mean().item()
                 
             # Store metrics for plotting
             training_steps.append(episode)
@@ -801,6 +993,71 @@ def main():
             else:
                 wikipedia_order_consistency.append(0.5)  # Neutral for non-Wikipedia datasets
             
+            # Compute batch selection entropy
+            selection_entropy = compute_batch_selection_entropy(trajectory)
+            batch_selection_entropy.append(selection_entropy)
+            
+            # Periodically log detailed trajectory information
+            if episode % 50 == 0 or episode < 5:  # Log first few and then every 50 episodes
+                trajectory_info = {
+                    'episode': episode,
+                    'selections': [],
+                    'key_texts': [],
+                    'value_texts': [],
+                    'rewards': trajectory.rewards.tolist() if trajectory.rewards is not None else [],
+                    'avg_reward': trajectory.avg_reward.tolist() if trajectory.avg_reward is not None else [],
+                    'index_sequences': [],  # Add index sequences for each batch item
+                }
+                
+                # Extract index sequences for each batch item
+                for b in range(batch_size):
+                    batch_sequence = []
+                    for step in trajectory.qkv_steps:
+                        if hasattr(step, 'selected_idx') and step.selected_idx is not None:
+                            batch_sequence.append(step.selected_idx[b].item())
+                    trajectory_info['index_sequences'].append(batch_sequence)
+                
+                # Extract selection information from each step
+                for step_idx, step in enumerate(trajectory.qkv_steps):
+                    step_info = {
+                        'step': step_idx,
+                        'selected_idx': step.selected_idx if hasattr(step, 'selected_idx') else None,
+                        'key_text': step.key_text[0] if step.key_text else None,  # First batch item
+                        'value_text': step.value_text[0] if step.value_text else None,
+                    }
+                    trajectory_info['selections'].append(step_info)
+                    
+                    # Store key/value texts for first batch item
+                    if step.key_text:
+                        trajectory_info['key_texts'].append(step.key_text[0])
+                    if step.value_text:
+                        trajectory_info['value_texts'].append(step.value_text[0])
+                
+                trajectory_samples.append(trajectory_info)
+                
+                # Also log to console if verbose or first few episodes
+                if args.verbose or episode < 3:
+                    print(f"\n=== Trajectory Sample Episode {episode} ===")
+                    print(f"Selection entropy: {selection_entropy:.3f}")
+                    print(f"Average reward: {avg_reward:.4f}")
+                    
+                    # Show index sequences for all batch items
+                    print("\nIndex sequences (pool indices, not original key IDs):")
+                    for b, seq in enumerate(trajectory_info['index_sequences'][:4]):  # Show up to 4 batch items
+                        print(f"  Batch {b}: {seq}")
+                    
+                    # Check if all batch items have same sequence
+                    unique_sequences = len(set(tuple(seq) for seq in trajectory_info['index_sequences']))
+                    print(f"Unique sequences: {unique_sequences}/{batch_size}")
+                    
+                    print("\nFirst batch item selections (first 5 steps):")
+                    for info in trajectory_info['selections'][:5]:  # Show first 5
+                        print(f"  Step {info['step']}: idx={info['selected_idx']}")
+                        if info['key_text']:
+                            print(f"    Key: {info['key_text'][:50]}...")
+                        if info['value_text']:
+                            print(f"    Value: {info['value_text'][:50]}...")
+            
             # Track trajectory-level log probabilities (average across all trajectory steps)
             traj_log_prob = adapter_log_probs_batch.mean().item()
             trajectory_log_probs.append(traj_log_prob)
@@ -810,10 +1067,7 @@ def main():
             kl_penalty_terms.append(kl_penalty_term)
             
             # Track reward variance within trajectory
-            if trajectory.avg_reward is not None and trajectory.avg_reward.numel() > 1:
-                reward_var = trajectory.avg_reward.var().item()
-            else:
-                reward_var = 0.0
+            reward_var = trajectory.avg_reward.var().item()
             reward_variance.append(reward_var)
             
             # Track current learning rate
@@ -905,13 +1159,22 @@ def main():
             step_log_probs_episode = []
             for step in trajectory.qkv_steps:
                 if hasattr(step, 'similarity_scores') and step.similarity_scores is not None:
-                    # Convert similarity scores to log probabilities
-                    from src.config import TEMPERATURE
-                    import torch.nn.functional as F
-                    log_probs = F.log_softmax(step.similarity_scores / TEMPERATURE, dim=-1)
+                    # TEMPERATURE and F are already in global scope
+                    
+                    # Apply available mask if present (same as in policy loss computation)
+                    similarities = step.similarity_scores
+                    if hasattr(step, 'available_mask') and step.available_mask is not None:
+                        # Mask out unavailable keys
+                        masked_similarities = similarities + step.available_mask
+                    else:
+                        masked_similarities = similarities
+                    
+                    log_probs = F.log_softmax(masked_similarities / TEMPERATURE, dim=-1)
                     # Get log prob of selected action (average over batch)
-                    selected_idx = step.selected_idx if hasattr(step, 'selected_idx') else 0
-                    selected_log_prob = log_probs[:, selected_idx].mean().item()
+                    if not isinstance(step.selected_idx, torch.Tensor):
+                        raise TypeError("selected_idx must be a torch.Tensor")
+                    selected_idx = step.selected_idx
+                    selected_log_prob = log_probs[torch.arange(log_probs.shape[0]), selected_idx].mean().item()
                     step_log_probs_episode.append(selected_log_prob)
             step_log_probs.append(step_log_probs_episode)
             
@@ -1030,6 +1293,8 @@ def save_plot_data(log_dir, episode, policy_gradients_data=None, all_data=None):
             'policy_gradients': policy_gradients_data.copy() if policy_gradients_data else [],
             'clipping_ratios': clipping_ratios.copy(),
             'kl_from_ref': kl_from_ref.copy(),
+            'batch_selection_entropy': batch_selection_entropy.copy(),
+            'trajectory_samples': trajectory_samples.copy(),  # Add trajectory samples
             # Add metadata
             'metadata': {
                 'episode': episode,

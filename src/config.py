@@ -4,24 +4,20 @@ Configuration module for the Attention-Guided RL project.
 Contains all the configuration constants used throughout the project.
 """
 
-import os
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-# Model configuration - manually configurable via environment variable
-# Set MODEL_TYPE environment variable to choose model:
-# - "gpt2": Use GPT-2 (default, works on smaller GPUs)
-# - "llama": Use Llama-3.2-3B (requires more GPU memory)
-MODEL_TYPE = os.environ.get("MODEL_TYPE", "gpt2").lower()
+# Model configuration - hardcoded default
+MODEL_TYPE = 'gpt2'  # Default to gpt2, can be overridden elsewhere if needed
 
-if MODEL_TYPE == "llama":
-    MODEL_NAME = "meta-llama/Llama-3.2-3B"
-    TOKENIZER_NAME = "meta-llama/Llama-3.2-3B"
-elif MODEL_TYPE == "gpt2":
-    MODEL_NAME = "gpt2"
-    TOKENIZER_NAME = "gpt2"
+if MODEL_TYPE == 'llama':
+    MODEL_NAME = 'meta-llama/Llama-3.2-3B'
+    TOKENIZER_NAME = 'meta-llama/Llama-3.2-3B'
+elif MODEL_TYPE == 'gpt2':
+    MODEL_NAME = 'gpt2'
+    TOKENIZER_NAME = 'gpt2'
 else:
-    raise ValueError(f"Invalid MODEL_TYPE: {MODEL_TYPE}. Must be 'gpt2' or 'llama'")
+    raise ValueError(f'Invalid MODEL_TYPE: {MODEL_TYPE}. Must be "gpt2" or "llama"')
 
 # Device configuration
 if torch.cuda.is_available():
@@ -33,37 +29,10 @@ DEVICE = device
 DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
 # Query configuration - Vector queries only
-QUERY_VEC_TOKEN = "<VECTOR_QUERY>"
+QUERY_VEC_TOKEN = 'Query'  # Hardcoded to 'Query'
 
 # Option to use standard vocabulary tokens instead of special tokens
-# This should give much better log probabilities since the model has seen these during pre-training
-USE_STANDARD_QUERY_TOKEN = os.environ.get("USE_STANDARD_QUERY_TOKEN", "true").lower() == "true"
-
-# Standard query tokens for each model type
-# These are common tokens that both models should handle well
-STANDARD_QUERY_TOKENS = {
-    "gpt2": "Query",      # Simple, semantic word that GPT-2 knows well
-    "llama": "Query",     # Same for Llama - consistency across models
-}
-
-# Alternative options (can be changed by setting environment variable)
-ALTERNATIVE_STANDARD_TOKENS = {
-    "gpt2": ["Query", "?", "Find", "Search", "What"],
-    "llama": ["Query", "?", "Find", "Search", "What"],
-}
-
-# Allow override via environment variable
-CUSTOM_QUERY_TOKEN = os.environ.get("QUERY_TOKEN", None)
-
-# Determine the actual token to use
-if USE_STANDARD_QUERY_TOKEN:
-    if CUSTOM_QUERY_TOKEN:
-        QUERY_VEC_TOKEN = CUSTOM_QUERY_TOKEN
-    else:
-        QUERY_VEC_TOKEN = STANDARD_QUERY_TOKENS.get(MODEL_TYPE, "Query")
-else:
-    # Use the original special token
-    QUERY_VEC_TOKEN = "<VECTOR_QUERY>"
+USE_STANDARD_QUERY_TOKEN = True  # Hardcoded to True
 
 # Prefix tokens for context building
 KEY_PREFIX = "Key: "
@@ -103,11 +72,11 @@ KV_EVERY_N = 4  # Skip 4 chunks between each extraction for diversity
 # Number of key-value pairs
 available_context = MAX_CONTEXT_LENGTH - INITIAL_PROMPT_TOKENS
 NUM_KV_PAIRS = available_context // TOKENS_PER_ROUND
-NUM_KV_PAIRS = min(NUM_KV_PAIRS, 15)  # Cap at 15 for reasonable trajectory length
+NUM_KV_PAIRS = min(NUM_KV_PAIRS, 10)  # Cap at 15 for reasonable trajectory length
 
 # Key embedding batch size - number of keys to process together in a single forward pass
 # Higher values improve GPU utilization but use more memory
-KEY_EMBEDDING_BATCH_SIZE = int(os.environ.get("KEY_EMBEDDING_BATCH_SIZE", "4"))  # Process 4 keys at once by default
+KEY_EMBEDDING_BATCH_SIZE = 4  # Process 4 keys at once by default
 
 # LoRA configuration
 LORA_RANK = 8 
@@ -119,20 +88,20 @@ LEARNING_RATE = 5e-4
 GRADIENT_CLIP_NORM = 1.0
 NUM_EPISODES = 10000
 CHECKPOINT_INTERVAL = 100
-TRAINING_BATCH_SIZE = 40  # Used for trajectory generation and training
+TRAINING_BATCH_SIZE = 4  # Used for trajectory generation and training
 
 # Reward computation - no scaling needed
 
 # KL penalty - increased significantly to provide meaningful regularization
 # Higher values mean stronger KL penalty, more stable but potentially slower learning
-KL_PENALTY_COEFFICIENT = float(os.environ.get("KL_PENALTY_COEFFICIENT", "0.1"))  # Increased from 0.01 to 0.1 (10x stronger)
+KL_PENALTY_COEFFICIENT = 0.1  # Increased from 0.01 to 0.1 (10x stronger)
 
 # Directory configuration
 CHECKPOINT_DIR = "checkpoints"
 LOG_DIR = "logs"
 
 # Wandb configuration
-ENABLE_WANDB = os.environ.get("ENABLE_WANDB", "false").lower() == "true"
+ENABLE_WANDB = False
 WANDB_PROJECT = "attention-guided-rl"
 
 # Logging
@@ -150,14 +119,14 @@ USE_GRPO_BASELINE = True
 TEMPERATURE = 1.0 
 
 # PPO clipping parameter (epsilon) for clipped surrogate objective
-PPO_CLIP_EPSILON = float(os.environ.get("PPO_CLIP_EPSILON", "0.2"))  # Standard PPO clipping range
+PPO_CLIP_EPSILON = 0.2  # Standard PPO clipping range
 
 # Baseline model update frequency (how often to update the single baseline model)
 # Since baseline model is now only used for key embeddings (not KL), we can update more frequently
-BASELINE_UPDATE_FREQUENCY = int(os.environ.get("BASELINE_UPDATE_FREQUENCY", "10"))  # More frequent updates (reduced from 50)
+BASELINE_UPDATE_FREQUENCY = 10  # More frequent updates (reduced from 50)
 
 # Reward computation configuration
 # Whether to subtract base model log probabilities from adapter log probabilities when computing rewards
 # True: reward = adapter_log_prob - base_log_prob (classic baseline subtraction)
 # False: reward = adapter_log_prob (raw adapter performance, let GRPO handle baselines)
-SUBTRACT_BASE_MODEL_LOGPROBS = os.environ.get("SUBTRACT_BASE_MODEL_LOGPROBS", "false").lower() == "true"
+SUBTRACT_BASE_MODEL_LOGPROBS = False

@@ -12,8 +12,8 @@ import torch.nn.functional as F
 from typing import List, Tuple, Optional, Any, Dict
 from dataclasses import dataclass
 
-from src.data import QKVStep
-from src.embeddings import extract_embeddings
+from src.data import KVPair, QKVSelection
+from src.embeddings import extract_embeddings, compute_similarity, register_embedding_hook
 from src.config import (
     DEVICE,
     TOKENS_PER_KEY,
@@ -35,21 +35,45 @@ from src.config import (
 
 
 
-@dataclass
+# --------------------
+# New immutable data-structures
+# --------------------
+
+
+@dataclass(frozen=True)
+class RawTrajectory:
+    """Trajectory skeleton produced directly by *generate_trajectory*.
+
+    Contains everything except reward information so it can be created
+    without touching the reference model.  Once rewards are computed the
+    object is *promoted* to a :class:`Trajectory`.
+    """
+    qkv_steps: List[QKVSelection]
+    all_key_embeddings: torch.Tensor  # [batch, num_keys, hidden]
+
+
+@dataclass(frozen=True)
 class Trajectory:
-    """
-    A trajectory consisting of query-key-value steps and optional rewards.
-    
-    Attributes:
-        qkv_steps: List of QKVStep objects selected during trajectory
-        rewards: Optional tensor of rewards for each step [batch_size, num_steps]
-        avg_reward: Average reward across steps [batch_size]
-        all_key_embeddings: All available key embeddings for this trajectory [batch_size, num_keys, embedding_dim]
-    """
-    qkv_steps: List[QKVStep]
-    rewards: Optional[torch.Tensor] = None
-    avg_reward: Optional[torch.Tensor] = None
-    all_key_embeddings: Optional[torch.Tensor] = None
+    """Fully-specified trajectory used for learning and analysis."""
+
+    qkv_steps: List[QKVSelection]
+    rewards: torch.Tensor             # [batch, num_steps]
+    avg_reward: torch.Tensor          # [batch]
+    all_key_embeddings: torch.Tensor  # [batch, num_keys, hidden]
+
+
+# Helper to convert RawTrajectory after rewards are ready
+def build_trajectory_from_raw(
+    raw: "RawTrajectory",
+    rewards: torch.Tensor,
+    avg_reward: torch.Tensor,
+) -> "Trajectory":
+    return Trajectory(
+        qkv_steps=raw.qkv_steps,
+        rewards=rewards,
+        avg_reward=avg_reward,
+        all_key_embeddings=raw.all_key_embeddings,
+    )
 
 
 def calculate_conditional_log_prob(
@@ -114,9 +138,6 @@ def generate_query_vector(
     Returns:
         torch.Tensor: Query vector [batch_size, query_dim]
     """
-    from src.config import QUERY_VEC_TOKEN
-    from src.embeddings import register_embedding_hook, extract_embeddings
-    
     # Get device from context tokens
     device = context_tokens.device
     batch_size = context_tokens.shape[0]
@@ -151,18 +172,18 @@ def generate_query_vector(
 
 
 def compute_trajectory_rewards(
-    trajectory: Trajectory,
+    raw_traj: RawTrajectory,
     adapter_model: torch.nn.Module,
     ref_model: torch.nn.Module,
     context_tokens: torch.Tensor,
     tokenizer: Any = None,
     verbose: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[Trajectory, torch.Tensor, torch.Tensor]:
     """
     Compute rewards for all query-key-value steps in a trajectory.
     
     Args:
-        trajectory: The trajectory containing QKVStep objects
+        raw_traj: The raw trajectory skeleton
         adapter_model: The model with LoRA adapter
         ref_model: The reference model without LoRA (pi_ref)
         context_tokens: Initial context tokens [batch_size, context_length]
@@ -170,13 +191,14 @@ def compute_trajectory_rewards(
         verbose: Flag to enable verbose logging
         
     Returns:
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: 
+        Tuple[Trajectory, torch.Tensor, torch.Tensor]: 
+            trajectory: The fully-specified trajectory with rewards
             rewards: Rewards for each step [batch_size, num_steps]
             adapter_log_probs: Log probabilities from adapter model [batch_size, num_steps]
             ref_log_probs: Log probabilities from reference model [batch_size, num_steps]
     """
     batch_size = context_tokens.shape[0]
-    num_steps = len(trajectory.qkv_steps)
+    num_steps = len(raw_traj.qkv_steps)
     
     if verbose:
         print("\n=== Computing Trajectory Rewards ===")
@@ -194,7 +216,7 @@ def compute_trajectory_rewards(
     # Build context incrementally, including each step
     current_context = context_tokens
     
-    for i, qkv_step in enumerate(trajectory.qkv_steps):
+    for i, qkv_step in enumerate(raw_traj.qkv_steps):
         if verbose:
             print(f"\n--- Reward Calculation for Step {i+1}/{num_steps} ---")
             
@@ -283,11 +305,10 @@ def compute_trajectory_rewards(
         print(f"Average adapter log prob: {adapter_log_probs.mean().item():.4f}")
         print(f"Average reference log prob: {ref_log_probs.mean().item():.4f}")
     
-    # Store rewards in the trajectory object
-    trajectory.rewards = rewards
-    trajectory.avg_reward = avg_reward
-    
-    return rewards, adapter_log_probs, ref_log_probs
+    # Build immutable Trajectory with rewards attached
+    trajectory = build_trajectory_from_raw(raw_traj, rewards, avg_reward)
+
+    return trajectory, adapter_log_probs, ref_log_probs
 
 
 def update_reward_stats(
@@ -456,15 +477,10 @@ def compute_policy_loss(
     # Track clipping ratios
     all_clipping_ratios = []
     
-    # Ensure trajectory has rewards
-    if trajectory.rewards is None or trajectory.avg_reward is None:
-        raise ValueError("Trajectory must have rewards computed before policy loss")
-    
     # Import needed configs
-    from src.config import USE_GRPO_BASELINE, GAE_LAMBDA, INITIAL_PROMPT, KEY_PREFIX, VALUE_PREFIX, PPO_CLIP_EPSILON, TEMPERATURE
+    # Removed redundant local config import (constants available module-wide)
     
     # Compute returns and advantages
-    returns = compute_returns(trajectory.rewards, gamma)
     advantages, _ = compute_advantages(
         trajectory.rewards, 
         values=None, 
@@ -521,10 +537,6 @@ def compute_policy_loss(
             if verbose:
                 print(f"Warning: Skipping step {t} - no similarity scores")
             continue
-            
-        # For proper gradient flow and KL computation, we need available_key_embeddings
-        if not hasattr(qkv_step, 'available_key_embeddings') or qkv_step.available_key_embeddings is None:
-            raise ValueError(f"Step {t} is missing available_key_embeddings - required for PPO with vector queries")
         
         # Reconstruct context up to this step
         batch_size = qkv_step.key_tokens.shape[0]
@@ -549,51 +561,58 @@ def compute_policy_loss(
                 prev_step.value_tokens.to(device)
             ], dim=1)
         
-        # Generate query vector with current adapter model (with gradients)
+        # --- Recompute current-policy similarities so gradients flow into adapter_model ---
+        # 1) Build query embedding with current (trainable) policy
         current_query_embeddings = generate_query_vector(
             adapter_model,
             tokenizer,
             context_tokens,
-            layer_idx=-2
-        )
-        
-        # Recompute similarities with available key embeddings
-        from src.embeddings import compute_similarity
-        available_key_embeddings = qkv_step.available_key_embeddings.to(device)
-        
-        # Compute new similarity scores with gradients (current policy)
-        current_similarities = compute_similarity(
-            current_query_embeddings.unsqueeze(1),  # Add key dimension
-            available_key_embeddings,
-            adapter_model
-        )
-        
-        # Compute old policy similarities
-        if t < len(old_query_means):
-            old_query_embeddings = old_query_means[t].to(device)
-            
-            # Compute old similarities
-            old_similarities = compute_similarity(
-                old_query_embeddings.unsqueeze(1),  # Add key dimension
-                available_key_embeddings,
-                adapter_model  # Use same model for consistency
-            )
+            layer_idx=-2,
+        )  # [batch, hidden]
+
+        # 2) Require full key embeddings to be present
+        if trajectory.all_key_embeddings is None:
+            raise ValueError("trajectory.all_key_embeddings is required but is None")
+
+        key_embs_full = trajectory.all_key_embeddings.to(device)  # [B, K, H]
+
+        # 3) Compute similarities with gradient through adapter_model parameters
+        current_similarities = compute_similarity(current_query_embeddings, key_embs_full, adapter_model)
+
+        # 4) Apply the availability mask
+        if hasattr(qkv_step, 'available_mask') and qkv_step.available_mask is not None:
+            masked_similarities = current_similarities + qkv_step.available_mask.to(device)
         else:
-            raise ValueError(f"Missing old query mean for step {t}")
-        
-        selected_idx = qkv_step.selected_idx if hasattr(qkv_step, 'selected_idx') else 0
+            masked_similarities = current_similarities
+
+        # Compute current policy log-probabilities (masked)
+        current_log_probs_full = F.log_softmax(masked_similarities / TEMPERATURE, dim=-1)
+
+        selected_idx = qkv_step.selected_idx if hasattr(qkv_step, 'selected_idx') else torch.tensor([0]*batch_size, device=device)
+        # Ensure selected_idx is tensor of shape [batch_size]
+        if not isinstance(selected_idx, torch.Tensor):
+            selected_idx = torch.tensor(selected_idx, device=device)
+        current_action_log_probs = current_log_probs_full[torch.arange(batch_size, device=device), selected_idx]
+
+        # --- Compute old-policy log-probabilities with same mask ---
+        old_query_emb = old_query_means[t]  # [batch, hidden]
+
+        # Require full key embeddings
+        key_embs_full = trajectory.all_key_embeddings.to(device)
+        old_similarities = compute_similarity(old_query_emb, key_embs_full, old_model)
+
+        # Apply same availability mask
+        old_masked_similarities = old_similarities + qkv_step.available_mask.to(device)
+
+        old_log_probs_full = F.log_softmax(old_masked_similarities / TEMPERATURE, dim=-1)
+        old_action_log_probs = old_log_probs_full[torch.arange(batch_size, device=device), selected_idx]
+
+        # Compute KL divergence between current and old policies over available keys (masked)
+        kl_step = F.kl_div(old_log_probs_full, current_log_probs_full, reduction="batchmean", log_target=True)
+
         step_advantages = advantages[:, t].to(device)
-        
-        # Compute log probabilities for numerical stability
-        current_log_probs = F.log_softmax(current_similarities / TEMPERATURE, dim=-1)
-        old_log_probs = F.log_softmax(old_similarities / TEMPERATURE, dim=-1)
-        
-        # Get log probabilities for selected action
-        current_action_log_probs = current_log_probs[:, selected_idx]  # [batch_size]
-        old_action_log_probs = old_log_probs[:, selected_idx]  # [batch_size]
-        
+
         # Compute probability ratio: pi_theta(a|s) / pi_old(a|s)
-        # Use log-space for numerical stability: exp(ln pi_theta - ln pi_old)
         log_ratio = current_action_log_probs - old_action_log_probs
         ratio = torch.exp(log_ratio)
         
@@ -601,7 +620,7 @@ def compute_policy_loss(
         clipped_ratio = torch.clamp(ratio, 1.0 - PPO_CLIP_EPSILON, 1.0 + PPO_CLIP_EPSILON)
         
         # Track clipping ratios for monitoring
-        all_clipping_ratios.extend(ratio.detach().cpu().numpy().tolist())
+        all_clipping_ratios.extend(ratio.detach().cpu().tolist())
         
         # Compute both unclipped and clipped surrogate terms
         unclipped_surrogate = ratio * step_advantages
@@ -614,15 +633,13 @@ def compute_policy_loss(
         batch_policy_gradient = ppo_surrogate.sum()  # Sum over batch
         policy_loss = policy_loss + batch_policy_gradient  # Accumulate across timesteps
         
-        # Compute KL divergence between current and old softmax policies (for regularization)
-        # KL divergence between two categorical distributions
-        kl_divergence = F.kl_div(current_log_probs, old_log_probs, reduction='batchmean', log_target=True)
-        kl_loss = kl_loss + kl_divergence  # Use tensor addition to maintain gradient
+        # Accumulate KL divergence for this step
+        kl_loss = kl_loss + kl_step  # accumulate KL
         
         if verbose and t == 0:  # Print info for first step
             print(f"PPO ratio mean: {ratio.mean().item():.4f}, std: {ratio.std().item():.4f}")
             print(f"Clipped ratio range: [{clipped_ratio.min().item():.4f}, {clipped_ratio.max().item():.4f}]")
-            print(f"Softmax KL divergence: {kl_divergence.item():.4f}")
+            print(f"KL divergence (masked): {kl_step.item():.4f}")
         
         count += 1
     
@@ -695,28 +712,23 @@ def train_step(
     """
     if verbose:
         print("\n=== Training Step ===")
-        
-        if trajectory.avg_reward is not None:
-            batch_size = trajectory.avg_reward.shape[0]
-            print(f"Input trajectory batch size: {batch_size}")
-            print(f"Reward stats: mean={reward_stats['mean']:.4f}, std={reward_stats['std']:.4f}")
-            
-            # Print individual batch element rewards
-            if batch_size > 0:
-                rewards = [f"{i}: {reward.item():.4f}" for i, reward in enumerate(trajectory.avg_reward)]
-                print(f"Batch element rewards: {', '.join(rewards)}")
+        batch_size = trajectory.avg_reward.shape[0]
+        print(f"Input trajectory batch size: {batch_size}")
+        print(f"Reward stats: mean={reward_stats['mean']:.4f}, std={reward_stats['std']:.4f}")
+        if batch_size > 0:
+            rewards_str = ', '.join(f"{i}: {r.item():.4f}" for i, r in enumerate(trajectory.avg_reward))
+            print(f"Batch element rewards: {rewards_str}")
     
     # No trajectory-level filtering - we use all trajectories
     
-    if verbose and trajectory.avg_reward is not None:
-        batch_size = trajectory.avg_reward.shape[0]
-        print(f"Processing all {batch_size} trajectories")
+    if verbose:
+        print(f"Processing all {trajectory.avg_reward.shape[0]} trajectories")
     
     # Zero gradients
     optimizer.zero_grad()
     
-    # Import the new parameters
-    from src.config import GAMMA
+    # Removed redundant local GAMMA import; constant already available
+    # from src.config import GAMMA
     
     # Compute policy loss using old_model for KL computation
     total_loss, policy_loss, kl_loss, avg_clipping_ratio = compute_policy_loss(
