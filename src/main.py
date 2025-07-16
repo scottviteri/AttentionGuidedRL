@@ -50,7 +50,8 @@ from src.model import setup_model_and_tokenizer, save_checkpoint, load_checkpoin
 from src.data import iter_key_value_pairs, iter_key_value_pairs_unified, KVPair, QKVSelection, repeat_n_times
 from src.embeddings import register_embedding_hook, extract_embeddings, compute_similarity, sample_key_value
 from src.training import (
-    Trajectory,
+    RawTrajectory,
+    Trajectory,  # for type hints
     compute_trajectory_rewards,
     update_reward_stats,
     train_step,
@@ -157,7 +158,7 @@ def generate_trajectory(
     available_qkv_steps: List[KVPair],
     batch_size: int,
     verbose: bool = False,
-) -> Trajectory:
+) -> RawTrajectory:
     """
     Generate a single trajectory using vector queries.
     
@@ -173,7 +174,7 @@ def generate_trajectory(
         verbose: Whether to enable verbose logging
         
     Returns:
-        Trajectory object containing the selected steps and rewards
+        RawTrajectory skeleton (no rewards yet)
     """
     # Ensure the context is on the same device as the model
     device = next(adapter_model.parameters()).device
@@ -340,13 +341,11 @@ def generate_trajectory(
         print(full_context)
         print("\n=== Trajectory Complete ===\n")
     
-    # Create trajectory object with the pre-saved key embeddings
-    trajectory = Trajectory(
+    # Build and return RawTrajectory (rewards filled later)
+    return RawTrajectory(
         qkv_steps=selected_steps,
-        all_key_embeddings=trajectory_key_embeddings
+        all_key_embeddings=trajectory_key_embeddings,
     )
-    
-    return trajectory
 
 
 def parse_args():
