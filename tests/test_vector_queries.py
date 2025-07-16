@@ -12,23 +12,37 @@ from src.data import get_tokenizer
 
 
 def test_query_vec_token_added():
-    """Test that the QUERY_VEC_TOKEN is properly added to the tokenizer."""
+    """Test that the QUERY_VEC_TOKEN is properly handled by the tokenizer."""
+    from src.config import USE_STANDARD_QUERY_TOKEN
     tokenizer = get_tokenizer()
     
-    # Check that the token is in the tokenizer
-    assert QUERY_VEC_TOKEN in tokenizer.get_added_vocab()
-    
-    # Check that we can encode and decode the token
-    token_ids = tokenizer.encode(QUERY_VEC_TOKEN, add_special_tokens=False)
-    assert len(token_ids) == 1  # Should be a single token
-    
-    # Check that we can decode it back
-    decoded = tokenizer.decode(token_ids)
-    assert QUERY_VEC_TOKEN in decoded
+    if USE_STANDARD_QUERY_TOKEN:
+        # Standard tokens are already in the vocabulary, not added
+        # Check that we can encode and decode the token
+        token_ids = tokenizer.encode(QUERY_VEC_TOKEN, add_special_tokens=False)
+        assert len(token_ids) >= 1  # Standard token might be multiple tokens
+        
+        # Check that we can decode it back
+        decoded = tokenizer.decode(token_ids)
+        assert QUERY_VEC_TOKEN in decoded
+    else:
+        # Special tokens are added to the vocabulary
+        # Check that the token is in the tokenizer
+        assert QUERY_VEC_TOKEN in tokenizer.get_added_vocab()
+        
+        # Check that we can encode and decode the token
+        token_ids = tokenizer.encode(QUERY_VEC_TOKEN, add_special_tokens=False)
+        assert len(token_ids) == 1  # Should be a single token
+        
+        # Check that we can decode it back
+        decoded = tokenizer.decode(token_ids)
+        assert QUERY_VEC_TOKEN in decoded
 
 
 def test_model_setup_with_query_vec_token(gpt2_model):
-    """Test that model setup correctly handles the new token."""
+    """Test that model setup correctly handles the query token."""
+    from src.config import USE_STANDARD_QUERY_TOKEN
+    
     with patch('src.model.load_base_model') as mock_load:
         # Use the real GPT2 model from the fixture
         mock_load.return_value = gpt2_model
@@ -36,13 +50,21 @@ def test_model_setup_with_query_vec_token(gpt2_model):
         # Setup model and tokenizer
         base_model, adapter_model, tokenizer = setup_model_and_tokenizer()
         
-        # Check that the token is in the tokenizer
-        assert QUERY_VEC_TOKEN in tokenizer.get_added_vocab()
-        
-        # Check that model embeddings were resized
-        # The embedding size should match the tokenizer vocab size
-        assert base_model.get_input_embeddings().weight.shape[0] == len(tokenizer)
-        assert adapter_model.get_input_embeddings().weight.shape[0] == len(tokenizer)
+        if USE_STANDARD_QUERY_TOKEN:
+            # Standard tokens are already in vocabulary - embeddings should not be resized
+            # Just check that the token can be encoded/decoded
+            token_ids = tokenizer.encode(QUERY_VEC_TOKEN, add_special_tokens=False)
+            assert len(token_ids) >= 1
+            decoded = tokenizer.decode(token_ids)
+            assert QUERY_VEC_TOKEN in decoded
+        else:
+            # Special tokens are added - check that token is in added vocab
+            assert QUERY_VEC_TOKEN in tokenizer.get_added_vocab()
+            
+            # Check that model embeddings were resized
+            # The embedding size should match the tokenizer vocab size
+            assert base_model.get_input_embeddings().weight.shape[0] == len(tokenizer)
+            assert adapter_model.get_input_embeddings().weight.shape[0] == len(tokenizer)
 
 
 def test_vector_queries_only():

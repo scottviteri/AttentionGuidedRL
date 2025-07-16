@@ -585,3 +585,124 @@ def test_key_embedding_batch_size_configuration():
     assert KEY_EMBEDDING_BATCH_SIZE > 0, f"KEY_EMBEDDING_BATCH_SIZE should be positive, got {KEY_EMBEDDING_BATCH_SIZE}"
     
     print(f"✓ KEY_EMBEDDING_BATCH_SIZE configuration test passed: {KEY_EMBEDDING_BATCH_SIZE}")
+
+
+def test_grpo_repetition_and_reshaping(gpt2_tokenizer):
+    """Test GRPO-style repetition of KV pairs and batch dimension reshaping."""
+    from src.config import NUM_KV_PAIRS, DEVICE, TOKENS_PER_KEY, TOKENS_PER_VALUE
+    import torch
+    
+    batch_size = 4
+    repeat_count = batch_size  # Simulate GRPO repetition
+    num_unique = 3  # Small number for testing
+    
+    # Use a real tokenizer but mock the base iterator to yield controlled unique KV pairs
+    def mock_base_iterator():
+        for i in range(num_unique):
+            yield KeyValuePair(
+                key_tokens=torch.full((1, TOKENS_PER_KEY), i, device=DEVICE),  # Shape (1, TOKENS_PER_KEY)
+                value_tokens=torch.full((1, TOKENS_PER_VALUE), i+100, device=DEVICE),
+                key_embedding=torch.full((1, 768), float(i), device=DEVICE),  # Unique embedding
+                key_text=[f"key_{i}"],
+                value_text=[f"value_{i}"]
+            )
+    
+    # Create repeated generator using repeat_n_times utility
+    from src.data import repeat_n_times
+
+    repeated_gen = repeat_n_times(repeat_count, mock_base_iterator())
+
+    # Build available_qkv_steps like in main.py
+    available_qkv_steps = [next(repeated_gen) for _ in range(NUM_KV_PAIRS)]
+    
+    # Verify repetition in the pool
+    assert len(available_qkv_steps) > 0, "Pool should not be empty"
+    unique_keys = set(kv.key_text[0] for kv in available_qkv_steps)
+    assert len(unique_keys) == num_unique, f"Expected {num_unique} unique, got {len(unique_keys)}"
+    
+    # Check consecutive repeats
+    repeat_streak = 1
+    max_streak = 1
+    for i in range(1, len(available_qkv_steps)):
+        if available_qkv_steps[i].key_text[0] == available_qkv_steps[i-1].key_text[0]:
+            repeat_streak += 1
+            max_streak = max(max_streak, repeat_streak)
+        else:
+            repeat_streak = 1
+    assert max_streak == repeat_count, f"Expected repeats of {repeat_count}, got max streak {max_streak}"
+    
+    # Simulate stacking and broadcasting from generate_trajectory
+    key_embs = []
+    for kv in available_qkv_steps:
+        key_emb = kv.key_embedding.to(DEVICE)
+        if key_emb.shape[0] == 1 and batch_size > 1:
+            key_emb = key_emb.expand(batch_size, -1)  # Mimic broadcasting
+        key_embs.append(key_emb)
+    
+    # Stack like in code
+    key_embeddings = torch.stack(key_embs, dim=1)  # [batch_size, num_keys, emb_dim]
+    
+    # Verify shapes after reshaping
+    assert key_embeddings.shape == (batch_size, len(available_qkv_steps), 768), \
+        f"Unexpected shape: {key_embeddings.shape}"
+    
+    # Verify that repeated KV pairs lead to identical embeddings across batch
+    for b in range(1, batch_size):
+        assert torch.allclose(key_embeddings[0], key_embeddings[b]), \
+            "Broadcasted embeddings should be identical across batch dimensions"
+    
+    print("✓ GRPO repetition and reshaping test passed")
+
+
+def test_batched_trajectory_order_exploration():
+    """Test that batched trajectory generation explores different orders without duplicates."""
+    from src.data import QKVSelection
+    from src.embeddings import sample_key_value
+    import torch
+    
+    batch_size = 4
+    num_keys = 5
+    
+    # Simulate per-batch available indices tracking
+    available_indices_per_batch = [list(range(num_keys)) for _ in range(batch_size)]
+    
+    # Track selected indices per batch
+    selected_per_batch = [[] for _ in range(batch_size)]
+    
+    # Simulate trajectory generation with selections
+    for step in range(num_keys):
+        # Mock similarity scores (random for diversity)
+        similarity_scores = torch.randn(batch_size, num_keys)
+        
+        # Sample indices
+        sampled_indices, _ = sample_key_value(
+            similarity_scores,
+            available_indices_per_batch,
+            batch_size
+        )
+        
+        # Verify each batch selected from its available indices
+        for b in range(batch_size):
+            sel_idx = sampled_indices[b]
+            assert sel_idx in available_indices_per_batch[b], \
+                f"Batch {b} selected {sel_idx} which is not available"
+            
+            # Track selection
+            selected_per_batch[b].append(sel_idx)
+            
+            # Remove from available
+            available_indices_per_batch[b].remove(sel_idx)
+    
+    # Verify no duplicates per batch
+    for b in range(batch_size):
+        assert len(set(selected_per_batch[b])) == num_keys, \
+            f"Batch {b} has duplicates: {selected_per_batch[b]}"
+        assert set(selected_per_batch[b]) == set(range(num_keys)), \
+            f"Batch {b} didn't cover all indices: {selected_per_batch[b]}"
+    
+    # Verify different orders explored across batches (with high probability)
+    unique_orders = set(tuple(order) for order in selected_per_batch)
+    assert len(unique_orders) > 1, \
+        f"All batches selected same order (unlikely): {selected_per_batch}"
+    
+    print(f"✓ Batched trajectory exploration test passed: {len(unique_orders)} unique orders")

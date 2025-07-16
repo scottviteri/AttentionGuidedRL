@@ -8,8 +8,8 @@ def gpt2_model():
     """Load a GPT-2 model for testing."""
     # Use the standard GPT-2 (small) model
     model = AutoModelForCausalLM.from_pretrained("gpt2")
-    # Move to GPU if available
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Always use GPU for tests to match project preference
+    device = torch.device("cuda")
     model = model.to(device)
     # Enable evaluation mode
     model.eval()

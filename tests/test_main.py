@@ -12,7 +12,7 @@ from unittest.mock import ANY
 import tempfile
 import shutil
 
-from src.data import KeyValuePair, QKVStep
+from src.data import KeyValuePair, QKVStep, iter_key_value_pairs, iter_key_value_pairs_unified, KVPair, QKVSelection, repeat_n_times
 from src.training import Trajectory
 from src.config import NUM_KV_PAIRS, TOKENS_PER_KEY, TOKENS_PER_VALUE
 
@@ -30,6 +30,16 @@ class MockArgs:
         self.run_name = None
         self.dataset = "wikipedia"  # Default dataset
         self.use_vector_queries = False  # Default to False for backwards compatibility
+        self.grpo_batching = True  # Added for new frozen dataclass structure
+        self.model_type = 'gpt2'
+        self.use_grpo_baseline = True
+        # Additional CLI args with their defaults
+        self.key_embedding_batch_size = 4
+        self.kl_penalty_coef = 0.1
+        self.enable_wandb = False
+        self.ppo_clip_epsilon = 0.2
+        self.baseline_update_freq = 10
+        self.subtract_base_logprobs = False
 
 
 @pytest.fixture
@@ -54,12 +64,19 @@ def test_generate_trajectory(mock_kv_pair):
     # Create mock models and tokenizer
     adapter_model = MagicMock()
     base_model = MagicMock()
-    tokenizer = MagicMock()
+    class DummyTokenizer:
+        def __call__(self, texts, **kwargs):
+            batch = len(texts) if isinstance(texts, list) else 1
+            return type('obj',(object,),{'input_ids': torch.zeros((batch,1), dtype=torch.long)})
+        def batch_decode(self, *args, **kwargs):
+            return ["ctx"]*2
+
+    tokenizer = DummyTokenizer()
     embeddings_dict = {"embeddings": None}
     hook_remover = MagicMock()
     
     # Set up mock device handling
-    mock_device = torch.device('cpu')
+    mock_device = torch.device('cuda')
     mock_param = MagicMock()
     mock_param.device = mock_device
     adapter_model.parameters.return_value = iter([mock_param])
@@ -72,15 +89,10 @@ def test_generate_trajectory(mock_kv_pair):
     context_tokens = torch.zeros((batch_size, 1), dtype=torch.long)
     
     # Setup basic mocks
-    tokenizer.batch_decode.return_value = ["context1", "context2"]
+    tokenizer.batch_decode = MagicMock(return_value=["context1", "context2"])
     
-    # Mock the tokenizer for KEY_PREFIX and VALUE_PREFIX
-    mock_tensor = torch.tensor([[100]])  # Use a sample tensor ID
-    tokenizer_result = MagicMock()
-    tokenizer_result.input_ids = mock_tensor
-    tokenizer_result.to.return_value = mock_tensor
-    tokenizer.return_value = tokenizer_result
-    
+    # DummyTokenizer.__call__ already returns an object with input_ids tensor, so no further patching needed
+
     # Mock the key functions in the generate_trajectory flow
     with patch("src.main.NUM_KV_PAIRS", 3):  # Use 3 KV pairs for testing
         with patch("src.main.generate_query_vector") as mock_generate_query:
@@ -207,112 +219,138 @@ def test_main(
     mock_create_model_copy
 ):
     """Test the main function (sanity check only)."""
-    # Mock the config module
     with patch("src.config") as mock_config:
         # Also mock compute_trajectory_rewards to avoid issues with mock trajectory
-        with patch("src.main.compute_trajectory_rewards") as mock_compute_rewards:
+        with patch("src.main.compute_trajectory_rewards", return_value=(torch.zeros(2, 1), torch.zeros(2, 1), torch.zeros(2, 1))) as mock_compute_rewards:
             # Also mock plot_metrics to avoid matplotlib issues
             with patch("src.main.plot_metrics") as mock_plot_metrics:
-                # Import main after patching config
-                from src.main import main
-                
-                # Create a proper mock for tqdm
-                mock_progress_bar = MagicMock()
-                # Make the progress_bar iterable and return only a single episode to avoid many iterations
-                mock_progress_bar.__iter__.return_value = iter([0])
-                mock_progress_bar.set_description = MagicMock()
-                
-                # Mock optimizer
-                mock_optimizer = MagicMock()
-                mock_adam.return_value = mock_optimizer
-                
-                # Mock parse_args
-                with patch("src.main.parse_args") as mock_parse_args:
-                    mock_args = MockArgs()
-                    mock_args.episodes = 1  # Set to 1 to minimize iterations
-                    mock_args.log_interval = 10  # Set a reasonable log interval
-                    mock_parse_args.return_value = mock_args
+                # Mock save_plot_data to avoid pickle issues with mock objects
+                with patch("src.main.save_plot_data") as mock_save_plot_data:
+                    # Import main after patching config
+                    from src.main import main
                     
-                    # Create mock models
-                    base_model = MagicMock()
-                    adapter_model = MagicMock()
-                    tokenizer = MagicMock()
-                    baseline_model = MagicMock()
+                    # Create a proper mock for tqdm
+                    mock_progress_bar = MagicMock()
+                    # Make the progress_bar iterable and return only a single episode to avoid many iterations
+                    mock_progress_bar.__iter__.return_value = iter([0])
+                    mock_progress_bar.set_description = MagicMock()
                     
-                    # Setup adapter_model.parameters to return a valid parameter list
-                    mock_param = MagicMock()
-                    # Mock the parameter to have required attributes
-                    mock_param.data = torch.randn(10, 10)
-                    mock_param.requires_grad = True
-                    mock_param.device = torch.device('cpu')
-                    mock_param.grad = None
-                    adapter_model.parameters.return_value = [mock_param]
-                    adapter_model.named_parameters.return_value = [('test_param', mock_param)]
-                    base_model.named_parameters.return_value = [('test_param', mock_param)]
+                    # Mock optimizer
+                    mock_optimizer = MagicMock()
+                    mock_adam.return_value = mock_optimizer
                     
-                    # Mock necessary return values
-                    mock_setup_logging.return_value = "logs/test"
-                    mock_setup_models.return_value = (base_model, adapter_model, tokenizer)
-                    mock_register_hook.return_value = ({"embeddings": None}, MagicMock())
-                    
-                    # Mock create_model_copy to return the baseline model
-                    mock_create_model_copy.return_value = baseline_model
-                    
-                    # Create a mock key-value pair
-                    mock_kv_pair = MagicMock()
-                    
-                    # Set up the mock generator that won't exhaust
-                    mock_kv_generator = MockGenerator(mock_kv_pair)
-                    mock_iter_kv_pairs_unified.return_value = mock_kv_generator
-                    
-                    # Create a mock trajectory and set the attributes we need
-                    mock_trajectory = MagicMock()
-                    batch_size = 2  # Define batch_size
-                    device = torch.device('cpu')  # Define device
-                    mock_trajectory.rewards = torch.zeros(batch_size, 1, device=device)
-                    
-                    # Set up avg_reward to handle .item() calls
-                    mock_avg_reward = torch.tensor([0.5, 0.6], device=device)
-                    mock_avg_reward_item = MagicMock(return_value=0.5)
-                    mock_avg_reward.__getitem__ = lambda self, idx: mock_avg_reward_item
-                    mock_trajectory.avg_reward = mock_avg_reward
-                    
-                    mock_trajectory.qkv_steps = [mock_kv_pair]
-                    
-                    # Mock generate_trajectory to return our mock trajectory
-                    mock_generate_trajectory.return_value = mock_trajectory
-                    
-                    # Mock train_step - returns loss and number of filtered batch elements
-                    mock_train_step.return_value = (0.5, 0.3, 0.2, 1.2)  # total_loss, policy_loss, kl_loss, avg_clipping_ratio
-                    
-                    # Mock additional functions to prevent runtime errors
-                    with patch("src.main.update_reward_stats", return_value={"mean": 0.0, "std": 1.0, "count": 1}):
-                        with patch("src.main.deepcopy", return_value=baseline_model):
-                            with patch("src.main.extract_embeddings", return_value=torch.randn(1, 768)):
-                                # Mock torch.zeros
-                                with patch("torch.zeros", return_value=torch.zeros((2, 1), dtype=torch.long)):
-                                    # Mock load_checkpoint
-                                    with patch("src.main.load_checkpoint", return_value=False):
+                    # Mock parse_args
+                    with patch("src.main.parse_args") as mock_parse_args:
+                        mock_args = MockArgs()
+                        mock_args.episodes = 1  # Set to 1 to minimize iterations
+                        mock_args.log_interval = 10  # Set a reasonable log interval
+                        mock_parse_args.return_value = mock_args
+                        
+                        # Create mock models
+                        base_model = MagicMock()
+                        adapter_model = MagicMock()
+                        def _dummy_tokenizer(texts, **kwargs):
+                            batch = len(texts) if isinstance(texts, list) else 1
+                            return type('obj', (object,), {'input_ids': torch.zeros((batch, 1), dtype=torch.long)})
+
+                        tokenizer = MagicMock(side_effect=_dummy_tokenizer)
+                        baseline_model = MagicMock()
+                        
+                        # Setup adapter_model.parameters to return a valid parameter list
+                        mock_param = MagicMock()
+                        # Mock the parameter to have required attributes
+                        mock_param.data = torch.randn(10, 10)
+                        mock_param.requires_grad = True
+                        mock_param.device = torch.device('cuda')
+                        mock_param.grad = None
+                        adapter_model.parameters.return_value = [mock_param]
+                        adapter_model.named_parameters.return_value = [('test_param', mock_param)]
+                        base_model.named_parameters.return_value = [('test_param', mock_param)]
+                        
+                        # Mock necessary return values
+                        mock_setup_logging.return_value = "logs/test"
+                        mock_setup_models.return_value = (base_model, adapter_model, tokenizer)
+                        mock_register_hook.return_value = ({"embeddings": None}, MagicMock())
+                        
+                        # Mock create_model_copy to return the baseline model
+                        mock_create_model_copy.return_value = baseline_model
+                        
+                        # Create a mock key-value pair
+                        mock_kv_pair = MagicMock()
+                        # Give the mock step proper similarity scores to avoid KL computation issues
+                        mock_kv_pair.similarity_scores = torch.randn(2, 5)  # batch_size=2, 5 keys
+                        
+                        # Set up the mock generator that won't exhaust
+                        mock_kv_generator = MockGenerator(mock_kv_pair)
+                        mock_iter_kv_pairs_unified.return_value = mock_kv_generator
+                        
+                        # Build a minimal but valid Trajectory
+                        from src.data import KVPair, QKVSelection
+                        from src.training import Trajectory
+                        from src.config import TOKENS_PER_KEY, TOKENS_PER_VALUE
+
+                        batch_size = 2
+                        device = torch.device('cuda')
+                        num_keys = 5
+                        embedding_dim = 4
+
+                        key_tokens = torch.randint(0,100,(batch_size, TOKENS_PER_KEY), device=device)
+                        value_tokens = torch.randint(0,100,(batch_size, TOKENS_PER_VALUE), device=device)
+                        key_emb = torch.randn(batch_size, embedding_dim, device=device)
+
+                        kvpair = KVPair(
+                            key_tokens=key_tokens,
+                            value_tokens=value_tokens,
+                            key_embedding=key_emb,
+                            key_text=["k1","k2"],
+                            value_text=["v1","v2"]
+                        )
+
+                        similarity_scores = torch.randn(batch_size, num_keys, device=device)
+                        available_mask = torch.zeros(batch_size, num_keys, device=device)
+                        qkv_step = QKVSelection(
+                            data=kvpair,
+                            query_text=["<Q>"]*batch_size,
+                            query_tokens=torch.empty((batch_size,0), dtype=torch.long, device=device),
+                            query_embedding=torch.randn(batch_size, embedding_dim, device=device),
+                            similarity_scores=similarity_scores,
+                            selected_idx=torch.tensor([0,0], device=device),
+                            available_mask=available_mask
+                        )
+
+                        trajectory = Trajectory(
+                            qkv_steps=[qkv_step],
+                            rewards=torch.zeros(batch_size,1, device=device),
+                            avg_reward=torch.tensor([0.5,0.6], device=device),
+                            all_key_embeddings=torch.randn(batch_size, num_keys, embedding_dim, device=device)
+                        )
+
+                        mock_generate_trajectory.return_value = trajectory
+
+                        # Patch generate_query_vector and compute_similarity to lightweight implementations
+                        with patch('src.training.generate_query_vector', return_value=torch.randn(batch_size, embedding_dim)):
+                            with patch('src.embeddings.compute_similarity', return_value=torch.randn(batch_size, num_keys)):
+                                # Proceed to call main
                                         # Mock tqdm properly
-                                        with patch("src.main.tqdm", return_value=mock_progress_bar):
-                                            # Mock next to handle batch key-value pair creation
-                                            with patch("builtins.next", side_effect=lambda gen: mock_kv_pair):
-                                                # Mock LOG_INTERVAL to prevent logging-related issues
-                                                with patch("src.main.LOG_INTERVAL", 10):
-                                                    # Call function
-                                                    main()
+                                            with patch("src.main.tqdm", return_value=mock_progress_bar):
+                                                # Mock next to handle batch key-value pair creation
+                                                with patch("builtins.next", side_effect=lambda gen: mock_kv_pair):
+                                                    # Mock LOG_INTERVAL to prevent logging-related issues
+                                                    with patch("src.main.LOG_INTERVAL", 10):
+                                                        # Call function
+                                                        main()
                 
-                # Check that setup functions were called
-                mock_setup_logging.assert_called_once()
-                mock_setup_models.assert_called_once()
-                # register_embedding_hook is called twice - once for adapter model and once for baseline model
-                assert mock_register_hook.call_count == 2
-                
-                # Check that train_step was called
-                assert mock_train_step.call_count > 0
-                
-                # Check that save_checkpoint was called at least once
-                assert mock_save_checkpoint.call_count > 0
+                    # Check that setup functions were called
+                    mock_setup_logging.assert_called_once()
+                    mock_setup_models.assert_called_once()
+                    # register_embedding_hook is called twice - once for adapter model and once for baseline model
+                    assert mock_register_hook.call_count == 2
+                    
+                    # Check that train_step was called
+                    assert mock_train_step.call_count > 0
+                    
+                    # Check that save_checkpoint was called at least once
+                    assert mock_save_checkpoint.call_count > 0
 
 
 def test_weights_update_with_real_model(gpt2_model, gpt2_tokenizer):
@@ -339,17 +377,24 @@ def test_weights_update_with_real_model(gpt2_model, gpt2_tokenizer):
     qkv_steps = []
     num_keys = 5  # Number of keys available at each step
     for i in range(num_steps):
-        qkv_step = QKVStep(
+        # Create base data first
+        qkv_data = KVPair(
             key_tokens=torch.randint(0, 100, (batch_size, TOKENS_PER_KEY), device=device),
             value_tokens=torch.randint(0, 100, (batch_size, TOKENS_PER_VALUE), device=device),
             key_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=device),
-            key_text=[f"Test key {i}"],
-            value_text=[f"Test value {i}"],
-            query_tokens=torch.tensor([[]], device=device).long(),  # Empty for vector queries
+            key_text=[f"key_{i}" for i in range(batch_size)],
+            value_text=[f"value_{i}" for i in range(batch_size)]
+        )
+        
+        # Create complete step with selection metadata
+        qkv_step = QKVSelection(
+            data=qkv_data,
+            query_text=["<VECTOR_QUERY>"] * batch_size,
+            query_tokens=torch.empty((batch_size, 0), device=device, dtype=torch.long),
             query_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=device),
-            query_text=["<VECTOR_QUERY>"],
-            similarity_scores=torch.randn(batch_size, num_keys, device=device),
-            selected_idx=0
+            similarity_scores=torch.randn(batch_size, 5, device=device),
+            selected_idx=torch.tensor([0] * batch_size, device=device), # Changed to tensor
+            available_mask=torch.zeros(batch_size,5, device=device)  # all keys available in this unit test
         )
         qkv_steps.append(qkv_step)
     
@@ -377,7 +422,7 @@ def test_weights_update_with_real_model(gpt2_model, gpt2_tokenizer):
         mock_kl_loss = torch.tensor([0.03], device=device, requires_grad=True)
         mock_compute_policy_loss.return_value = (mock_total_loss, mock_policy_loss, mock_kl_loss, 75.0)
         
-                    total_loss, policy_loss, kl_loss, avg_clipping_ratio = train_step(
+        total_loss, policy_loss, kl_loss, avg_clipping_ratio = train_step(
             trajectory,
             adapter_model,
             base_model,
@@ -428,15 +473,25 @@ def test_base_model_weights_unchanged(gpt2_model, gpt2_tokenizer):
     # Create a QKVStep with proper tensors
     batch_size = 1
     device = adapter_model.device
-    qkv_step = QKVStep(
+    
+    # Create the base data first
+    qkv_data = KVPair(
         key_tokens=torch.randint(0, 100, (batch_size, TOKENS_PER_KEY), device=device),
         value_tokens=torch.randint(0, 100, (batch_size, TOKENS_PER_VALUE), device=device),
         key_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=device),
         key_text=["Test key"],
-        value_text=["Test value"],
+        value_text=["Test value"]
+    )
+    
+    # Create the complete step
+    qkv_step = QKVSelection(
+        data=qkv_data,
+        query_text=["Test query"],
         query_tokens=torch.randint(0, 100, (batch_size, TOKENS_PER_KEY), device=device),
         query_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=device),
-        query_text=["Test query"]
+        similarity_scores=torch.randn(batch_size, 5, device=device),
+        selected_idx=torch.tensor([0] * batch_size, device=device), # Changed to tensor
+        available_mask=torch.zeros(batch_size,5,device=device)
     )
     
     # Create trajectory with rewards
@@ -444,6 +499,10 @@ def test_base_model_weights_unchanged(gpt2_model, gpt2_tokenizer):
     trajectory = Trajectory(qkv_steps=[qkv_step])
     trajectory.rewards = torch.tensor([[1.0]], device=device)
     trajectory.avg_reward = torch.tensor([1.0], device=device)
+    # Add mandatory all_key_embeddings tensor
+    embed_dim = qkv_step.key_embedding.shape[1]
+    num_keys = qkv_step.similarity_scores.shape[1]
+    trajectory.all_key_embeddings = torch.randn(batch_size, num_keys, embed_dim, device=device)
     
     # Set up reward stats
     reward_stats = {"mean": 0.0, "std": 1.0, "count": 1}
@@ -457,7 +516,8 @@ def test_base_model_weights_unchanged(gpt2_model, gpt2_tokenizer):
         optimizer,
         reward_stats,
         kl_penalty_coef=0.01,
-        verbose=False
+        verbose=False,
+        tokenizer=gpt2_tokenizer
     )
     
     # Verify that the original base model parameters did not change
@@ -731,6 +791,95 @@ def test_twenty_questions_integration_with_trajectory(gpt2_model, gpt2_tokenizer
             assert hasattr(step, 'query_text')  # Query was generated
             assert step.key_text[0].endswith("?"), f"Expected question in trajectory, got: {step.key_text[0]}"
             assert step.value_text[0] in ["YES", "NO"], f"Expected YES/NO in trajectory, got: {step.value_text[0]}"
+            
+    finally:
+        # Clean up hook
+        hook_remover()
+
+
+def test_batched_trajectory_explores_different_orders(gpt2_model, gpt2_tokenizer):
+    """Test that batched trajectory generation explores different orders without duplicates."""
+    from src.main import generate_trajectory
+    from src.embeddings import register_embedding_hook
+    from src.data import KVPair
+    from src.model import apply_lora_adapter
+    from src.config import NUM_KV_PAIRS
+    import torch
+    
+    # Create adapter model
+    adapter_model = apply_lora_adapter(gpt2_model)
+    base_model = gpt2_model
+    
+    # Register embedding hook
+    embeddings_dict, hook_remover = register_embedding_hook(adapter_model)
+    
+    try:
+        # Create controlled test data
+        batch_size = 4
+        device = next(adapter_model.parameters()).device
+        
+        # Create exactly NUM_KV_PAIRS unique KV pairs
+        available_qkv_steps = []
+        for i in range(NUM_KV_PAIRS):
+            kv_pair = KVPair(
+                key_tokens=torch.full((1, 10), i, device=device),  # Unique token pattern
+                value_tokens=torch.full((1, 10), i+100, device=device),
+                key_embedding=torch.full((1, 768), float(i), device=device),  # Unique embedding
+                key_text=[f"test_key_{i}"],
+                value_text=[f"test_value_{i}"]
+            )
+            available_qkv_steps.append(kv_pair)
+        
+        # Create initial context
+        initial_tokens = gpt2_tokenizer(
+            ["Test context " for _ in range(batch_size)],
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False
+        ).input_ids.to(device)
+        
+        # Generate a trajectory
+        trajectory = generate_trajectory(
+            initial_tokens,
+            adapter_model,
+            base_model,
+            gpt2_tokenizer,
+            embeddings_dict,
+            hook_remover,
+            available_qkv_steps.copy(),  # Copy to preserve original
+            batch_size=batch_size,
+            verbose=False,
+        )
+        
+        # Verify trajectory was created
+        assert len(trajectory.qkv_steps) == NUM_KV_PAIRS
+        
+        # Extract selected indices per batch item
+        selected_per_batch = [[] for _ in range(batch_size)]
+        for step in trajectory.qkv_steps:
+            if isinstance(step.selected_idx, torch.Tensor):
+                # New batched mode
+                for b in range(batch_size):
+                    selected_per_batch[b].append(step.selected_idx[b].item())
+            else:
+                # Legacy single selection mode (shouldn't happen with our changes)
+                for b in range(batch_size):
+                    selected_per_batch[b].append(step.selected_idx)
+        
+        # Verify no duplicates per batch item
+        for b in range(batch_size):
+            indices = selected_per_batch[b]
+            assert len(indices) == NUM_KV_PAIRS, f"Batch {b} has {len(indices)} selections, expected {NUM_KV_PAIRS}"
+            assert len(set(indices)) == NUM_KV_PAIRS, f"Batch {b} has duplicates: {indices}"
+            assert set(indices) == set(range(NUM_KV_PAIRS)), f"Batch {b} didn't cover all indices: {indices}"
+        
+        # Verify different orders explored (with high probability)
+        # Since we're using random sampling, not all batches will have different orders,
+        # but at least some should be different
+        unique_orders = set(tuple(order) for order in selected_per_batch)
+        assert len(unique_orders) > 1, f"All batches selected same order: {selected_per_batch}"
+        
+        print(f"✓ Batched trajectory test passed: {len(unique_orders)} unique orders out of {batch_size} batches")
             
     finally:
         # Clean up hook

@@ -341,7 +341,7 @@ def test_sample_key_value_with_masked_keys():
     """Test sampling with unavailable/masked keys"""
     batch_size = 3
     num_keys = 10
-    device = torch.device("cpu")
+    device = torch.device("cuda")
     
     # Create similarity scores with some clearly preferred keys
     similarity_scores = torch.zeros(batch_size, num_keys, device=device) + 0.1

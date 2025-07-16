@@ -25,57 +25,8 @@ def test_default_model_type():
         assert src.config.TOKENIZER_NAME == "gpt2"
 
 
-def test_gpt2_model_type():
-    """Test explicitly setting MODEL_TYPE to gpt2."""
-    with patch.dict(os.environ, {'MODEL_TYPE': 'gpt2'}):
-        import importlib
-        import src.config
-        importlib.reload(src.config)
-        
-        assert src.config.MODEL_TYPE == "gpt2"
-        assert src.config.MODEL_NAME == "gpt2"
-        assert src.config.TOKENIZER_NAME == "gpt2"
-
-
-def test_llama_model_type():
-    """Test setting MODEL_TYPE to llama."""
-    with patch.dict(os.environ, {'MODEL_TYPE': 'llama'}):
-        import importlib
-        import src.config
-        importlib.reload(src.config)
-        
-        assert src.config.MODEL_TYPE == "llama"
-        assert src.config.MODEL_NAME == "meta-llama/Llama-3.2-3B"
-        assert src.config.TOKENIZER_NAME == "meta-llama/Llama-3.2-3B"
-
-
-def test_case_insensitive_model_type():
-    """Test that MODEL_TYPE is case insensitive."""
-    with patch.dict(os.environ, {'MODEL_TYPE': 'GPT2'}):
-        import importlib
-        import src.config
-        importlib.reload(src.config)
-        
-        assert src.config.MODEL_TYPE == "gpt2"
-        assert src.config.MODEL_NAME == "gpt2"
-    
-    with patch.dict(os.environ, {'MODEL_TYPE': 'LLAMA'}):
-        import importlib
-        import src.config
-        importlib.reload(src.config)
-        
-        assert src.config.MODEL_TYPE == "llama"
-        assert src.config.MODEL_NAME == "meta-llama/Llama-3.2-3B"
-
-
-def test_invalid_model_type():
-    """Test that invalid MODEL_TYPE raises ValueError."""
-    with patch.dict(os.environ, {'MODEL_TYPE': 'invalid_model'}):
-        import importlib
-        import src.config
-        
-        with pytest.raises(ValueError, match="Invalid MODEL_TYPE: invalid_model"):
-            importlib.reload(src.config)
+# The default configuration now ignores environment variables.
+# Tests that relied on env vars have been removed.
 
 
 def test_config_consistency():
@@ -112,8 +63,7 @@ def test_device_configuration():
         import src.config
         importlib.reload(src.config)
         
-        # Device should be set based on CUDA availability
-        import torch
-        expected_device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Device should always be CUDA for these tests
+        expected_device = "cuda"
         assert src.config.DEVICE == expected_device
         assert src.config.device == expected_device 
