@@ -79,8 +79,9 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     policy_gradients = get_data('policy_gradients')
     clipping_ratios = get_data('clipping_ratios', 1.0)
     kl_from_ref = get_data('kl_from_ref')
+    batch_selection_entropy = get_data('batch_selection_entropy', 0.0)
     
-    # Create comprehensive figure with 3 rows and 4 columns
+    # Create comprehensive figure with 3 rows and 4 columns (removing 2 redundant plots)
     fig, axes = plt.subplots(3, 4, figsize=(24, 18))
     axes = axes.flatten()
     
@@ -106,7 +107,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         axes[1].plot(training_steps, p(training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
         axes[1].legend(fontsize=8)
     
-    # Plot 3: Log Probabilities
+    # Plot 3: Model Log Probabilities
     axes[2].plot(training_steps, adapter_log_probs, 'darkgreen', label='Adapter Model', linewidth=2)
     axes[2].plot(training_steps, baseline_log_probs, 'orange', label='Baseline Model', linewidth=2)
     axes[2].plot(training_steps, base_log_probs, 'blue', label='Base Model', linewidth=2)
@@ -130,70 +131,45 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         axes[3].plot(training_steps, p(training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
         axes[3].legend(fontsize=8)
     
-    # Plot 5: Trajectory-Level Log Probabilities
-    axes[4].plot(training_steps, trajectory_log_probs, 'darkblue', linewidth=2)
+    # Plot 5: Gradient Norm
+    axes[4].plot(training_steps, gradient_magnitudes, 'red', linewidth=2)
     axes[4].set_xlabel('Training Step')
-    axes[4].set_ylabel('Trajectory Log Prob')
-    axes[4].set_title('Trajectory-Level Log Probabilities')
+    axes[4].set_ylabel('Gradient Norm')
+    axes[4].set_title('Gradient Norm Over Time')
     axes[4].grid(True, alpha=0.3)
-    if len(training_steps) > 10:
-        z = np.polyfit(training_steps, trajectory_log_probs, 1)
-        p = np.poly1d(z)
-        axes[4].plot(training_steps, p(training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
-        axes[4].legend(fontsize=8)
+    axes[4].set_yscale('log')
     
-    # Plot 6: Gradient Norm
-    axes[5].plot(training_steps, gradient_magnitudes, 'red', linewidth=2)
+    # Plot 6: Wikipedia Order Consistency
+    axes[5].plot(training_steps, wikipedia_order_consistency, 'teal', linewidth=2)
+    axes[5].axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='Random (0.5)')
+    axes[5].axhline(y=1.0, color='green', linestyle='--', alpha=0.3, label='Perfect Order (1.0)')
+    axes[5].axhline(y=0.0, color='red', linestyle='--', alpha=0.3, label='Reverse Order (0.0)')
     axes[5].set_xlabel('Training Step')
-    axes[5].set_ylabel('Gradient Norm')
-    axes[5].set_title('Gradient Norm Over Time')
+    axes[5].set_ylabel('Order Consistency')
+    axes[5].set_title('Wikipedia Key Selection Order')
+    axes[5].set_ylim(-0.1, 1.1)
+    axes[5].legend(fontsize=7)
     axes[5].grid(True, alpha=0.3)
-    axes[5].set_yscale('log')
     
-    # Plot 7: Wikipedia Order Consistency
-    axes[6].plot(training_steps, wikipedia_order_consistency, 'teal', linewidth=2)
-    axes[6].axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, label='Random (0.5)')
-    axes[6].axhline(y=1.0, color='green', linestyle='--', alpha=0.3, label='Perfect Order (1.0)')
-    axes[6].axhline(y=0.0, color='red', linestyle='--', alpha=0.3, label='Reverse Order (0.0)')
+    # Plot 7: KL Divergence from Reference
+    axes[6].plot(training_steps, kl_from_ref, 'darkred', linewidth=2)
     axes[6].set_xlabel('Training Step')
-    axes[6].set_ylabel('Order Consistency')
-    axes[6].set_title('Wikipedia Key Selection Order')
-    axes[6].set_ylim(-0.1, 1.1)
-    axes[6].legend(fontsize=7)
+    axes[6].set_ylabel('KL Divergence')
+    axes[6].set_title('KL Divergence from Reference Model (π_ref)')
     axes[6].grid(True, alpha=0.3)
-    
-    # Plot 8: Policy Gradients
-    axes[7].plot(training_steps, policy_gradients, 'darkgreen', linewidth=2)
-    axes[7].axhline(y=0, color='gray', linestyle='-', alpha=0.5)
-    axes[7].set_xlabel('Training Step')
-    axes[7].set_ylabel('Policy Gradient')
-    axes[7].set_title('Policy Gradient (positive = reinforce)')
-    axes[7].grid(True, alpha=0.3)
-    if len(policy_gradients) > 10:
-        mean_grad = np.mean(policy_gradients)
-        axes[7].text(0.02, 0.98, f'Mean: {mean_grad:.4f}', transform=axes[7].transAxes, 
-                    verticalalignment='top', fontsize=8, 
-                    bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
-    
-    # Plot 9: KL Divergence from Reference
-    axes[8].plot(training_steps, kl_from_ref, 'darkred', linewidth=2)
-    axes[8].set_xlabel('Training Step')
-    axes[8].set_ylabel('KL Divergence')
-    axes[8].set_title('KL Divergence from Reference Model (π_ref)')
-    axes[8].grid(True, alpha=0.3)
     if len(kl_from_ref) > 0 and any(kl_from_ref):
         mean_kl = np.mean(kl_from_ref)
-        axes[8].axhline(y=mean_kl, color='gray', linestyle='--', alpha=0.5, label=f'Mean: {mean_kl:.4f}')
-        axes[8].legend(fontsize=8)
+        axes[6].axhline(y=mean_kl, color='gray', linestyle='--', alpha=0.5, label=f'Mean: {mean_kl:.4f}')
+        axes[6].legend(fontsize=8)
     
-    # Plot 10: Reward Variance
-    axes[9].plot(training_steps, reward_variance, 'magenta', linewidth=2)
-    axes[9].set_xlabel('Training Step')
-    axes[9].set_ylabel('Reward Variance')
-    axes[9].set_title('Reward Variance Within Trajectory')
-    axes[9].grid(True, alpha=0.3)
+    # Plot 8: Reward Variance
+    axes[7].plot(training_steps, reward_variance, 'magenta', linewidth=2)
+    axes[7].set_xlabel('Training Step')
+    axes[7].set_ylabel('Reward Variance')
+    axes[7].set_title('Reward Variance Within Trajectory')
+    axes[7].grid(True, alpha=0.3)
     
-    # Plot 11: Step-Indexed Log Probabilities
+    # Plot 9: Step-Indexed Log Probabilities
     if len(step_log_probs) > 0 and any(len(ep) > 0 for ep in step_log_probs):
         # Get NUM_KV_PAIRS from config or infer from data
         NUM_KV_PAIRS = config.get('NUM_KV_PAIRS', 15)
@@ -225,40 +201,58 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
             second_third = compute_avg_for_period(first_third_end, second_third_end)
             third_third = compute_avg_for_period(second_third_end, total_episodes)
             
-            axes[10].plot(step_indices, first_third, 'lightcoral', linewidth=2, marker='o', 
+            axes[8].plot(step_indices, first_third, 'lightcoral', linewidth=2, marker='o', 
                          markersize=3, label=f'Early (eps 0-{first_third_end})', alpha=0.8)
-            axes[10].plot(step_indices, second_third, 'gold', linewidth=2, marker='s', 
+            axes[8].plot(step_indices, second_third, 'gold', linewidth=2, marker='s', 
                          markersize=3, label=f'Mid (eps {first_third_end}-{second_third_end})', alpha=0.8)
-            axes[10].plot(step_indices, third_third, 'mediumseagreen', linewidth=2, marker='^', 
+            axes[8].plot(step_indices, third_third, 'mediumseagreen', linewidth=2, marker='^', 
                          markersize=3, label=f'Late (eps {second_third_end}+)', alpha=0.8)
-            axes[10].legend(fontsize=7)
+            axes[8].legend(fontsize=7)
         else:
             overall_avg = compute_avg_for_period(0, total_episodes)
-            axes[10].plot(step_indices, overall_avg, 'darkviolet', linewidth=2, marker='o', 
+            axes[8].plot(step_indices, overall_avg, 'darkviolet', linewidth=2, marker='o', 
                          markersize=4, label='Overall Average')
-            axes[10].legend(fontsize=8)
+            axes[8].legend(fontsize=8)
         
-        axes[10].set_xlabel('Step Index')
-        axes[10].set_ylabel('Avg Log Prob of Selected Action')
-        axes[10].set_title('Log Prob by Step Index (training progression)')
-        axes[10].grid(True, alpha=0.3)
-        axes[10].set_xticks(step_indices)
+        axes[8].set_xlabel('Step Index')
+        axes[8].set_ylabel('Avg Log Prob of Selected Action')
+        axes[8].set_title('Log Prob by Step Index (training progression)')
+        axes[8].grid(True, alpha=0.3)
+        axes[8].set_xticks(step_indices)
     else:
-        axes[10].text(0.5, 0.5, 'No step log prob data\navailable yet', 
-                     ha='center', va='center', transform=axes[10].transAxes, fontsize=10)
-        axes[10].set_title('Log Prob by Step Index')
+        axes[8].text(0.5, 0.5, 'No step log prob data\navailable yet', 
+                     ha='center', va='center', transform=axes[8].transAxes, fontsize=10)
+        axes[8].set_title('Log Prob by Step Index')
     
-    # Plot 12: PPO Clipping Ratio
-    axes[11].plot(training_steps, clipping_ratios, 'navy', linewidth=2)
-    axes[11].axhline(y=0.8, color='red', linestyle='--', alpha=0.5, label='Lower clip (0.8)')
-    axes[11].axhline(y=1.2, color='red', linestyle='--', alpha=0.5, label='Upper clip (1.2)')
-    axes[11].axhline(y=1.0, color='gray', linestyle='-', alpha=0.3, label='No change (1.0)')
+    # Plot 10: PPO Clipping Ratio
+    axes[9].plot(training_steps, clipping_ratios, 'navy', linewidth=2)
+    axes[9].axhline(y=0.8, color='red', linestyle='--', alpha=0.5, label='Lower clip (0.8)')
+    axes[9].axhline(y=1.2, color='red', linestyle='--', alpha=0.5, label='Upper clip (1.2)')
+    axes[9].axhline(y=1.0, color='gray', linestyle='-', alpha=0.3, label='No change (1.0)')
+    axes[9].set_xlabel('Training Step')
+    axes[9].set_ylabel('Average Clipping Ratio')
+    axes[9].set_title('PPO Clipping Ratio (π_θ / π_old)')
+    axes[9].legend(fontsize=7)
+    axes[9].grid(True, alpha=0.3)
+    axes[9].set_ylim(0.5, 1.5)
+    
+    # Plot 11: KL Loss Raw Values
+    axes[10].plot(training_steps, kl_losses, 'coral', linewidth=2)
+    axes[10].set_xlabel('Training Step')
+    axes[10].set_ylabel('KL Loss')
+    axes[10].set_title('KL Loss (Raw)')
+    axes[10].grid(True, alpha=0.3)
+    
+    # Plot 12: Batch Selection Entropy
+    axes[11].plot(training_steps, batch_selection_entropy, 'darkviolet', linewidth=2)
+    axes[11].axhline(y=0.0, color='red', linestyle='--', alpha=0.5, label='Identical selections')
+    axes[11].axhline(y=1.0, color='green', linestyle='--', alpha=0.5, label='Maximum diversity')
     axes[11].set_xlabel('Training Step')
-    axes[11].set_ylabel('Average Clipping Ratio')
-    axes[11].set_title('PPO Clipping Ratio (π_θ / π_old)')
+    axes[11].set_ylabel('Normalized Entropy')
+    axes[11].set_title('Batch Selection Entropy (Diversity of Key Orders)')
+    axes[11].set_ylim(-0.1, 1.1)
     axes[11].legend(fontsize=7)
     axes[11].grid(True, alpha=0.3)
-    axes[11].set_ylim(0.5, 1.5)
     
     # Adjust layout
     plt.tight_layout(pad=2.0)
