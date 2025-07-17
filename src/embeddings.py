@@ -301,11 +301,25 @@ def compute_similarity(
     Returns:
         Similarity scores as probabilities [batch, num_keys]
     """
+    # ---- DEBUG PRINT ----
+    # Print the shapes only once to avoid excessive logging
+    if not hasattr(compute_similarity, "_dbg_printed"):
+        print("[DEBUG] compute_similarity called")
+        print(f"         query_embeddings shape: {query_embeddings.shape}")
+        print(f"         key_embeddings  shape: {key_embeddings.shape}")
+        # We will fill in num_heads etc. after they are computed below
+        compute_similarity._dbg_printed = True
+    
     batch_size = query_embeddings.shape[0]
     num_keys = key_embeddings.shape[1]
     
     # Get attention parameters
     num_heads, num_groups, head_dim = get_attention_params(model)
+
+    # Complete the debug print once (num_heads etc.)
+    if getattr(compute_similarity, "_dbg_printed", False) and not getattr(compute_similarity, "_dbg_completed", False):
+        print(f"         num_heads={num_heads}, num_groups={num_groups}, head_dim={head_dim}")
+        compute_similarity._dbg_completed = True
     
     # Ensure tensors are in float32 for computation (einsum doesn't handle bfloat16 well)
     query_embeddings = query_embeddings.float()
