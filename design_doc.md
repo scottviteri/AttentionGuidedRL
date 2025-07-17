@@ -29,7 +29,7 @@ This project presents a reinforcement learning (RL)-based active learning framew
 - **Base Language Model:**  
   - *Model:* Llama-3.2-3B (base version, not fine-tuned).  
   - *Role:* Generates queries and predicts values for text completion.  
-  - *Training:* Adapted using Low-Rank Adaptation (LoRA) with standard parameters (rank=8, alpha=16, dropout=0.05), with gradients enabled only for the adapter.  
+  - *Training:* Adapted using Low-Rank Adaptation (LoRA) with standard parameters (rank=8, alpha=16, dropout=0.0), with gradients enabled only for the adapter. Dropout is disabled to avoid non-deterministic behavior during inference, as randomness is already introduced through the sampling process.  
   - *Clarification:* The configuration for grouped query attention (e.g., number of query heads, key-value groups, head dimension) can be inferred from the model using attributes such as `first_layer.self_attn.k_proj` and `first_layer.self_attn.q_proj`.
 
 - **Key–Value Memory Database:**  
@@ -60,7 +60,7 @@ This project presents a reinforcement learning (RL)-based active learning framew
    - Load Llama-3.2-3B in `bfloat16` on CUDA (or CPU if unavailable).  
    - Load Wikipedia articles using a functional iterator-based dataloader, filtering articles with fewer than `tokens_per_kv_pair * num_kv_pairs` tokens.  
    - Pre-compute key embeddings from the data source.  
-   - Initialize the RL policy with a LoRA adapter (rank=8, alpha=16, dropout=0.05).  
+   - Initialize the RL policy with a LoRA adapter (rank=8, alpha=16, dropout=0.0).  
    - Use the first 15 trajectories as a warm-up to establish reward statistics.
    - Set learning rate for the BitsAndBytes 8-bit Adam optimizer to 2e-4.
 
@@ -350,7 +350,7 @@ The key advantage of this batched approach is that it minimizes sequential proce
 
 ### 4.6. Model Management with LoRA
 
-- Use a single LoRA adapter with standard parameters (rank=8, alpha=16, dropout=0.05); save its state as the "previous model" before each update using a straightforward copy (e.g., `copy.deepcopy(model.lora_params)`).  
+- Use a single LoRA adapter with standard parameters (rank=8, alpha=16, dropout=0.0); save its state as the "previous model" before each update using a straightforward copy (e.g., `copy.deepcopy(model.lora_params)`).  
 - Use the base model (no adapter) for reward normalization.
 
 ### 4.7. Testing and Incremental Development

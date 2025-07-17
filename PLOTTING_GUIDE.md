@@ -10,6 +10,7 @@ The AttentionGuidedRL project includes a comprehensive plotting system that trac
 - **NEW**: Uses clean `PlotData` dataclass structure and single pickle file approach
 - Plots are automatically saved every 15 episodes and at the end of training
 - Data is saved to `logs/<timestamp>/plots/plot_data.pkl` (single file, overwrites)
+- **NEW**: Text-based analysis automatically generated alongside plots for LM consumption
 - **Key improvements**: Type-safe data structure, functional updates, no global variables
 
 ### 2. Metrics Tracked (20+ metrics)
@@ -70,9 +71,50 @@ python generate_plots.py data.pkl --output-dir custom_plots/
 python generate_plots.py data.pkl --kl-coef 0.05
 ```
 
+### 5. Text Analysis Generation (NEW)
+
+Use `generate_text_analysis.py` to generate LM-friendly analysis from saved data:
+
+```bash
+# Basic usage - saves analysis in same directory as pickle file
+python generate_text_analysis.py logs/20250717-155819/plots/plot_data.pkl
+
+# Specify output directory  
+python generate_text_analysis.py data.pkl --output-dir analysis_results/
+```
+
+This generates:
+- `plot_data_analysis.txt`: Human-readable training analysis report
+- `plot_data_analysis.json`: Structured data for programmatic consumption
+
+#### Text Analysis Features
+
+The text analysis provides comprehensive insights optimized for language model consumption:
+
+**Human-Readable Report (`_analysis.txt`):**
+- Overall learning health status and score (0-100)
+- Step-level learning signal analysis (advantage distribution patterns)
+- Query-key similarity evolution and discrimination ability
+- Training phase detection with performance summaries
+- Trend analysis with statistical significance
+- Configuration highlights and data summary
+
+**Structured JSON (`_analysis.json`):**
+- Programmatic access to all analysis metrics
+- Trend statistics (slope, R², mean, std, min, max)
+- Learning health components with boolean flags
+- Recent metrics for real-time monitoring
+- Training phase breakdowns with episode ranges
+
+**Key Metrics Analyzed:**
+- **Learning Health**: Composite score based on reward trends, advantage positivity, loss stability, and gradient health
+- **Step-Level Learning**: Positive advantage percentage, learning signal strength, consistency
+- **Similarity Analysis**: Query discrimination ability, specificity, entropy evolution
+- **Training Phases**: Automatic detection of performance phases around baseline updates
+
 **Note**: No backward compatibility - pickle files must contain all enhanced debugging metrics. Older pickle files from before the plotting improvements will not work.
 
-### 5. Custom Plotting
+### 6. Custom Plotting
 
 Use `custom_plot_example.py` as a template for creating custom visualizations:
 

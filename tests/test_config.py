@@ -14,10 +14,9 @@ def test_default_model_configuration():
 
 
 def test_device_configuration():
-    """Test that the device is correctly configured."""
-    assert DEVICE is not None
-    assert isinstance(DEVICE, str)
-    assert DEVICE in ['cuda', 'cpu', 'mps'] 
+    """Test that DEVICE is properly configured for CUDA."""
+    # CUDA is now a hard requirement, so DEVICE should be 'cuda'
+    assert DEVICE == 'cuda', f"Expected DEVICE to be 'cuda' but got '{DEVICE}'. This project requires CUDA."
 
 
 def test_token_configuration_consistency():

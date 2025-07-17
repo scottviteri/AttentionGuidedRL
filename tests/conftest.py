@@ -1,75 +1,99 @@
 # tests/conftest.py
 import pytest
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaConfig, LlamaForCausalLM
+import numpy as np
+from unittest.mock import MagicMock
 
-@pytest.fixture(scope="session")
-def gpt2_model():
-    """Load a GPT-2 model for testing."""
-    # Use the standard GPT-2 (small) model
-    model = AutoModelForCausalLM.from_pretrained("gpt2")
-    # Always use GPU for tests to match project preference
+# Assuming CUDA is available as an explicit requirement
+device = torch.device("cuda")
+
+
+@pytest.fixture
+def mock_tokenizer():
+    """Mock tokenizer for testing."""
+    tokenizer = MagicMock()
+    
+    # Set up the tokenizer to return realistic tokens
+    # We'll use a fixed vocab size for consistency
+    tokenizer.vocab_size = 50257  # GPT-2 vocab size
+    
+    # Mock the __call__ method to return input_ids
+    def mock_call(*args, **kwargs):
+        if isinstance(args[0], list):
+            # Handle batch of strings
+            batch_size = len(args[0])
+            # Return a mock object with input_ids
+            result = MagicMock()
+            result.input_ids = torch.randint(0, tokenizer.vocab_size, (batch_size, 10))
+            return result
+        else:
+            # Handle single string
+            result = MagicMock()
+            result.input_ids = torch.randint(0, tokenizer.vocab_size, (1, 10))
+            return result
+    
+    tokenizer.side_effect = mock_call
+    tokenizer.__call__ = mock_call
+    
+    # Mock batch_decode to return list of strings
+    tokenizer.batch_decode.return_value = ["mock decoded text"] * 10
+    
+    # Mock individual token properties
+    tokenizer.eos_token_id = 50256
+    tokenizer.pad_token_id = 50256
+    tokenizer.unk_token_id = 50256
+    
+    return tokenizer
+
+
+@pytest.fixture  
+def mock_gpt2_model():
+    """Create a minimal mock GPT-2 model for testing."""
+    model = MagicMock()
+    
+    # Mock the config
+    model.config = MagicMock()
+    model.config.n_embd = 768  # GPT-2 embedding dimension
+    model.config.vocab_size = 50257
+    model.config.n_layer = 12
+    model.config.n_head = 12
+    
+    # Mock device properties - assume CUDA is available
     device = torch.device("cuda")
-    model = model.to(device)
-    # Enable evaluation mode
-    model.eval()
-    return model
-
-@pytest.fixture(scope="session")
-def gpt2_tokenizer():
-    """Load the GPT-2 tokenizer for testing."""
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    # Set padding token to be the same as the EOS token
-    tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer
-
-@pytest.fixture(scope="session")
-def tiny_llama_model():
-    """Create a tiny Llama model for testing GQA functionality.
     
-    This creates a minimal Llama model with:
-    - 2 layers (instead of 32+)
-    - 128 hidden size (instead of 4096+)
-    - 4 attention heads
-    - 2 KV heads (for GQA testing)
-    - Small vocabulary
+    def mock_parameters():
+        # Return a mock parameter on the correct device
+        param = torch.randn(10, 10, device=device, requires_grad=True)
+        yield param
     
-    This allows us to test Llama-specific GQA functionality without
-    the computational burden of a full model.
-    """
-    config = LlamaConfig(
-        vocab_size=1000,        # Tiny vocabulary
-        hidden_size=128,        # Small hidden size
-        intermediate_size=256,  # Small intermediate size
-        num_hidden_layers=2,    # Just 2 layers
-        num_attention_heads=4,  # 4 query heads
-        num_key_value_heads=2,  # 2 KV heads (GQA with 2:1 ratio)
-        max_position_embeddings=512,
-        rms_norm_eps=1e-5,
-        # Disable caching for testing
-        use_cache=False,
-    )
+    model.parameters.return_value = mock_parameters()
     
-    # Create model from config
-    model = LlamaForCausalLM(config)
+    def mock_next_parameters():
+        param = torch.randn(10, 10, device=device, requires_grad=True) 
+        return param
+        
+    # Mock the __next__ method for next(model.parameters())
+    model.__next__ = mock_next_parameters
     
-    # Move to GPU
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    model.eval()
+    # Mock the forward pass
+    def mock_forward(*args, **kwargs):
+        batch_size = args[0].size(0) if len(args) > 0 else 1
+        seq_len = args[0].size(1) if len(args) > 0 else 10
+        
+        # Create mock output
+        mock_output = MagicMock()
+        mock_output.logits = torch.randn(batch_size, seq_len, model.config.vocab_size, device=device)
+        mock_output.last_hidden_state = torch.randn(batch_size, seq_len, model.config.n_embd, device=device)
+        
+        return mock_output
     
-    # Initialize weights to small random values for stable testing
-    for param in model.parameters():
-        param.data.normal_(mean=0.0, std=0.02)
+    model.forward = mock_forward
+    model.__call__ = mock_forward
+    
+    # Mock other methods
+    model.eval.return_value = model
+    model.train.return_value = model
+    model.to.return_value = model
+    model.cuda.return_value = model
     
     return model
-
-@pytest.fixture(scope="session")
-def tiny_llama_tokenizer():
-    """Create a simple tokenizer for the tiny Llama model."""
-    # We can reuse GPT2 tokenizer for simplicity, just need to adjust vocab size
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
-    # Note: In real use, the tokenizer vocab should match model vocab,
-    # but for testing embedding extraction this mismatch is acceptable
-    return tokenizer

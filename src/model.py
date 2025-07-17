@@ -7,7 +7,8 @@ Contains functions for loading language models and applying LoRA for efficient t
 import os
 import copy
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.utils.quantization_config import BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model
 import logging
 
@@ -33,20 +34,18 @@ def load_base_model():
         The loaded language model
     """
     # Configure quantization for reduced memory usage
-    quantization_config = None
-    
-    if torch.cuda.is_available():
-        # Use 8-bit quantization if CUDA is available
-        quantization_config = BitsAndBytesConfig(
-            load_in_8bit=True,
-            llm_int8_threshold=6.0,
-            llm_int8_has_fp16_weight=False,
-        )
+    # Assumes CUDA is available as an explicit dependency
+    quantization_config = BitsAndBytesConfig(
+        load_in_8bit=True,
+        llm_int8_threshold=6.0,
+        llm_int8_has_fp16_weight=False,
+    )
     
     # Load the model with appropriate configurations
+    # Assumes CUDA is available as an explicit dependency
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        device_map=DEVICE if torch.cuda.is_available() else None,
+        device_map=DEVICE,
         torch_dtype=DTYPE,
         quantization_config=quantization_config,
     )
@@ -102,15 +101,8 @@ def apply_lora_adapter(model):
     # Apply LoRA adapter to the copy
     model_copy = get_peft_model(model_copy, lora_config)
     
-    # Initialize lora_B weights with random values since default "gaussian" only initializes lora_A
-    # This ensures both parts of the LoRA decomposition are randomly initialized
-    with torch.no_grad():
-        for name, module in model_copy.named_modules():
-            if hasattr(module, 'lora_B'):
-                # Access all lora_B weights in the module
-                for key in module.lora_B.keys():
-                    # Initialize with small random values (scaled by 0.01)
-                    module.lora_B[key].weight.normal_(mean=0.0, std=0.01)
+    # Note: LoRA weights are automatically initialized by PEFT's "gaussian" setting
+    # No manual initialization needed - PEFT handles this correctly
     
     return model_copy
 
@@ -153,6 +145,50 @@ def create_model_copy(model):
         A copy of the model with the same parameters
     """
     return copy.deepcopy(model)
+
+def update_model_ema(target_model: torch.nn.Module, source_model: torch.nn.Module, decay: float = 0.95) -> None:
+    """
+    Update target_model parameters using exponential moving average from source_model.
+    
+    This provides smooth parameter updates instead of hard replacements, reducing training spikiness.
+    Handles quantized parameters properly by only updating floating-point parameters.
+    
+    Args:
+        target_model: Model to update (old_model/baseline)
+        source_model: Model to copy from (current adapter_model)
+        decay: EMA decay factor (0.9-0.99 typical, higher = smoother)
+               target = decay * target + (1 - decay) * source
+    """
+    import logging
+    
+    updated_count = 0
+    skipped_count = 0
+    
+    with torch.no_grad():
+        for (target_name, target_param), (source_name, source_param) in zip(
+            target_model.named_parameters(), source_model.named_parameters()
+        ):
+            # Skip quantized parameters - they need special handling
+            is_quantized_param = (
+                hasattr(target_param, 'quant_state') or 
+                hasattr(source_param, 'quant_state') or
+                'Int8Params' in str(type(target_param)) or
+                'Params4bit' in str(type(target_param))
+            )
+            
+            if is_quantized_param:
+                skipped_count += 1
+                continue
+            
+            # Only update floating-point parameters to avoid dtype casting errors
+            if target_param.dtype.is_floating_point and source_param.dtype.is_floating_point:
+                target_param.data.mul_(decay).add_(source_param.data, alpha=1 - decay)
+                updated_count += 1
+            else:
+                skipped_count += 1
+    
+    logging.debug(f"EMA update: {updated_count} parameters updated, {skipped_count} skipped")
+
 
 def setup_model_and_tokenizer():
     """

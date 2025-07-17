@@ -16,27 +16,37 @@ Key features:
 
 ## Requirements
 
+**⚠️ CUDA GPU Required**: This project requires a CUDA-compatible GPU and does not support CPU-only execution.
+
 - Python 3.8+
-- PyTorch 2.0+
-- Transformers 4.35+
+- CUDA-compatible GPU with CUDA 11.8+ or 12.x
+- PyTorch 2.0+ (CUDA-enabled)
+- Transformers 4.45+ (required for proper quantization support)
 - PEFT (Parameter-Efficient Fine-Tuning) 0.4+
 - Datasets 2.13+
 - tqdm
+- bitsandbytes 0.40+ (for 8-bit quantization, requires CUDA)
+- accelerate 0.22+ (for device management)
 
 ## Setup
 
-1. Clone the repository:
+1. **Verify CUDA availability:**
+```bash
+python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}, Device count: {torch.cuda.device_count()}')"
+```
+
+2. Clone the repository:
 ```bash
 git clone https://github.com/yourusername/attention-guided-rl.git
 cd attention-guided-rl
 ```
 
-2. Install the dependencies:
+3. Install the dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Run the tests to ensure everything is set up correctly:
+4. Run the tests to ensure everything is set up correctly:
 ```bash
 python -m pytest
 ```
@@ -201,10 +211,11 @@ The model is saved periodically (every 100 episodes by default) and at the end o
 
 ### Automatic Plot Data Saving
 
-**NEW**: The training now automatically saves all plotting data to pickle files, allowing you to regenerate plots or create custom visualizations without re-running training.
+**NEW**: The training now automatically saves all plotting data to pickle files, allowing you to regenerate plots or create custom visualizations without re-running training. Additionally, text-based analysis optimized for LM consumption is automatically generated alongside plots.
 
 During training, plot data is saved:
 - Every 15 episodes and at end of training: `logs/<timestamp>/plots/plot_data.pkl` (overwrites previous)
+- Text analysis: `plot_data_analysis.txt` and `plot_data_analysis.json` (automatically generated)
 
 **Note**: Now uses clean `PlotData` dataclass structure with single file approach. No backward compatibility with older pickle files.
 
@@ -222,6 +233,22 @@ python generate_plots.py logs/*/plots/plot_data_episode_100.pkl -o custom_plots/
 # Override configuration for labels
 python generate_plots.py data.pkl --kl-coef 0.2
 ```
+
+### Text Analysis Generation
+
+Generate LM-friendly analysis from saved plot data:
+
+```bash
+# Generate text analysis from latest run
+python generate_text_analysis.py logs/*/plots/plot_data.pkl
+
+# Generate analysis with custom output directory
+python generate_text_analysis.py data.pkl --output-dir analysis_results/
+```
+
+This creates two files optimized for language model consumption:
+- `plot_data_analysis.txt`: Human-readable training report with learning health overview
+- `plot_data_analysis.json`: Structured data for programmatic analysis
 
 ### Creating Custom Plots
 

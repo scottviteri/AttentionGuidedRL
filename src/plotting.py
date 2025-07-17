@@ -256,6 +256,7 @@ class PlotData:
 def save_plot_data(plot_data: PlotData, log_dir: str) -> None:
     """
     Save plotting data to a single pickle file using atomic writes to prevent corruption.
+    Also generates text-based analysis for LM consumption.
     
     Args:
         plot_data: PlotData instance containing all metrics
@@ -276,7 +277,8 @@ def save_plot_data(plot_data: PlotData, log_dir: str) -> None:
     # Write to temporary file first
     with tempfile.NamedTemporaryFile(mode='wb', dir=plots_dir, delete=False) as tmp_file:
         try:
-            pickle.dump(plot_data.to_dict(), tmp_file)
+            plot_data_dict = plot_data.to_dict()
+            pickle.dump(plot_data_dict, tmp_file)
             tmp_file.flush()  # Ensure data is written to disk
             os.fsync(tmp_file.fileno())  # Force write to storage
             temp_filename = tmp_file.name
@@ -298,6 +300,16 @@ def save_plot_data(plot_data: PlotData, log_dir: str) -> None:
         except:
             pass
         raise e
+    
+    # Generate text analysis for LM consumption
+    try:
+        from src.text_analysis import save_text_analysis
+        text_path, json_path = save_text_analysis(filename, plots_dir)
+        print(f"Generated text analysis: {os.path.basename(text_path)}")
+        print(f"Generated JSON analysis: {os.path.basename(json_path)}")
+    except Exception as e:
+        print(f"Warning: Failed to generate text analysis: {e}")
+        # Don't fail the main saving process if text analysis fails
 
 
 def load_plot_data(filepath: str) -> PlotData:

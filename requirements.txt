@@ -1,12 +1,13 @@
-torch>=2.0.0  # Includes einsum functionality used in embeddings.py
-transformers>=4.35.0
+# CUDA-enabled PyTorch is required - this project assumes GPU availability
+torch>=2.0.0+cu118  # CUDA-enabled PyTorch (adjust CUDA version as needed)
+transformers>=4.45.0  # Recent version with correct BitsAndBytesConfig import
 datasets>=2.13.0
 peft>=0.4.0
 tqdm>=4.66.0
 numpy>=1.24.0
 pytest>=7.0.0
-bitsandbytes>=0.40.0
-accelerate>=0.22.0
+bitsandbytes>=0.40.0  # Requires CUDA for quantization
+accelerate>=0.22.0  # For device management
 scipy>=1.10.0
 matplotlib>=3.7.0
 pandas>=2.0.0

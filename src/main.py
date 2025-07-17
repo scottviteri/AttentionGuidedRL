@@ -15,7 +15,7 @@ from collections import Counter
 import torch.nn.functional as F
 from tqdm import tqdm
 from datetime import datetime
-from typing import List, Any
+from typing import List, Any, Iterator
 import sys
 
 from src.config import (
@@ -35,8 +35,10 @@ from src.config import (
     BASELINE_UPDATE_FREQUENCY,
     SUBTRACT_BASE_MODEL_LOGPROBS,
     TEMPERATURE,
+    EMA_DECAY,
+    USE_EMA_BASELINE,
 )
-from src.model import setup_model_and_tokenizer, save_checkpoint, load_checkpoint, create_model_copy, get_checkpoint_path
+from src.model import setup_model_and_tokenizer, save_checkpoint, load_checkpoint, create_model_copy, get_checkpoint_path, update_model_ema
 from src.data import KVPair, QKVSelection
 from src.embeddings import register_embedding_hook, compute_similarity, sample_key_value, extract_embeddings
 from src.training import (
@@ -274,6 +276,8 @@ def parse_args():
     parser.add_argument('--baseline-update-freq', type=int, default=10, help='How often to update baseline model (episodes)')
     parser.add_argument('--subtract-base-logprobs', action='store_true', default=False, help='Subtract base model logprobs in reward computation')
     parser.add_argument('--debug-generators', action='store_true', default=False, help='Enable detailed debugging of generator pipelines')
+    parser.add_argument('--ema-decay', type=float, default=0.05, help='EMA decay for smooth baseline updates (0.01-0.1, higher=smoother)')
+    parser.add_argument('--use-ema-baseline', action='store_true', default=True, help='Use EMA baseline updates instead of hard updates (reduces spikes)')
     
     return parser.parse_args()
 
@@ -575,7 +579,7 @@ def compute_kl_from_reference(
         ref_log_probs = F.log_softmax(ref_sims / TEMPERATURE, dim=-1)
 
         # 3) KL(adapter || ref) in log-space.  "log_target=True" expects both inputs are log-probs.
-        kl_step = F.kl_div(ref_log_probs, adapter_log_probs, reduction="batchmean", log_target=True)
+        kl_step = F.kl_div(adapter_log_probs, ref_log_probs, reduction="batchmean", log_target=True)
         kl_vals.append(kl_step.item())
 
         # 4) Advance context for next timestep
@@ -648,6 +652,8 @@ def main():
     config.PPO_CLIP_EPSILON = args.ppo_clip_epsilon
     config.BASELINE_UPDATE_FREQUENCY = args.baseline_update_freq
     config.SUBTRACT_BASE_MODEL_LOGPROBS = args.subtract_base_logprobs
+    config.EMA_DECAY = args.ema_decay
+    config.USE_EMA_BASELINE = args.use_ema_baseline
     
     # Separate hooks: one for query (train-time) and one for key (data loading)
     query_embeddings_dict, query_hook_remover = register_embedding_hook(adapter_model, embed_type="query")
@@ -710,8 +716,10 @@ def main():
             debug_stream,
             count_stream,
             time_stream,
-            peek_stream
+            peek_stream,
+            KVPair
         )
+        from typing import Iterator, cast
         
         # Determine if we're using GRPO-style batching
         use_grpo_batching = args.grpo_batching
@@ -719,7 +727,7 @@ def main():
         if use_grpo_batching:
             # GRPO approach: repeat each data point batch_size times
             # This creates a batch where each unique item appears multiple times
-            base_iterator = iter_key_value_pairs_unified_with_tokenizer(
+            base_iterator: Iterator[KVPair] = iter_key_value_pairs_unified_with_tokenizer(
                 dataset_name=args.dataset,
                 batch_size=1,  # Generate single items
                 tokenizer=tokenizer,
@@ -729,15 +737,15 @@ def main():
             # Add debugging if requested
             if args.debug_generators:
                 logging.info("Debug mode enabled for generators")
-                base_iterator = peek_stream(base_iterator, peek_count=1)
-                base_iterator = debug_stream(base_iterator, "unique_kv_pairs", max_items=2)
-                base_iterator = time_stream(base_iterator, "kv_generation")
+                base_iterator = cast(Iterator[KVPair], peek_stream(base_iterator, peek_count=1))
+                base_iterator = cast(Iterator[KVPair], debug_stream(base_iterator, "unique_kv_pairs", max_items=2))
+                base_iterator = cast(Iterator[KVPair], time_stream(base_iterator, "kv_generation"))
                 
             # Repeat each item batch_size times for GRPO-style batching
-            kv_pair_generator = repeat_n_times(args.batch_size, base_iterator)
+            kv_pair_generator: Iterator[KVPair] = cast(Iterator[KVPair], repeat_n_times(args.batch_size, base_iterator))
             
             if args.debug_generators:
-                kv_pair_generator = debug_stream(kv_pair_generator, "repeated_kv_pairs", max_items=args.batch_size + 1)
+                kv_pair_generator = cast(Iterator[KVPair], debug_stream(kv_pair_generator, "repeated_kv_pairs", max_items=args.batch_size + 1))
         else:
             # Standard approach: different items in each batch position
             kv_pair_generator = iter_key_value_pairs_unified_with_tokenizer(
@@ -750,9 +758,9 @@ def main():
             # Add debugging if requested
             if args.debug_generators:
                 logging.info("Debug mode enabled for generators")
-                kv_pair_generator = peek_stream(kv_pair_generator, peek_count=1)
-                kv_pair_generator = debug_stream(kv_pair_generator, "standard_kv_pairs", max_items=2)
-                kv_pair_generator = time_stream(kv_pair_generator, "kv_generation")
+                kv_pair_generator = cast(Iterator[KVPair], peek_stream(kv_pair_generator, peek_count=1))
+                kv_pair_generator = cast(Iterator[KVPair], debug_stream(kv_pair_generator, "standard_kv_pairs", max_items=2))
+                kv_pair_generator = cast(Iterator[KVPair], time_stream(kv_pair_generator, "kv_generation"))
         
         # Get reference to the base model (pi_ref)
         ref_model = base_model
@@ -765,6 +773,12 @@ def main():
         logging.info(f"- GRPO batching: {'Enabled' if use_grpo_batching else 'Disabled'}")
         # No separate previous_model - use old_model for KL computation
         logging.info(f"Old model will be updated every {BASELINE_UPDATE_FREQUENCY} episodes")
+        
+        # Log baseline update method
+        if USE_EMA_BASELINE:
+            logging.info(f"✅ Using EMA baseline updates (decay={EMA_DECAY:.3f}) - eliminates spikes")
+        else:
+            logging.info(f"⚠️  Using HARD baseline updates - may cause training spikes every {BASELINE_UPDATE_FREQUENCY} episodes")
         
         # Function to compute gradient statistics
         def get_gradient_stats(model):
@@ -1099,17 +1113,24 @@ def main():
                 f"Reward: {avg_reward:.4f}"
             )
             
-            # Update old_model at configurable frequency
-            if (episode + 1) % BASELINE_UPDATE_FREQUENCY == 0:
-                # Update the old_model to reflect learning progress
-                old_model = create_model_copy(adapter_model)
-                
-                # Re-register the embedding hook for the new old_model (for KEY embeddings)
-                old_hook_remover()  # Remove old hook
-                old_embeddings_dict, old_hook_remover = register_embedding_hook(old_model, embed_type="key")
-                
-                # NO need to recreate kv_pair_generator; embeddings will be recomputed on-the-fly
-                logging.info("Old_model updated; KV generator preserved to avoid data repetition")
+            # Update old_model using either EMA (smooth) or hard updates (legacy)
+            if USE_EMA_BASELINE:
+                # Smooth EMA update every episode - eliminates spikes
+                update_model_ema(old_model, adapter_model, decay=EMA_DECAY)
+                if episode % BASELINE_UPDATE_FREQUENCY == 0:
+                    logging.info(f"EMA baseline update (decay={EMA_DECAY:.3f}) - smooth, no spikes")
+            else:
+                # Legacy hard update at intervals - causes spikes
+                if (episode + 1) % BASELINE_UPDATE_FREQUENCY == 0:
+                    # Update the old_model to reflect learning progress
+                    old_model = create_model_copy(adapter_model)
+                    
+                    # Re-register the embedding hook for the new old_model (for KEY embeddings)
+                    old_hook_remover()  # Remove old hook
+                    old_embeddings_dict, old_hook_remover = register_embedding_hook(old_model, embed_type="key")
+                    
+                    # NO need to recreate kv_pair_generator; embeddings will be recomputed on-the-fly
+                    logging.info("Old_model updated; KV generator preserved to avoid data repetition")
             
             # Periodically verify weight changes (every 5 episodes) – check LoRA params correctly
             if (episode + 1) % 5 == 0:

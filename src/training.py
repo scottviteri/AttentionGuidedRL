@@ -541,7 +541,7 @@ def compute_policy_loss(
         old_action_log_probs = old_log_probs_full[torch.arange(batch_size, device=device), selected_idx]
 
         # Compute KL divergence between current and old policies over available keys (masked)
-        kl_step = F.kl_div(old_log_probs_full, current_log_probs_full, reduction="batchmean", log_target=True)
+        kl_step = F.kl_div(current_log_probs_full, old_log_probs_full, reduction="batchmean", log_target=True)
 
         step_advantages = advantages[:, t].to(device)
 
