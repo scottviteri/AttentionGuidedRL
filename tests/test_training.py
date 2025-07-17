@@ -90,28 +90,35 @@ def test_calculate_conditional_log_prob():
     # Import here to avoid circular imports
     from src.training import calculate_conditional_log_prob
     
-    # Create mock model
-    model = MagicMock()
+    # Create a simple model for testing
+    class SimpleModel(torch.nn.Module):
+        def __init__(self, vocab_size=1000):
+            super().__init__()
+            self.embed = torch.nn.Embedding(vocab_size, 64)
+            self.linear = torch.nn.Linear(64, vocab_size)
+            
+        def forward(self, input_ids, **kwargs):
+            embeds = self.embed(input_ids)
+            logits = self.linear(embeds)
+            return type('Output', (), {'logits': logits})()
     
-    # Setup fake outputs
-    fake_logits = torch.randn(2, 10, 1000)
-    model.return_value = MagicMock(logits=fake_logits)
+    model = SimpleModel()
     
     # Create fake inputs
-    tokens = torch.randint(0, 1000, (2, 5))
-    context = torch.randint(0, 1000, (2, 5))
+    batch_size = 2
+    context_len = 5
+    tokens_len = 5
     
-    # Call function
+    tokens = torch.randint(0, 1000, (batch_size, tokens_len))
+    context = torch.randint(0, 1000, (batch_size, context_len))
+    
+    # Call function with real model
     result = calculate_conditional_log_prob(model, tokens, context)
     
     # Check output
     assert isinstance(result, torch.Tensor)
-    assert result.shape == (2,)  # Batch size
-    
-    # Check model was called with concatenated inputs
-    assert model.called
-    model_input = model.call_args[0][0]
-    assert model_input.shape[1] == context.shape[1] + tokens.shape[1]
+    assert result.shape == (batch_size,)  # One log prob per batch item
+    assert torch.all(result <= 0)  # Log probabilities should be non-positive
 
 
 def test_generate_query_vector():
@@ -303,7 +310,7 @@ def test_model_behavior_during_training():
     import torch.nn as nn
     from src.model import apply_lora_adapter
     from src.training import compute_trajectory_rewards, train_step, RawTrajectory, build_trajectory_from_raw
-    from src.data import KeyValuePair
+    from src.data import KVPair
     # from src.training import Trajectory
     
     # Create simple test model that can be used with LoRA
@@ -377,7 +384,7 @@ def test_model_behavior_during_training():
     num_keys = 5
 
     # Create the base data first (KeyValuePair is now KVPair)
-    qkv_data = KeyValuePair(
+    qkv_data = KVPair(
         key_tokens=torch.randint(0, 100, (2, TOKENS_PER_KEY), device=device),
         value_tokens=torch.randint(0, 100, (2, TOKENS_PER_VALUE), device=device),
         key_embedding=torch.randn(2, 64, device=device),
@@ -389,8 +396,6 @@ def test_model_behavior_during_training():
     from src.data import QKVSelection
     kv_pair = QKVSelection(
         data=qkv_data,
-        query_text=["<VECTOR_QUERY>", "<VECTOR_QUERY>"],
-        query_tokens=torch.tensor([[]], device=device).long(),  # Empty for vector queries
         query_embedding=torch.randn(2, 64, device=device),
         similarity_scores=torch.randn(2, num_keys, device=device),
         selected_idx=torch.tensor([0, 0], device=device), # Changed to tensor and device
@@ -473,8 +478,8 @@ def test_model_behavior_during_training():
 def test_compute_trajectory_rewards_with_real_model(gpt2_model, gpt2_tokenizer):
     """Test computing trajectory rewards with real models."""
     from src.training import compute_trajectory_rewards, RawTrajectory, build_trajectory_from_raw, calculate_conditional_log_prob
-    from src.data import KeyValuePair
-    from src.config import TOKENS_PER_KEY, TOKENS_PER_VALUE
+    from src.data import KVPair
+    import copy
     
     # Create a simple trajectory with some key-value pairs
     batch_size = 1
@@ -482,7 +487,7 @@ def test_compute_trajectory_rewards_with_real_model(gpt2_model, gpt2_tokenizer):
     
     # Create a few key-value pairs
     for i in range(3):
-        kv_pair = KeyValuePair(
+        kv_pair = KVPair(
             key_tokens=torch.randint(0, 1000, (batch_size, TOKENS_PER_KEY), device=gpt2_model.device),
             value_tokens=torch.randint(0, 1000, (batch_size, TOKENS_PER_VALUE), device=gpt2_model.device),
             key_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=gpt2_model.device),
@@ -514,7 +519,7 @@ def test_train_step_with_real_model(gpt2_model):
     """Test training step with a real GPT-2 model."""
     from src.training import train_step, RawTrajectory, build_trajectory_from_raw
     from src.model import apply_lora_adapter
-    from src.data import KeyValuePair
+    from src.data import KVPair
     from src.config import TOKENS_PER_KEY, TOKENS_PER_VALUE
     import copy
     
@@ -545,8 +550,8 @@ def test_train_step_with_real_model(gpt2_model):
     # Create a batched trajectory
     batch_size = 2
     
-    # Create a proper KeyValuePair with batch dimension
-    kv_pair = KeyValuePair(
+    # Create a proper KVPair with batch dimension
+    kv_pair = KVPair(
         key_tokens=torch.randint(0, 100, (batch_size, 10), device=gpt2_model.device),
         value_tokens=torch.randint(0, 100, (batch_size, 10), device=gpt2_model.device),
         key_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=gpt2_model.device),
@@ -676,7 +681,7 @@ def test_compute_advantages():
     
     # Test without value function (with default GRPO baseline)
     rewards = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-    advantages, returns = compute_advantages(rewards, values=None)
+    advantages, returns = compute_advantages(rewards)
     
     # Check shapes
     assert advantages.shape == rewards.shape
@@ -688,16 +693,9 @@ def test_compute_advantages():
             f"GRPO advantages at timestep {t} don't sum to zero"
     
     # Test without GRPO baseline (should be normalized)
-    advantages_no_grpo, _ = compute_advantages(rewards, values=None, use_grpo_baseline=False)
+    advantages_no_grpo, _ = compute_advantages(rewards, use_grpo_baseline=False)
     assert torch.abs(advantages_no_grpo.mean()) < 1e-6
     assert torch.abs(advantages_no_grpo.std() - 1.0) < 0.1
-    
-    # Test with value function
-    values = torch.tensor([[0.5, 1.5, 2.5], [3.5, 4.5, 5.5]])
-    advantages_with_values, _ = compute_advantages(rewards, values=values)
-    
-    # Should be different from without values
-    assert not torch.allclose(advantages, advantages_with_values)
 
 
 def test_improved_policy_loss(gpt2_model):
@@ -727,8 +725,6 @@ def test_improved_policy_loss(gpt2_model):
         # Create complete step
         step = QKVSelection(
             data=qkv_data,
-            query_text=["<VECTOR_QUERY>"] * batch_size,
-            query_tokens=torch.tensor([[]], device=device).long(),
             query_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=device),
             similarity_scores=torch.randn(batch_size, num_keys, device=device),  # Similarities with all keys
             selected_idx=torch.tensor([0] * batch_size, device=device),  # Changed to tensor
@@ -810,8 +806,7 @@ def test_grpo_baseline():
     
     # Test with GRPO baseline
     advantages_grpo, returns = compute_advantages(
-        rewards, 
-        values=None, 
+        rewards,
         gamma=1.0,  # No discounting for easier verification
         use_grpo_baseline=True
     )
@@ -859,7 +854,6 @@ def test_grpo_baseline():
     # Test without GRPO baseline for comparison
     advantages_no_grpo, _ = compute_advantages(
         rewards,
-        values=None,
         gamma=1.0,
         use_grpo_baseline=False
     )
@@ -914,8 +908,6 @@ def test_kl_divergence_dimension_match():
         # Create complete step
         step = QKVSelection(
             data=qkv_data,
-            query_text=["<VECTOR_QUERY>"] * batch_size,
-            query_tokens=torch.empty((batch_size, 0), dtype=torch.long),
             query_embedding=torch.randn(batch_size, 768),
             similarity_scores=torch.randn(batch_size, num_available_keys),
             selected_idx=torch.tensor([0] * batch_size),  # Leave on CPU for indexing
@@ -1026,8 +1018,6 @@ def test_adapter_weights_update_during_training(gpt2_model):
         from src.data import QKVSelection
         step = QKVSelection(
             data=qkv_data,
-            query_text=["<VECTOR_QUERY>"] * batch_size,
-            query_tokens=torch.empty((batch_size, 0), device=device, dtype=torch.long),
             query_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=device),
             similarity_scores=torch.randn(batch_size, num_keys, device=device),
             selected_idx=torch.tensor([0] * batch_size, device=device),
