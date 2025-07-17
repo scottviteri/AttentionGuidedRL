@@ -207,6 +207,8 @@ During training, plot data is saved:
 - Every 25 episodes: `logs/<timestamp>/plots/plot_data_episode_<N>.pkl`
 - At the end of training: `logs/<timestamp>/plots/plot_data_latest.pkl`
 
+**Note**: Enhanced plotting requires all new metrics. No backward compatibility with older pickle files.
+
 ### Regenerating Plots
 
 Use the standalone plotting script to regenerate plots from saved data:

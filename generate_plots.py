@@ -51,35 +51,33 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         print("No data to plot!")
         return
     
-    # Get all arrays and ensure consistent length
+    # Extract all metrics (no backward compatibility - all metrics must be present)
     min_length = len(training_steps)
     
-    # Helper function to safely get data
-    def get_data(key, default_value=0.0):
-        arr = data.get(key, [])
-        if not arr:
-            return [default_value] * min_length
-        return arr[:min_length]
+    # Core metrics
+    total_losses = data['total_losses'][:min_length]
+    policy_losses = data['policy_losses'][:min_length]
+    kl_losses = data['kl_losses'][:min_length]
+    avg_rewards = data['avg_rewards'][:min_length]
+    adapter_log_probs = data['adapter_log_probs'][:min_length]
+    baseline_log_probs = data['baseline_log_probs'][:min_length]
+    base_log_probs = data['base_log_probs'][:min_length]
+    avg_advantages = data['avg_advantages'][:min_length]
+    trajectory_log_probs = data['trajectory_log_probs'][:min_length]
+    wikipedia_order_consistency = data['wikipedia_order_consistency'][:min_length]
+    kl_penalty_terms = data['kl_penalty_terms'][:min_length]
+    reward_variance = data['reward_variance'][:min_length]
+    gradient_magnitudes = data['gradient_magnitudes'][:min_length]
+    step_log_probs = data['step_log_probs']
+    policy_gradients = data['policy_gradients'][:min_length]
+    clipping_ratios = data['clipping_ratios'][:min_length]
+    kl_from_ref = data['kl_from_ref'][:min_length]
+    batch_selection_entropy = data['batch_selection_entropy'][:min_length]
     
-    # Extract all metrics
-    total_losses = get_data('total_losses')
-    policy_losses = get_data('policy_losses')
-    kl_losses = get_data('kl_losses')
-    avg_rewards = get_data('avg_rewards')
-    adapter_log_probs = get_data('adapter_log_probs')
-    baseline_log_probs = get_data('baseline_log_probs')
-    base_log_probs = get_data('base_log_probs')
-    avg_advantages = get_data('avg_advantages')
-    trajectory_log_probs = get_data('trajectory_log_probs')
-    wikipedia_order_consistency = get_data('wikipedia_order_consistency', 0.5)
-    kl_penalty_terms = get_data('kl_penalty_terms')
-    reward_variance = get_data('reward_variance')
-    gradient_magnitudes = get_data('gradient_magnitudes')
-    step_log_probs = data.get('step_log_probs', [])
-    policy_gradients = get_data('policy_gradients')
-    clipping_ratios = get_data('clipping_ratios', 1.0)
-    kl_from_ref = get_data('kl_from_ref')
-    batch_selection_entropy = get_data('batch_selection_entropy', 0.0)
+    # Enhanced debugging metrics (required)
+    lora_layer_gradients = data['lora_layer_gradients']
+    advantage_distributions = data['advantage_distributions'][:min_length]
+    similarity_score_stats = data['similarity_score_stats'][:min_length]
     
     # Create comprehensive figure with 3 rows and 4 columns (removing 2 redundant plots)
     fig, axes = plt.subplots(3, 4, figsize=(24, 18))
@@ -95,17 +93,23 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[0].legend(fontsize=8)
     axes[0].grid(True, alpha=0.3)
     
-    # Plot 2: Rewards
+    # Plot 2: Rewards with Baseline Update Markers
     axes[1].plot(training_steps, avg_rewards, 'purple', linewidth=2)
     axes[1].set_xlabel('Training Step')
     axes[1].set_ylabel('Average Reward')
-    axes[1].set_title('Average Reward')
+    axes[1].set_title('Average Reward (Baseline Updates Marked)')
     axes[1].grid(True, alpha=0.3)
     if len(training_steps) > 10:
         z = np.polyfit(training_steps, avg_rewards, 1)
         p = np.poly1d(z)
         axes[1].plot(training_steps, p(training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
         axes[1].legend(fontsize=8)
+    
+    # Add baseline update markers
+    BASELINE_UPDATE_FREQUENCY = config['BASELINE_UPDATE_FREQUENCY']
+    for episode in range(BASELINE_UPDATE_FREQUENCY, max(training_steps) + 1, BASELINE_UPDATE_FREQUENCY):
+        if episode <= max(training_steps):
+            axes[1].axvline(x=episode, color='red', linestyle='--', alpha=0.6, linewidth=1)
     
     # Plot 3: Model Log Probabilities
     axes[2].plot(training_steps, adapter_log_probs, 'darkgreen', label='Adapter Model', linewidth=2)
@@ -157,10 +161,9 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[6].set_ylabel('KL Divergence')
     axes[6].set_title('KL Divergence from Reference Model (π_ref)')
     axes[6].grid(True, alpha=0.3)
-    if len(kl_from_ref) > 0 and any(kl_from_ref):
-        mean_kl = np.mean(kl_from_ref)
-        axes[6].axhline(y=mean_kl, color='gray', linestyle='--', alpha=0.5, label=f'Mean: {mean_kl:.4f}')
-        axes[6].legend(fontsize=8)
+    mean_kl = np.mean(kl_from_ref)
+    axes[6].axhline(y=mean_kl, color='gray', linestyle='--', alpha=0.5, label=f'Mean: {mean_kl:.4f}')
+    axes[6].legend(fontsize=8)
     
     # Plot 8: Reward Variance
     axes[7].plot(training_steps, reward_variance, 'magenta', linewidth=2)
@@ -236,23 +239,41 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[9].grid(True, alpha=0.3)
     axes[9].set_ylim(0.5, 1.5)
     
-    # Plot 11: KL Loss Raw Values
-    axes[10].plot(training_steps, kl_losses, 'coral', linewidth=2)
+    # Plot 11: LoRA Layer Gradient Flow
+    for layer_idx, grad_history in lora_layer_gradients.items():
+        # Ensure gradient history matches training_steps length
+        grad_data = grad_history[:min_length] + [0.0] * max(0, min_length - len(grad_history))
+        color = 'red' if layer_idx == max(lora_layer_gradients.keys()) else f'C{layer_idx % 10}'
+        linewidth = 3 if layer_idx == max(lora_layer_gradients.keys()) else 1.5
+        alpha = 1.0 if layer_idx == max(lora_layer_gradients.keys()) else 0.7
+        label = f'Layer {layer_idx}' + (' (Query Layer)' if layer_idx == max(lora_layer_gradients.keys()) else '')
+        axes[10].plot(training_steps, grad_data, color=color, linewidth=linewidth, alpha=alpha, label=label)
     axes[10].set_xlabel('Training Step')
-    axes[10].set_ylabel('KL Loss')
-    axes[10].set_title('KL Loss (Raw)')
+    axes[10].set_ylabel('Gradient Magnitude')
+    axes[10].set_title('LoRA Layer Gradient Flow')
+    axes[10].set_yscale('log')
+    axes[10].legend(fontsize=6, loc='upper right')
     axes[10].grid(True, alpha=0.3)
     
-    # Plot 12: Batch Selection Entropy
-    axes[11].plot(training_steps, batch_selection_entropy, 'darkviolet', linewidth=2)
-    axes[11].axhline(y=0.0, color='red', linestyle='--', alpha=0.5, label='Identical selections')
-    axes[11].axhline(y=1.0, color='green', linestyle='--', alpha=0.5, label='Maximum diversity')
+    # Plot 12: Advantage Distribution Analysis
+    positive_percentages = [d['positive_percentage'] for d in advantage_distributions]
+    negative_percentages = [d['negative_percentage'] for d in advantage_distributions]
+    
+    axes[11].plot(training_steps, positive_percentages, 'green', linewidth=2, label='Positive Advantages')
+    axes[11].plot(training_steps, negative_percentages, 'red', linewidth=2, label='Negative Advantages')
+    axes[11].axhline(y=50.0, color='gray', linestyle='--', alpha=0.5, label='50% (Balanced)')
     axes[11].set_xlabel('Training Step')
-    axes[11].set_ylabel('Normalized Entropy')
-    axes[11].set_title('Batch Selection Entropy (Diversity of Key Orders)')
-    axes[11].set_ylim(-0.1, 1.1)
+    axes[11].set_ylabel('Percentage (%)')
+    axes[11].set_title('Advantage Distribution (Step-Level Learning Signal)')
+    axes[11].set_ylim(0, 100)
     axes[11].legend(fontsize=7)
     axes[11].grid(True, alpha=0.3)
+    
+    # Add baseline update markers
+    BASELINE_UPDATE_FREQUENCY = config['BASELINE_UPDATE_FREQUENCY']
+    for episode in range(BASELINE_UPDATE_FREQUENCY, max(training_steps) + 1, BASELINE_UPDATE_FREQUENCY):
+        if episode <= max(training_steps):
+            axes[11].axvline(x=episode, color='orange', linestyle=':', alpha=0.6, linewidth=1)
     
     # Adjust layout
     plt.tight_layout(pad=2.0)
@@ -282,6 +303,134 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         plt.savefig(breakdown_path, dpi=150)
         plt.close()
         print(f"Saved loss breakdown to: {breakdown_path}")
+
+    # Create additional similarity score analysis plot
+    if len(training_steps) > 5:
+        plt.figure(figsize=(15, 10))
+        
+        # Extract similarity metrics
+        similarity_means = [s['mean'] for s in similarity_score_stats]
+        similarity_stds = [s['std'] for s in similarity_score_stats]
+        similarity_entropies = [s['entropy'] for s in similarity_score_stats]
+        similarity_maxs = [s['max'] for s in similarity_score_stats]
+        similarity_mins = [s['min'] for s in similarity_score_stats]
+        
+        # Create 2x2 subplot for detailed similarity analysis
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Subplot 1: Mean similarity scores
+        ax1.plot(training_steps, similarity_means, 'blue', linewidth=2, label='Mean Similarity')
+        ax1.set_xlabel('Training Step')
+        ax1.set_ylabel('Similarity Score')
+        ax1.set_title('Mean Query-Key Similarity Evolution')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+        
+        # Subplot 2: Similarity entropy (measure of specificity)
+        ax2.plot(training_steps, similarity_entropies, 'green', linewidth=2, label='Similarity Entropy')
+        ax2.set_xlabel('Training Step')
+        ax2.set_ylabel('Entropy (nats)')
+        ax2.set_title('Query Specificity (Lower = More Specific)')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+        
+        # Subplot 3: Similarity range (max - min)
+        similarity_ranges = [mx - mn for mx, mn in zip(similarity_maxs, similarity_mins)]
+        ax3.plot(training_steps, similarity_ranges, 'orange', linewidth=2, label='Range (Max - Min)')
+        ax3.set_xlabel('Training Step')
+        ax3.set_ylabel('Similarity Range')
+        ax3.set_title('Query Discrimination Ability')
+        ax3.grid(True, alpha=0.3)
+        ax3.legend()
+        
+        # Subplot 4: Standard deviation
+        ax4.plot(training_steps, similarity_stds, 'red', linewidth=2, label='Similarity Std Dev')
+        ax4.set_xlabel('Training Step')
+        ax4.set_ylabel('Standard Deviation')
+        ax4.set_title('Similarity Score Variability')
+        ax4.grid(True, alpha=0.3)
+        ax4.legend()
+        
+        # Add baseline update markers to all subplots
+        BASELINE_UPDATE_FREQUENCY = config['BASELINE_UPDATE_FREQUENCY']
+        for ax in [ax1, ax2, ax3, ax4]:
+            for episode in range(BASELINE_UPDATE_FREQUENCY, max(training_steps) + 1, BASELINE_UPDATE_FREQUENCY):
+                if episode <= max(training_steps):
+                    ax.axvline(x=episode, color='gray', linestyle=':', alpha=0.5, linewidth=1)
+        
+        plt.tight_layout()
+        similarity_path = os.path.join(output_dir, 'similarity_analysis.png')
+        plt.savefig(similarity_path, dpi=150)
+        plt.close()
+        print(f"Saved similarity analysis to: {similarity_path}")
+
+    # Create step-level learning dynamics analysis
+    if len(training_steps) > 10:
+        plt.figure(figsize=(12, 8))
+        
+        # Extract step-level learning metrics over time
+        positive_advantages = [d['positive_percentage'] for d in advantage_distributions]
+        advantage_means = [d['mean'] for d in advantage_distributions]
+        advantage_stds = [d['std'] for d in advantage_distributions]
+        
+        # Create 2x2 subplot for step-level analysis
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
+        
+        # Subplot 1: Learning signal strength (positive advantage percentage)
+        ax1.plot(training_steps, positive_advantages, 'green', linewidth=2, label='Positive Advantage %')
+        ax1.axhline(y=50.0, color='gray', linestyle='--', alpha=0.5, label='50% (Balanced)')
+        ax1.set_xlabel('Training Step')
+        ax1.set_ylabel('Percentage (%)')
+        ax1.set_title('Step-Level Learning Signal Strength')
+        ax1.set_ylim(0, 100)
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+        
+        # Subplot 2: Advantage magnitude evolution
+        ax2.plot(training_steps, advantage_means, 'blue', linewidth=2, label='Mean Advantage')
+        ax2.axhline(y=0.0, color='gray', linestyle='-', alpha=0.5, label='Zero Advantage')
+        ax2.set_xlabel('Training Step')
+        ax2.set_ylabel('Advantage')
+        ax2.set_title('Advantage Magnitude Over Time')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+        
+        # Subplot 3: Advantage variability (indicates learning consistency)
+        ax3.plot(training_steps, advantage_stds, 'orange', linewidth=2, label='Advantage Std Dev')
+        ax3.set_xlabel('Training Step')
+        ax3.set_ylabel('Standard Deviation')
+        ax3.set_title('Learning Signal Variability')
+        ax3.grid(True, alpha=0.3)
+        ax3.legend()
+        
+        # Subplot 4: Combined learning health score
+        # Normalize metrics to 0-1 scale for combination
+        norm_positive = np.array(positive_advantages) / 100.0  # Already 0-100, normalize to 0-1
+        norm_mean_adv = np.array(advantage_means)
+        norm_mean_adv = (norm_mean_adv - np.min(norm_mean_adv)) / (np.max(norm_mean_adv) - np.min(norm_mean_adv) + 1e-8)
+        
+        # Health score: high positive percentage + positive trend in advantages
+        health_score = 0.6 * norm_positive + 0.4 * norm_mean_adv
+        ax4.plot(training_steps, health_score * 100, 'purple', linewidth=2, label='Learning Health Score')
+        ax4.set_xlabel('Training Step')
+        ax4.set_ylabel('Health Score (%)')
+        ax4.set_title('Overall Step-Level Learning Health')
+        ax4.set_ylim(0, 100)
+        ax4.grid(True, alpha=0.3)
+        ax4.legend()
+        
+        # Add baseline update markers to all subplots
+        BASELINE_UPDATE_FREQUENCY = config['BASELINE_UPDATE_FREQUENCY']
+        for ax in [ax1, ax2, ax3, ax4]:
+            for episode in range(BASELINE_UPDATE_FREQUENCY, max(training_steps) + 1, BASELINE_UPDATE_FREQUENCY):
+                if episode <= max(training_steps):
+                    ax.axvline(x=episode, color='red', linestyle=':', alpha=0.4, linewidth=1)
+        
+        plt.tight_layout()
+        step_analysis_path = os.path.join(output_dir, 'step_learning_analysis.png')
+        plt.savefig(step_analysis_path, dpi=150)
+        plt.close()
+        print(f"Saved step-level learning analysis to: {step_analysis_path}")
 
 
 def main():

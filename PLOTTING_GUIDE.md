@@ -11,30 +11,48 @@ The AttentionGuidedRL project includes a comprehensive plotting system that trac
 - Data is saved as pickle files for later re-generation
 - Plots are saved in `logs/<timestamp>/plots/`
 
-### 2. Metrics Tracked (18+ metrics)
+### 2. Metrics Tracked (20+ metrics)
 - **Loss Components**: Total loss, policy loss, KL penalty
-- **Rewards**: Average rewards with trend lines
+- **Rewards**: Average rewards with trend lines and baseline update markers
 - **Model Comparisons**: Adapter, baseline (old), and reference model log probabilities
-- **Advantages**: Raw advantages (no filtering) with trends
+- **Advantages**: Raw advantages with distribution analysis
 - **Trajectory Metrics**: Trajectory-level log probabilities
-- **Gradient Health**: Gradient norms (log scale)
+- **Gradient Health**: Overall gradient norms + per-layer LoRA gradient flow
 - **Wikipedia Order**: Order consistency metric (0=reverse, 0.5=random, 1=perfect)
 - **Policy Gradients**: Shows reinforcement direction
 - **KL Divergence**: From reference model (π_ref)
 - **Reward Variance**: Within-trajectory variance
 - **Step Analysis**: Log probabilities by step position (early/mid/late training)
 - **PPO Metrics**: Clipping ratios (π_θ/π_old)
+- **NEW: LoRA Layer Analysis**: Per-layer gradient magnitudes (identifies which layers are learning)
+- **NEW: Advantage Distribution**: Percentage of positive vs negative advantages (step-level learning signal)
+- **NEW: Baseline Update Detection**: Vertical markers showing periodic model updates
+- **NEW: Similarity Analysis**: Query-key similarity evolution, entropy, and discrimination ability
 
 ### 3. Plot Types Generated
 
 #### Training Metrics (12 subplots)
-- Comprehensive overview in a 3x4 grid
+- Comprehensive overview in a 3x4 grid with enhanced debugging focus
+- **Plot 11**: LoRA Layer Gradient Flow (replaces redundant KL Loss Raw Values)
+- **Plot 12**: Advantage Distribution Analysis (replaces Batch Selection Entropy) 
 - Each metric has its own subplot with appropriate scaling
 - Trend lines added where relevant
+- Baseline update markers on key plots (rewards, advantages, etc.)
 
 #### Loss Breakdown
 - Stacked area chart showing policy loss vs KL penalty contribution
 - Generated when 20+ episodes of data available
+
+#### Similarity Analysis (NEW)
+- Separate 2x2 detailed analysis of query-key similarity evolution
+- Shows mean similarity, entropy (specificity), range (discrimination), and variability
+- Includes baseline update markers to correlate with training phases
+
+#### Step-Level Learning Analysis (NEW)
+- Separate 2x2 analysis of step-level learning dynamics
+- Learning signal strength (positive advantage percentage over time)
+- Advantage magnitude evolution and variability analysis 
+- Combined learning health score with baseline update correlations
 
 ### 4. Standalone Plot Generation
 
@@ -50,6 +68,8 @@ python generate_plots.py data.pkl --output-dir custom_plots/
 # Override KL coefficient in labels
 python generate_plots.py data.pkl --kl-coef 0.05
 ```
+
+**Note**: No backward compatibility - pickle files must contain all enhanced debugging metrics. Older pickle files from before the plotting improvements will not work.
 
 ### 5. Custom Plotting
 
@@ -107,7 +127,12 @@ Each pickle file contains:
     'policy_losses': [...],
     'kl_losses': [...],
     'avg_rewards': [...],
-    # ... 14+ more metrics ...
+    # ... 17+ more existing metrics ...
+    
+    # NEW: Enhanced debugging metrics
+    'lora_layer_gradients': {0: [...], 1: [...], 10: [...]},  # Per-layer gradient magnitudes
+    'advantage_distributions': [{'positive_percentage': 65.2, 'negative_percentage': 34.8, ...}],
+    'similarity_score_stats': [{'mean': 0.23, 'std': 0.18, 'entropy': 2.4, ...}],
     'metadata': {
         'episode': 49,
         'timestamp': '2025-06-19T07:37:21',
