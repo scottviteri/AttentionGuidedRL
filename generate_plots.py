@@ -432,11 +432,8 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     # Adjust layout
     plt.tight_layout(pad=2.0)
     
-    # Save the plot with smoothing info in filename
-    base_name = 'training_metrics'
-    if smooth_window > 1:
-        base_name += f'_smooth{smooth_window}'
-    output_path = os.path.join(output_dir, f'{base_name}.png')
+    # Save the plot (always use the same filename, whether smoothed or not)
+    output_path = os.path.join(output_dir, 'training_metrics.png')
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
     
@@ -459,10 +456,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
         
-        breakdown_name = 'loss_breakdown'
-        if smooth_window > 1:
-            breakdown_name += f'_smooth{smooth_window}'
-        breakdown_path = os.path.join(output_dir, f'{breakdown_name}.png')
+        breakdown_path = os.path.join(output_dir, 'loss_breakdown.png')
         plt.savefig(breakdown_path, dpi=150)
         plt.close()
         print(f"Saved loss breakdown to: {breakdown_path}")
@@ -534,10 +528,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
                     ax.axvline(x=episode, color='gray', linestyle=':', alpha=0.5, linewidth=1)
         
         plt.tight_layout()
-        similarity_name = 'similarity_analysis'
-        if smooth_window > 1:
-            similarity_name += f'_smooth{smooth_window}'
-        similarity_path = os.path.join(output_dir, f'{similarity_name}.png')
+        similarity_path = os.path.join(output_dir, 'similarity_analysis.png')
         plt.savefig(similarity_path, dpi=150)
         plt.close()
         print(f"Saved similarity analysis to: {similarity_path}")
@@ -617,10 +608,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
                     ax.axvline(x=episode, color='red', linestyle=':', alpha=0.4, linewidth=1)
         
         plt.tight_layout()
-        step_analysis_name = 'step_learning_analysis'
-        if smooth_window > 1:
-            step_analysis_name += f'_smooth{smooth_window}'
-        step_analysis_path = os.path.join(output_dir, f'{step_analysis_name}.png')
+        step_analysis_path = os.path.join(output_dir, 'step_learning_analysis.png')
         plt.savefig(step_analysis_path, dpi=150)
         plt.close()
         print(f"Saved step-level learning analysis to: {step_analysis_path}")

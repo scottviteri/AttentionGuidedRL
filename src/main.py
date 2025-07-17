@@ -797,10 +797,12 @@ def main():
             for name, param in model.named_parameters():
                 if param.grad is not None and 'lora' in name.lower():
                     # Extract layer index from parameter name
-                    # Examples: "base_model.model.layers.10.self_attn.q_proj.lora_A.default.weight"
+                    # Examples for GPT-2: "base_model.model.transformer.h.10.attn.c_attn.lora_A.default.weight"
+                    # Examples for Llama: "base_model.model.layers.10.self_attn.q_proj.lora_A.default.weight"
                     parts = name.split('.')
                     for i, part in enumerate(parts):
-                        if part == 'layers' and i + 1 < len(parts):
+                        # Handle both GPT-2 (h.{layer}) and Llama (layers.{layer}) naming conventions
+                        if (part == 'layers' or part == 'h') and i + 1 < len(parts):
                             try:
                                 layer_idx = int(parts[i + 1])
                                 grad_norm = param.grad.norm().item()
