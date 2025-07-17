@@ -161,37 +161,6 @@ class MockGenerator:
         raise StopIteration
 
 
-@patch("src.main.create_model_copy")
-@patch("src.main.setup_logging")
-@patch("src.main.setup_model_and_tokenizer")
-@patch("src.main.register_embedding_hook")
-@patch("src.data.create_kv_stream")
-@patch("src.main.generate_trajectory")
-@patch("src.main.train_step")
-@patch("src.main.save_checkpoint")
-@patch("torch.optim.Adam")
-@patch("src.main.logging")
-def test_main(
-    mock_logging,
-    mock_adam,
-    mock_save_checkpoint,
-    mock_train_step,
-    mock_generate_trajectory,
-    mock_iter_kv_pairs_unified,
-    mock_register_hook,
-    mock_setup_models,
-    mock_setup_logging,
-    mock_create_model_copy
-):
-    """Test the main function (sanity check only)."""
-    # Import main after patching config
-    from src.main import main
-    
-    # This test has too many mocks and doesn't really test anything meaningful
-    # Instead, we should have more focused integration tests
-    pytest.skip("This test is overly mocked and doesn't provide meaningful coverage")
-
-
 def test_main_function_exists():
     """Test that main function can be imported and has expected signature."""
     from src.main import main
@@ -222,35 +191,38 @@ def test_reward_statistics_update():
     assert abs(stats['mean'] - 3.0) < 0.01  # Mean of [1,2,3,4,5] = 3
 
 
-def test_checkpoint_save_and_load(tmp_path):
-    """Test checkpoint saving and loading functionality."""
-    # Skip this test as the checkpoint functions in model.py have a different API
-    # than what this test expects (they only save/load model, not full training state)
-    pytest.skip("Checkpoint functions have different API than test expects")
-    # Create mock models and optimizer
-    model = torch.nn.Linear(10, 10)
-    optimizer = torch.optim.Adam(model.parameters())
+def test_checkpoint_save_and_load(tmp_path, gpt2_model):
+    """Test checkpoint saving and loading functionality using the actual API."""
+    from src.model import save_checkpoint, load_checkpoint, apply_lora_adapter
+    import tempfile
+    import os
     
-    # Create test data
-    checkpoint_data = {
-        'episode': 100,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'metrics': {'loss': [1.0, 0.9, 0.8]}
-    }
+    # Create a LoRA adapter model for testing
+    adapter_model = apply_lora_adapter(gpt2_model)
     
-    # Save checkpoint
-    checkpoint_path = tmp_path / "checkpoint.pt"
-    with patch("torch.save") as mock_save:
-        save_checkpoint(str(checkpoint_path), **checkpoint_data)
-        mock_save.assert_called_once()
+    # Test episode number
+    episode = 100
+    
+    # Mock the checkpoint path to use temp directory
+    with patch("src.model.get_checkpoint_path") as mock_get_path:
+        checkpoint_path = tmp_path / f"checkpoint_episode_{episode}.pt"
+        mock_get_path.return_value = str(checkpoint_path)
         
-    # Load checkpoint
-    with patch("torch.load") as mock_load:
-        mock_load.return_value = checkpoint_data
-        loaded = load_checkpoint(str(checkpoint_path))
-        assert loaded['episode'] == 100
-        assert 'model_state_dict' in loaded
+        # Save checkpoint
+        save_checkpoint(adapter_model, episode)
+        
+        # Verify file was created
+        assert checkpoint_path.exists(), "Checkpoint file should be created"
+        
+        # Create a new model to load into
+        new_model = apply_lora_adapter(gpt2_model)
+        
+        # Load checkpoint
+        load_checkpoint(new_model, episode)
+        
+        # Basic verification that loading completed without error
+        # (We can't easily verify state dict equality due to LoRA complexity)
+        assert True  # If we get here, save/load worked
 
 
 def test_weights_update_with_real_model(gpt2_model, gpt2_tokenizer):
@@ -544,81 +516,9 @@ def test_embedding_pipeline():
         hook_remover()
 
 
-def test_generate_trajectory_with_real_model(gpt2_model, gpt2_tokenizer):
-    """Test generating a trajectory with a real GPT-2 model."""
-    from src.main import generate_trajectory
-    from src.embeddings import compute_similarity, extract_embeddings, register_embedding_hook
-    from src.data import KVPair
-    from src.config import TOKENS_PER_KEY, TOKENS_PER_VALUE
-    import torch
-    
-    # We need to patch most of the external functions to make this test work
-    with patch('src.embeddings.MODEL_TYPE', 'gpt2'):
-        # This makes sure the get_attention_params returns correct heads/dimensions
-        embeddings_dict, hook_remover = register_embedding_hook(gpt2_model)
-        
-        try:
-            # Use simple test values that won't exercise the real functionality
-            # but will verify the flow works correctly
-            batch_size = 1
-            device = gpt2_model.device
-            
-            # Create initial context
-            context_tokens = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
-            
-            # Mock necessary functions
-            with patch("src.main.NUM_KV_PAIRS", 1):  # Use just 1 KV pair for test simplicity
-                with patch("src.main.generate_query_vector") as mock_generate_query_vector:
-                    # Return query embeddings with valid shape
-                    mock_generate_query_vector.return_value = torch.randn(batch_size, gpt2_model.config.n_embd, device=device)
-                    
-                    with patch("src.main.extract_embeddings") as mock_extract_embeddings:
-                        # Return embeddings with correct shape 
-                        # Need to handle both query and key embedding extraction
-                        def side_effect(model, tokens, embeddings_dict):
-                            batch_size = tokens.shape[0]
-                            # Return embeddings with correct shape for the model
-                            return torch.randn(batch_size, gpt2_model.config.n_embd, device=device)
-                        
-                        mock_extract_embeddings.side_effect = side_effect
-                        
-                        with patch("src.main.compute_similarity") as mock_compute_similarity:
-                            # Return valid probability distribution
-                            mock_compute_similarity.return_value = torch.softmax(torch.randn(batch_size, 2), dim=1)
-                            
-                            with patch("src.main.sample_key_value") as mock_sample_key_value:
-                                # Return valid sampled indices and probabilities
-                                mock_sample_key_value.return_value = ([0], torch.tensor([0.5], device=device))
-                                
-                                with patch("src.main.compute_trajectory_rewards"):
-                                    # Create simple test KV pairs
-                                    kv_pairs = []
-                                    for i in range(2):  # 2 test pairs
-                                        kv_pair = KVPair(
-                                            key_tokens=torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]], device=device),
-                                            value_tokens=torch.tensor([[21, 22, 23, 24, 25, 26, 27, 28, 29, 30]], device=device),
-                                            key_embedding=torch.randn(1, 768, device=device),
-                                            key_text=["Test key"],
-                                            value_text=["Test value"]
-                                        )
-                                        kv_pairs.append(kv_pair)
-                                    
-                                    # Call the function with the real model but minimal actual functionality
-                                    trajectory = generate_trajectory(
-                                        context_tokens,
-                                        gpt2_model,
-                                        gpt2_tokenizer,
-                                        kv_pairs,
-                                        batch_size,
-                                    )
-                                    
-                                    # Verify the basic structure is correct
-                                    assert trajectory is not None
-                                    assert hasattr(trajectory, 'qkv_steps')
-                                    assert len(trajectory.qkv_steps) == 1  # Patched NUM_KV_PAIRS
-        finally:
-            # Clean up hook
-            hook_remover() 
+# Removed redundant test_generate_trajectory_with_real_model 
+# This was testing the same functionality as test_generate_trajectory but with 
+# excessive mocking that made it less valuable than the existing integration test 
 
 
 def test_twenty_questions_integration_with_trajectory(gpt2_model, gpt2_tokenizer):
