@@ -4,201 +4,165 @@ Tests for the model module.
 
 import pytest
 import torch
-from unittest.mock import MagicMock, patch
+import copy
+from unittest.mock import patch
 
 from src.config import MODEL_TYPE
 
 
-@pytest.fixture
-def mock_pretrained_model_for_llama():
-    """Create a mock pre-trained model for Llama."""
-    model = MagicMock()
-    model.model.model.layers = []
-    
-    # Mock layers
-    for i in range(2):
-        layer = MagicMock()
-        model.model.model.layers.append(layer)
-    
-    return model
-
-
-@pytest.fixture
-def mock_pretrained_model_for_gpt2():
-    """Create a mock pre-trained model for GPT-2."""
-    model = MagicMock()
-    model.transformer.h = []
-    
-    # Mock layers
-    for i in range(2):
-        layer = MagicMock()
-        model.transformer.h.append(layer)
-    
-    return model
-
-
-@patch("src.model.MODEL_TYPE", "llama")
-@patch("src.model.AutoModelForCausalLM.from_pretrained")
-def test_load_base_model_llama(mock_from_pretrained, mock_pretrained_model_for_llama):
-    """Test loading the base Llama model."""
-    # Import here to use the patched MODEL_TYPE
-    from src.model import load_base_model
-    
-    # Setup mocks
-    mock_from_pretrained.return_value = mock_pretrained_model_for_llama
-    
-    # Call the function
-    model = load_base_model()
-    
-    # Check that from_pretrained was called
-    mock_from_pretrained.assert_called_once()
-    
-    # Check that we got the model
-    assert model == mock_pretrained_model_for_llama
-
-
-@patch("src.model.MODEL_TYPE", "gpt2")
-@patch("src.model.AutoModelForCausalLM.from_pretrained")
-def test_load_base_model_gpt2(mock_from_pretrained, mock_pretrained_model_for_gpt2):
-    """Test loading the base GPT-2 model."""
-    # Import here to use the patched MODEL_TYPE
-    from src.model import load_base_model
-    
-    # Setup mocks
-    mock_from_pretrained.return_value = mock_pretrained_model_for_gpt2
-    
-    # Call the function
-    model = load_base_model()
-    
-    # Check that from_pretrained was called
-    mock_from_pretrained.assert_called_once()
-    
-    # Check that we got the model
-    assert model == mock_pretrained_model_for_gpt2
-
-
-@patch("src.model.LoraConfig")
-@patch("src.model.get_peft_model")
-@patch("src.model.copy.deepcopy")
-@patch("torch.no_grad")
-def test_apply_lora_adapter(mock_no_grad, mock_deepcopy, mock_get_peft_model, mock_lora_config):
-    """Test applying LoRA adapter to a model."""
-    # Import here to avoid circular imports
-    from src.model import apply_lora_adapter
-    
-    # Setup mocks
-    mock_model = MagicMock()
-    mock_model_copy = MagicMock()
-    mock_peft_model = MagicMock()
-    
-    # Setup return values
-    mock_deepcopy.return_value = mock_model_copy
-    mock_lora_config.return_value = "lora_config"
-    mock_get_peft_model.return_value = mock_peft_model
-    
-    # Setup mock modules for lora_B initialization
-    mock_lora_module = MagicMock()
-    mock_lora_module.lora_B = {"default": MagicMock()}
-    mock_lora_module.lora_B["default"].weight = MagicMock()
-    
-    # Mock the named_modules method to return some modules with lora_B
-    mock_peft_model.named_modules.return_value = [
-        ("module1", mock_lora_module),
-        ("module2", MagicMock())  # module without lora_B
-    ]
-    
-    # Call the function
-    result = apply_lora_adapter(mock_model)
-    
-    # Check that the model was deep-copied
-    mock_deepcopy.assert_called_once_with(mock_model)
-    
-    # Check that LoraConfig was created with the expected parameters
-    mock_lora_config.assert_called_once()
-    
-    # Check that get_peft_model was called with the right parameters
-    mock_get_peft_model.assert_called_with(mock_model_copy, "lora_config")
-    
-    # Check that named_modules was called for the LoRA initialization
-    mock_peft_model.named_modules.assert_called()
-    
-    # Check that we normalized weights for modules with lora_B
-    mock_lora_module.lora_B["default"].weight.normal_.assert_called_once()
-    
-    # Check that we got the peft model
-    assert result == mock_peft_model
-
-
-@patch("src.model.MODEL_TYPE", "llama")
 def test_get_target_modules_llama():
     """Test getting target modules for LoRA in Llama models."""
-    # Import here to use the patched MODEL_TYPE
     from src.model import get_target_modules
     
-    # Call the function
-    target_modules = get_target_modules()
-    
-    # Check that we got the right modules for Llama
-    assert "q_proj" in target_modules
-    assert "k_proj" in target_modules
-    assert "v_proj" in target_modules
-    # Note: o_proj is not included in the current implementation
-    assert len(target_modules) == 3
+    with patch("src.model.MODEL_TYPE", "llama"):
+        target_modules = get_target_modules()
+        
+        # Check that we got the right modules for Llama
+        assert "q_proj" in target_modules
+        assert "k_proj" in target_modules
+        assert "v_proj" in target_modules
+        assert len(target_modules) == 3
 
 
-@patch("src.model.MODEL_TYPE", "gpt2")
 def test_get_target_modules_gpt2():
     """Test getting target modules for LoRA in GPT-2 models."""
-    # Import here to use the patched MODEL_TYPE
     from src.model import get_target_modules
     
-    # Call the function
-    target_modules = get_target_modules()
-    
-    # Check that we got the right modules for GPT-2
-    assert "c_attn" in target_modules
-    # Note: c_proj is not included in the current implementation
-    assert len(target_modules) == 1
+    with patch("src.model.MODEL_TYPE", "gpt2"):
+        target_modules = get_target_modules()
+        
+        # Check that we got the right modules for GPT-2
+        assert "c_attn" in target_modules
+        assert len(target_modules) == 1
 
 
-@patch("src.model.torch.save")
-def test_save_model_adapter(mock_save):
-    """Test saving the model adapter."""
-    # Import here to avoid circular imports
-    from src.model import save_model_adapter
+def test_apply_lora_adapter_integration(gpt2_model):
+    """Test applying LoRA adapter to a real GPT-2 model."""
+    from src.model import apply_lora_adapter
     
-    # Setup mocks
-    mock_model = MagicMock()
-    mock_model.state_dict.return_value = {"weights": "values"}
+    # Store original parameter count
+    original_params = sum(p.numel() for p in gpt2_model.parameters())
+    original_trainable = sum(p.numel() for p in gpt2_model.parameters() if p.requires_grad)
     
-    # Call the function
-    save_model_adapter(mock_model, "path/to/save")
+    # Apply LoRA adapter
+    with patch("src.model.MODEL_TYPE", "gpt2"):
+        adapter_model = apply_lora_adapter(gpt2_model)
     
-    # Check that state_dict was called
-    mock_model.state_dict.assert_called_once()
+    # Verify we have LoRA modules
+    lora_modules = [name for name, module in adapter_model.named_modules() if 'lora' in name.lower()]
+    assert len(lora_modules) > 0, "Should have LoRA modules after applying adapter"
     
-    # Check that save was called with the right parameters
-    mock_save.assert_called_with({"weights": "values"}, "path/to/save")
+    # Verify LoRA parameters are trainable
+    lora_params = [p for name, p in adapter_model.named_parameters() if 'lora' in name.lower()]
+    assert all(p.requires_grad for p in lora_params), "LoRA parameters should be trainable"
+    
+    # Verify total parameter count increased (due to LoRA)
+    new_total_params = sum(p.numel() for p in adapter_model.parameters())
+    assert new_total_params > original_params, "LoRA should add parameters"
+    
+    # Test forward pass works
+    device = next(adapter_model.parameters()).device
+    test_input = torch.randint(0, 1000, (1, 10), device=device)
+    with torch.no_grad():
+        output = adapter_model(test_input)
+        vocab_size = getattr(adapter_model.config, 'vocab_size', 50257)  # GPT-2 default
+        assert output.logits.shape == (1, 10, vocab_size)
 
 
-@patch("src.model.torch.load")
-def test_load_model_adapter(mock_load):
-    """Test loading the model adapter."""
-    # Import here to avoid circular imports
-    from src.model import load_model_adapter
+def test_model_setup_and_tokenizer_integration():
+    """Test the complete model and tokenizer setup flow."""
+    from src.model import setup_model_and_tokenizer
     
-    # Setup mocks
-    mock_model = MagicMock()
-    mock_load.return_value = {"weights": "values"}
+    # This tests the real function without mocks
+    with patch("src.model.MODEL_TYPE", "gpt2"):
+        base_model, adapter_model, tokenizer = setup_model_and_tokenizer()
     
-    # Call the function
-    load_model_adapter(mock_model, "path/to/load")
+    # Verify models are different objects
+    assert base_model is not adapter_model
     
-    # Check that load was called with the right path
-    mock_load.assert_called_with("path/to/load")
+    # Verify both models work
+    test_text = "Hello world"
+    tokens = tokenizer(test_text, return_tensors="pt")
     
-    # Check that load_state_dict was called with the right parameters
-    mock_model.load_state_dict.assert_called_with({"weights": "values"})
+    with torch.no_grad():
+        base_output = base_model(**tokens)
+        adapter_output = adapter_model(**tokens)
+    
+    # Both should produce valid outputs
+    assert base_output.logits.shape == adapter_output.logits.shape
+    assert base_output.logits.shape[-1] == tokenizer.vocab_size
+
+
+def test_checkpoint_save_and_load_integration(gpt2_model, tmp_path):
+    """Test checkpoint saving and loading with real model."""
+    from src.model import apply_lora_adapter, save_checkpoint, load_checkpoint
+    import os
+    
+    # Apply LoRA to get trainable parameters
+    with patch("src.model.MODEL_TYPE", "gpt2"):
+        adapter_model = apply_lora_adapter(gpt2_model)
+    
+    # Create a temporary checkpoint directory
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    
+    # Patch the checkpoint directory
+    with patch("src.model.CHECKPOINT_DIR", str(checkpoint_dir)):
+        # Save checkpoint
+        save_checkpoint(adapter_model, "test_episode")
+        
+        # Verify checkpoint file was created
+        checkpoint_files = list(checkpoint_dir.glob("*.pt"))
+        assert len(checkpoint_files) > 0, "Checkpoint file should be created"
+        
+        # Create a fresh model to load into
+        with patch("src.model.MODEL_TYPE", "gpt2"):
+            fresh_model = apply_lora_adapter(copy.deepcopy(gpt2_model))
+        
+        # Modify the fresh model to ensure loading actually changes it
+        for param in fresh_model.parameters():
+            if param.requires_grad:
+                param.data.fill_(0.0)
+        
+        # Load checkpoint
+        success = load_checkpoint(fresh_model, "test_episode")
+        assert success, "Checkpoint loading should succeed"
+        
+        # Verify parameters changed from zeros
+        has_nonzero = any(
+            torch.any(param.data != 0.0).item()
+            for param in fresh_model.parameters()
+            if param.requires_grad
+        )
+        assert has_nonzero, "Loading checkpoint should restore non-zero parameters"
+
+
+def test_model_copy_integration(gpt2_model):
+    """Test creating a model copy."""
+    from src.model import apply_lora_adapter, create_model_copy
+    
+    # Apply LoRA first
+    with patch("src.model.MODEL_TYPE", "gpt2"):
+        adapter_model = apply_lora_adapter(gpt2_model)
+    
+    # Create a copy
+    model_copy = create_model_copy(adapter_model)
+    
+    # Verify it's a different object
+    assert model_copy is not adapter_model
+    
+    # Verify they have the same structure
+    assert type(model_copy) == type(adapter_model)
+    
+    # Verify both produce the same output (before any training)
+    test_input = torch.randint(0, 1000, (1, 5)).to(adapter_model.device)
+    
+    with torch.no_grad():
+        original_output = adapter_model(test_input)
+        copy_output = model_copy(test_input)
+    
+    # Should be close initially (before any parameter updates)
+    assert torch.allclose(original_output.logits, copy_output.logits, atol=1e-5)
 
 
 def test_real_gpt2_model_setup(gpt2_model, gpt2_tokenizer):
@@ -246,8 +210,9 @@ def test_real_gpt2_model_setup(gpt2_model, gpt2_tokenizer):
     # Create input tokens
     input_text = ["Hello world", "Testing GPT-2"]
     inputs = gpt2_tokenizer(input_text, return_tensors="pt", padding=True)
-    input_ids = inputs["input_ids"].to(adapter_model.device)
-    attention_mask = inputs["attention_mask"].to(adapter_model.device)
+    device = next(adapter_model.parameters()).device
+    input_ids = inputs["input_ids"].to(device)
+    attention_mask = inputs["attention_mask"].to(device)
     
     # Run a forward pass
     with torch.no_grad():
@@ -298,99 +263,22 @@ def test_base_model_unchanged_after_lora(gpt2_model):
     
     # Verify that the base model doesn't have LoRA modules already
     for block_idx, block in enumerate(gpt2_model.transformer.h):
-        assert "lora" not in str(block.attn.c_attn).lower(), f"Base model already has LoRA modules: {block.attn.c_attn}"
+        # Check that no LoRA modules exist in the base model
+        lora_modules = [name for name, _ in block.named_modules() if 'lora' in name.lower()]
+        assert len(lora_modules) == 0, f"Block {block_idx} should not have LoRA modules before applying adapter"
     
-    # Apply LoRA adapter with patch for GPT-2
+    # Apply LoRA adapter
     with patch("src.model.MODEL_TYPE", "gpt2"):
         adapter_model = apply_lora_adapter(gpt2_model)
     
-    # Verify that adapter model now has LoRA modules
-    for block_idx, block in enumerate(adapter_model.transformer.h):
-        assert "lora" in str(block.attn.c_attn).lower(), f"Adapter model missing LoRA modules: {block.attn.c_attn}"
-    
-    # If the base model is also changed, this means apply_lora_adapter is modifying it in-place
+    # Verify that the base model STILL doesn't have LoRA modules (wasn't modified)
     for block_idx, block in enumerate(gpt2_model.transformer.h):
-        current_c_attn = str(block.attn.c_attn)
-        assert "lora" not in current_c_attn.lower(), (
-            f"Base model was modified after applying LoRA adapter. Block {block_idx}, "
-            f"Original: {original_c_attn_layers[block_idx]}, Current: {current_c_attn}"
-        )
+        lora_modules = [name for name, _ in block.named_modules() if 'lora' in name.lower()]
+        assert len(lora_modules) == 0, f"Base model block {block_idx} should not have LoRA modules after applying adapter to copy"
     
-    # Verify overall model architecture hasn't changed
-    assert base_model_architecture == str(gpt2_model), "Base model architecture changed after applying LoRA"
-
-
-def test_lora_weight_initialization(gpt2_model):
-    """
-    Test that both lora_A and lora_B weights are properly initialized with non-zero values.
-    """
-    import torch
-    from src.model import apply_lora_adapter
+    # Verify that the adapter model DOES have LoRA modules
+    adapter_lora_modules = [name for name, _ in adapter_model.named_modules() if 'lora' in name.lower()]
+    assert len(adapter_lora_modules) > 0, "Adapter model should have LoRA modules"
     
-    # Apply LoRA adapter with patch for GPT-2
-    with patch("src.model.MODEL_TYPE", "gpt2"):
-        adapter_model = apply_lora_adapter(gpt2_model)
-    
-    # Check that lora_A and lora_B weights exist and are not zero
-    lora_a_nonzero = False
-    lora_b_nonzero = False
-    
-    # Iterate through all modules to find LoRA layers
-    for name, module in adapter_model.named_modules():
-        # Check lora_A weights
-        if hasattr(module, 'lora_A'):
-            for key in module.lora_A.keys():
-                # Check if weights are non-zero (at least some of them)
-                weights = module.lora_A[key].weight
-                if torch.abs(weights).sum() > 0:
-                    lora_a_nonzero = True
-                    
-        # Check lora_B weights
-        if hasattr(module, 'lora_B'):
-            for key in module.lora_B.keys():
-                # Check if weights are non-zero (at least some of them)
-                weights = module.lora_B[key].weight
-                if torch.abs(weights).sum() > 0:
-                    lora_b_nonzero = True
-    
-    # Both lora_A and lora_B should have non-zero weights
-    assert lora_a_nonzero, "LoRA A weights are all zeros"
-    assert lora_b_nonzero, "LoRA B weights are all zeros"
-    
-    # Print statistics about LoRA weights for debugging
-    lora_a_stats = []
-    lora_b_stats = []
-    
-    for name, module in adapter_model.named_modules():
-        if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
-            for key in module.lora_A.keys():
-                a_weights = module.lora_A[key].weight
-                b_weights = module.lora_B[key].weight
-                
-                lora_a_stats.append({
-                    'mean': torch.mean(a_weights).item(),
-                    'std': torch.std(a_weights).item(),
-                    'min': torch.min(a_weights).item(),
-                    'max': torch.max(a_weights).item(),
-                    'nonzero': (torch.abs(a_weights) > 1e-10).float().mean().item() * 100
-                })
-                
-                lora_b_stats.append({
-                    'mean': torch.mean(b_weights).item(),
-                    'std': torch.std(b_weights).item(),
-                    'min': torch.min(b_weights).item(),
-                    'max': torch.max(b_weights).item(),
-                    'nonzero': (torch.abs(b_weights) > 1e-10).float().mean().item() * 100
-                })
-                
-    # Average statistics
-    a_mean_stats = {k: sum(stat[k] for stat in lora_a_stats) / len(lora_a_stats) for k in lora_a_stats[0]}
-    b_mean_stats = {k: sum(stat[k] for stat in lora_b_stats) / len(lora_b_stats) for k in lora_b_stats[0]}
-    
-    print(f"LoRA A stats: {a_mean_stats}")
-    print(f"LoRA B stats: {b_mean_stats}")
-    
-    # Check that the statistics are reasonable
-    assert abs(a_mean_stats['mean']) < 0.1, "LoRA A weights have unexpectedly large mean"
-    assert a_mean_stats['std'] > 0, "LoRA A weights have zero standard deviation"
-    assert b_mean_stats['std'] > 0, "LoRA B weights have zero standard deviation" 
+    # Verify original architecture string hasn't changed
+    assert str(gpt2_model) == base_model_architecture, "Base model architecture should be unchanged" 

@@ -289,9 +289,10 @@ def test_weights_update_with_real_model(gpt2_model, gpt2_tokenizer):
     # Run a training step with mocked compute_policy_loss to avoid gradient issues
     with patch('src.training.compute_policy_loss') as mock_compute_policy_loss:
         # Create tensors that require grad for the backward pass
-        mock_total_loss = torch.tensor([0.1], device=device, requires_grad=True)
-        mock_policy_loss = torch.tensor([0.07], device=device, requires_grad=True)
-        mock_kl_loss = torch.tensor([0.03], device=device, requires_grad=True)
+        device_str = 'cuda' if torch.cuda.is_available() else 'cpu'
+        mock_total_loss = torch.tensor([0.1], device=device_str, requires_grad=True)
+        mock_policy_loss = torch.tensor([0.07], device=device_str, requires_grad=True)
+        mock_kl_loss = torch.tensor([0.03], device=device_str, requires_grad=True)
         mock_compute_policy_loss.return_value = (mock_total_loss, mock_policy_loss, mock_kl_loss, 75.0)
         
         total_loss, policy_loss, kl_loss, avg_clipping_ratio = train_step(
@@ -346,11 +347,12 @@ def test_base_model_weights_unchanged(gpt2_model, gpt2_tokenizer):
     batch_size = 1
     device = adapter_model.device
     
-    # Create the base data first
+    # Create the base data first with explicit device handling
+    device_str = 'cuda' if torch.cuda.is_available() else 'cpu'
     qkv_data = KVPair(
-        key_tokens=torch.randint(0, 100, (batch_size, TOKENS_PER_KEY), device=device),
-        value_tokens=torch.randint(0, 100, (batch_size, TOKENS_PER_VALUE), device=device),
-        key_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=device),
+        key_tokens=torch.randint(0, 100, (batch_size, TOKENS_PER_KEY), device=device_str),
+        value_tokens=torch.randint(0, 100, (batch_size, TOKENS_PER_VALUE), device=device_str),
+        key_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=device_str),
         key_text=["Test key"],
         value_text=["Test value"]
     )
@@ -358,18 +360,18 @@ def test_base_model_weights_unchanged(gpt2_model, gpt2_tokenizer):
     # Create the complete step
     qkv_step = QKVSelection(
         data=qkv_data,
-        query_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=device),
-        similarity_scores=torch.randn(batch_size, 5, device=device),
-        selected_idx=torch.tensor([0] * batch_size, device=device), # Changed to tensor
-        available_mask=torch.zeros(batch_size,5,device=device)
+        query_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=device_str),
+        similarity_scores=torch.randn(batch_size, 5, device=device_str),
+        selected_idx=torch.tensor([0] * batch_size, device=device_str),
+        available_mask=torch.zeros(batch_size, 5, device=device_str)
     )
     
     # Create trajectory with rewards
     num_keys = 5
     hidden_dim = gpt2_model.config.n_embd
-    all_key_embeddings = torch.randn(batch_size, num_keys, hidden_dim, device=device)
+    all_key_embeddings = torch.randn(batch_size, num_keys, hidden_dim, device=device_str)
     raw_traj = RawTrajectory(qkv_steps=[qkv_step], all_key_embeddings=all_key_embeddings)
-    rewards = torch.tensor([[0.5]], device=device)
+    rewards = torch.tensor([[0.5]], device=device_str)
     avg_reward = rewards.mean(dim=1)
     trajectory = build_trajectory_from_raw(raw_traj, rewards, avg_reward)
     
