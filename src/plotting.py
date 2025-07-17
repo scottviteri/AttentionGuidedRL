@@ -255,7 +255,7 @@ class PlotData:
 
 def save_plot_data(plot_data: PlotData, log_dir: str) -> None:
     """
-    Save plotting data to a single pickle file.
+    Save plotting data to a single pickle file using atomic writes to prevent corruption.
     
     Args:
         plot_data: PlotData instance containing all metrics
@@ -263,15 +263,41 @@ def save_plot_data(plot_data: PlotData, log_dir: str) -> None:
     """
     import pickle
     import os
+    import tempfile
+    import shutil
     
     # Create plots directory
     plots_dir = f"{log_dir}/plots"
     os.makedirs(plots_dir, exist_ok=True)
     
-    # Save to single pickle file (overwrites previous)
+    # Use atomic write: write to temp file, then rename to final location
     filename = f"{plots_dir}/plot_data.pkl"
-    with open(filename, 'wb') as f:
-        pickle.dump(plot_data.to_dict(), f)
+    
+    # Write to temporary file first
+    with tempfile.NamedTemporaryFile(mode='wb', dir=plots_dir, delete=False) as tmp_file:
+        try:
+            pickle.dump(plot_data.to_dict(), tmp_file)
+            tmp_file.flush()  # Ensure data is written to disk
+            os.fsync(tmp_file.fileno())  # Force write to storage
+            temp_filename = tmp_file.name
+        except Exception as e:
+            # Clean up temp file on error
+            try:
+                os.unlink(tmp_file.name)
+            except:
+                pass
+            raise e
+    
+    # Atomically move temp file to final location
+    try:
+        shutil.move(temp_filename, filename)
+    except Exception as e:
+        # Clean up temp file on error
+        try:
+            os.unlink(temp_filename)
+        except:
+            pass
+        raise e
 
 
 def load_plot_data(filepath: str) -> PlotData:
@@ -285,9 +311,31 @@ def load_plot_data(filepath: str) -> PlotData:
         PlotData instance
     """
     import pickle
+    import os
     
-    with open(filepath, 'rb') as f:
-        data = pickle.load(f)
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Plot data file not found: {filepath}")
+    
+    # Check file size
+    file_size = os.path.getsize(filepath)
+    if file_size == 0:
+        raise ValueError(f"Plot data file is empty: {filepath}")
+    
+    try:
+        with open(filepath, 'rb') as f:
+            data = pickle.load(f)
+    except pickle.UnpicklingError as e:
+        # More helpful error message for corrupted files
+        raise ValueError(
+            f"Plot data file appears to be corrupted: {filepath}\n"
+            f"Original error: {e}\n"
+            f"File size: {file_size} bytes\n"
+            f"You may need to re-run training to regenerate this file."
+        ) from e
+    except Exception as e:
+        raise ValueError(
+            f"Failed to load plot data from {filepath}: {e}"
+        ) from e
     
     return PlotData.from_dict(data)
 

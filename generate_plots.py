@@ -3,7 +3,21 @@
 Standalone script to generate plots from saved training data.
 
 Usage:
-    python generate_plots.py path/to/plot_data.pkl [--output-dir path/to/output]
+    # Use explicit path to plot_data.pkl
+    python generate_plots.py path/to/plot_data.pkl [--output-dir path/to/output] [--smooth-window N]
+    
+    # Use nth most recent log folder (automatically finds logs/YYYYMMDD-HHMMSS/plots/plot_data.pkl)
+    python generate_plots.py --recent N [--output-dir path/to/output] [--smooth-window N] [--logs-dir path/to/logs]
+    
+Examples:
+    # Generate plots from most recent training run
+    python generate_plots.py --recent 0
+    
+    # Generate plots from second most recent run with smoothing
+    python generate_plots.py --recent 1 --smooth-window 5
+    
+    # Generate plots from third most recent run, save to custom directory
+    python generate_plots.py --recent 2 --output-dir ./custom_plots/
 """
 
 import argparse
@@ -14,16 +28,125 @@ import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend (same as main training)
 import matplotlib.pyplot as plt
 from typing import Dict, List, Any, Optional
+import glob
+from datetime import datetime
+
+
+def find_nth_most_recent_log_folder(n: int = 0, logs_dir: str = "logs") -> Optional[str]:
+    """
+    Find the nth most recent log folder based on date in folder names.
+    
+    Args:
+        n: Index of folder to select (0 = most recent, 1 = second most recent, etc.)
+        logs_dir: Base logs directory path
+        
+    Returns:
+        Path to the nth most recent log folder, or None if not found
+    """
+    if not os.path.exists(logs_dir):
+        print(f"Error: Logs directory '{logs_dir}' does not exist")
+        return None
+    
+    # Get all date-based folders (format: YYYYMMDD-HHMMSS)
+    date_folders = []
+    for item in os.listdir(logs_dir):
+        item_path = os.path.join(logs_dir, item)
+        if os.path.isdir(item_path) and len(item) == 15 and item[8] == '-':
+            try:
+                # Validate date format by parsing it
+                datetime.strptime(item, "%Y%m%d-%H%M%S")
+                date_folders.append(item)
+            except ValueError:
+                continue  # Skip folders that don't match the expected date format
+    
+    if not date_folders:
+        print(f"Error: No date-based log folders found in '{logs_dir}'")
+        return None
+    
+    # Sort by date (most recent first)
+    date_folders.sort(reverse=True)
+    
+    if n >= len(date_folders):
+        print(f"Error: Requested folder index {n} but only {len(date_folders)} folders available")
+        print(f"Available folders: {date_folders}")
+        return None
+    
+    selected_folder = date_folders[n]
+    full_path = os.path.join(logs_dir, selected_folder)
+    
+    # Check if plot_data.pkl exists
+    plot_data_path = os.path.join(full_path, "plots", "plot_data.pkl")
+    if not os.path.exists(plot_data_path):
+        print(f"Error: plot_data.pkl not found in {full_path}/plots/")
+        return None
+    
+    print(f"Selected folder: {selected_folder} (index {n})")
+    print(f"Plot data path: {plot_data_path}")
+    return full_path
+
+
+def smooth_data(data: List[float], window_size: int) -> List[float]:
+    """
+    Apply moving average smoothing to data.
+    
+    Args:
+        data: List of values to smooth
+        window_size: Size of the smoothing window
+        
+    Returns:
+        List of smoothed values (same length as input)
+    """
+    if window_size <= 1 or len(data) <= 1:
+        return data
+    
+    # Ensure window size doesn't exceed data length
+    window_size = min(window_size, len(data))
+    
+    smoothed = []
+    for i in range(len(data)):
+        # Calculate the window boundaries
+        start_idx = max(0, i - window_size // 2)
+        end_idx = min(len(data), i + window_size // 2 + 1)
+        
+        # Take the mean of values in the window
+        window_values = data[start_idx:end_idx]
+        smoothed.append(np.mean(window_values))
+    
+    return smoothed
 
 
 def load_plot_data(filename: str) -> Dict[str, Any]:
-    """Load plot data from pickle file."""
-    with open(filename, 'rb') as f:
-        data = pickle.load(f)
+    """Load plot data from pickle file with better error handling."""
+    import os
+    
+    if not os.path.exists(filename):
+        raise FileNotFoundError(f"Plot data file not found: {filename}")
+    
+    # Check file size
+    file_size = os.path.getsize(filename)
+    if file_size == 0:
+        raise ValueError(f"Plot data file is empty: {filename}")
+    
+    try:
+        with open(filename, 'rb') as f:
+            data = pickle.load(f)
+    except pickle.UnpicklingError as e:
+        # More helpful error message for corrupted files
+        raise ValueError(
+            f"Plot data file appears to be corrupted: {filename}\n"
+            f"Original error: {e}\n"
+            f"File size: {file_size} bytes\n"
+            f"You may need to re-run training to regenerate this file."
+        ) from e
+    except Exception as e:
+        raise ValueError(
+            f"Failed to load plot data from {filename}: {e}"
+        ) from e
+    
     return data
 
 
-def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custom_config: Optional[Dict[str, Any]] = None):
+def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custom_config: Optional[Dict[str, Any]] = None, smooth_window: int = 1):
     """
     Generate all plots from the saved data.
     
@@ -31,6 +154,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         data: Dictionary containing all plot data
         output_dir: Directory to save plots (default: same directory as data file)
         custom_config: Optional custom configuration to override defaults
+        smooth_window: Size of smoothing window (1 = no smoothing)
     """
     # Extract config from metadata
     config = data.get('metadata', {}).get('config', {})
@@ -52,6 +176,8 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         return
     
     print(f"Plotting {len(training_steps)} training steps")
+    if smooth_window > 1:
+        print(f"Applying smoothing with window size: {smooth_window}")
     
     # Check for missing required keys
     required_keys = [
@@ -72,25 +198,25 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     # Extract all metrics (arrays must have consistent lengths)
     min_length = len(training_steps)
     
-    # Core metrics
-    total_losses = data['total_losses'][:min_length]
-    policy_losses = data['policy_losses'][:min_length]
-    kl_losses = data['kl_losses'][:min_length]
-    avg_rewards = data['avg_rewards'][:min_length]
-    adapter_log_probs = data['adapter_log_probs'][:min_length]
-    baseline_log_probs = data['baseline_log_probs'][:min_length]
-    base_log_probs = data['base_log_probs'][:min_length]
-    avg_advantages = data['avg_advantages'][:min_length]
-    trajectory_log_probs = data['trajectory_log_probs'][:min_length]
-    wikipedia_order_consistency = data['wikipedia_order_consistency'][:min_length]
-    kl_penalty_terms = data['kl_penalty_terms'][:min_length]
-    reward_variance = data['reward_variance'][:min_length]
-    gradient_magnitudes = data['gradient_magnitudes'][:min_length]
+    # Core metrics - apply smoothing
+    total_losses = smooth_data(data['total_losses'][:min_length], smooth_window)
+    policy_losses = smooth_data(data['policy_losses'][:min_length], smooth_window)
+    kl_losses = smooth_data(data['kl_losses'][:min_length], smooth_window)
+    avg_rewards = smooth_data(data['avg_rewards'][:min_length], smooth_window)
+    adapter_log_probs = smooth_data(data['adapter_log_probs'][:min_length], smooth_window)
+    baseline_log_probs = smooth_data(data['baseline_log_probs'][:min_length], smooth_window)
+    base_log_probs = smooth_data(data['base_log_probs'][:min_length], smooth_window)
+    avg_advantages = smooth_data(data['avg_advantages'][:min_length], smooth_window)
+    trajectory_log_probs = smooth_data(data['trajectory_log_probs'][:min_length], smooth_window)
+    wikipedia_order_consistency = smooth_data(data['wikipedia_order_consistency'][:min_length], smooth_window)
+    kl_penalty_terms = smooth_data(data['kl_penalty_terms'][:min_length], smooth_window)
+    reward_variance = smooth_data(data['reward_variance'][:min_length], smooth_window)
+    gradient_magnitudes = smooth_data(data['gradient_magnitudes'][:min_length], smooth_window)
     step_log_probs = data['step_log_probs']
-    policy_gradients = data['policy_gradients'][:min_length]
-    clipping_ratios = data['clipping_ratios'][:min_length]
-    kl_from_ref = data['kl_from_ref'][:min_length]
-    batch_selection_entropy = data['batch_selection_entropy'][:min_length]
+    policy_gradients = smooth_data(data['policy_gradients'][:min_length], smooth_window)
+    clipping_ratios = smooth_data(data['clipping_ratios'][:min_length], smooth_window)
+    kl_from_ref = smooth_data(data['kl_from_ref'][:min_length], smooth_window)
+    batch_selection_entropy = smooth_data(data['batch_selection_entropy'][:min_length], smooth_window)
     
     # Enhanced debugging metrics (required)
     lora_layer_gradients = data['lora_layer_gradients']
@@ -101,13 +227,16 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     fig, axes = plt.subplots(3, 4, figsize=(24, 18))
     axes = axes.flatten()
     
+    # Determine title suffix for smoothing
+    title_suffix = f" (smoothed, window={smooth_window})" if smooth_window > 1 else ""
+    
     # Plot 1: Loss Components
     axes[0].plot(training_steps, total_losses, 'b-', label='Total Loss', linewidth=2)
     axes[0].plot(training_steps, policy_losses, 'g--', label='Policy Loss', linewidth=1.5)
     axes[0].plot(training_steps, kl_penalty_terms, 'r:', label=f'KL Penalty (β={KL_PENALTY_COEFFICIENT})', linewidth=1.5)
     axes[0].set_xlabel('Training Step')
     axes[0].set_ylabel('Loss')
-    axes[0].set_title('Loss Components')
+    axes[0].set_title(f'Loss Components{title_suffix}')
     axes[0].legend(fontsize=8)
     axes[0].grid(True, alpha=0.3)
     
@@ -115,7 +244,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[1].plot(training_steps, avg_rewards, 'purple', linewidth=2)
     axes[1].set_xlabel('Training Step')
     axes[1].set_ylabel('Average Reward')
-    axes[1].set_title('Average Reward (Baseline Updates Marked)')
+    axes[1].set_title(f'Average Reward (Baseline Updates Marked){title_suffix}')
     axes[1].grid(True, alpha=0.3)
     if len(training_steps) > 10:
         z = np.polyfit(training_steps, avg_rewards, 1)
@@ -124,7 +253,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         axes[1].legend(fontsize=8)
     
     # Add baseline update markers
-    BASELINE_UPDATE_FREQUENCY = config['BASELINE_UPDATE_FREQUENCY']
+    BASELINE_UPDATE_FREQUENCY = config.get('BASELINE_UPDATE_FREQUENCY', 10)
     for episode in range(BASELINE_UPDATE_FREQUENCY, max(training_steps) + 1, BASELINE_UPDATE_FREQUENCY):
         if episode <= max(training_steps):
             axes[1].axvline(x=episode, color='red', linestyle='--', alpha=0.6, linewidth=1)
@@ -135,7 +264,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[2].plot(training_steps, base_log_probs, 'blue', label='Base Model', linewidth=2)
     axes[2].set_xlabel('Training Step')
     axes[2].set_ylabel('Avg Log Prob (per token)')
-    axes[2].set_title('Model Log Probabilities')
+    axes[2].set_title(f'Model Log Probabilities{title_suffix}')
     axes[2].legend(fontsize=8)
     axes[2].grid(True, alpha=0.3)
     
@@ -144,7 +273,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[3].axhline(y=0, color='gray', linestyle='-', alpha=0.5)
     axes[3].set_xlabel('Training Step')
     axes[3].set_ylabel('Average Advantage')
-    axes[3].set_title('Advantage Statistics')
+    axes[3].set_title(f'Advantage Statistics{title_suffix}')
     axes[3].legend(fontsize=8)
     axes[3].grid(True, alpha=0.3)
     if len(training_steps) > 10:
@@ -157,7 +286,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[4].plot(training_steps, gradient_magnitudes, 'red', linewidth=2)
     axes[4].set_xlabel('Training Step')
     axes[4].set_ylabel('Gradient Norm')
-    axes[4].set_title('Gradient Norm Over Time')
+    axes[4].set_title(f'Gradient Norm Over Time{title_suffix}')
     axes[4].grid(True, alpha=0.3)
     axes[4].set_yscale('log')
     
@@ -168,7 +297,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[5].axhline(y=0.0, color='red', linestyle='--', alpha=0.3, label='Reverse Order (0.0)')
     axes[5].set_xlabel('Training Step')
     axes[5].set_ylabel('Order Consistency')
-    axes[5].set_title('Wikipedia Key Selection Order')
+    axes[5].set_title(f'Wikipedia Key Selection Order{title_suffix}')
     axes[5].set_ylim(-0.1, 1.1)
     axes[5].legend(fontsize=7)
     axes[5].grid(True, alpha=0.3)
@@ -177,7 +306,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[6].plot(training_steps, kl_from_ref, 'darkred', linewidth=2)
     axes[6].set_xlabel('Training Step')
     axes[6].set_ylabel('KL Divergence')
-    axes[6].set_title('KL Divergence from Reference Model (π_ref)')
+    axes[6].set_title(f'KL Divergence from Reference Model (π_ref){title_suffix}')
     axes[6].grid(True, alpha=0.3)
     mean_kl = np.mean(kl_from_ref)
     axes[6].axhline(y=mean_kl, color='gray', linestyle='--', alpha=0.5, label=f'Mean: {mean_kl:.4f}')
@@ -187,59 +316,58 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[7].plot(training_steps, reward_variance, 'magenta', linewidth=2)
     axes[7].set_xlabel('Training Step')
     axes[7].set_ylabel('Reward Variance')
-    axes[7].set_title('Reward Variance Within Trajectory')
+    axes[7].set_title(f'Reward Variance Within Trajectory{title_suffix}')
     axes[7].grid(True, alpha=0.3)
     
-    # Plot 9: Step-Indexed Log Probabilities
-    if len(step_log_probs) > 0 and any(len(ep) > 0 for ep in step_log_probs):
-        # Get NUM_KV_PAIRS from config or infer from data
-        NUM_KV_PAIRS = config.get('NUM_KV_PAIRS', 15)
-        step_indices = list(range(NUM_KV_PAIRS))
-        
-        # Divide episodes into thirds
-        total_episodes = len(step_log_probs)
-        first_third_end = total_episodes // 3
-        second_third_end = 2 * total_episodes // 3
-        
-        def compute_avg_for_period(start_idx, end_idx):
-            avg_log_probs_by_step = []
-            for step_idx in step_indices:
-                step_log_probs_period = []
-                for episode_idx in range(start_idx, min(end_idx, len(step_log_probs))):
-                    episode_log_probs = step_log_probs[episode_idx]
-                    if step_idx < len(episode_log_probs):
-                        step_log_probs_period.append(episode_log_probs[step_idx])
-                
-                if step_log_probs_period:
-                    avg_log_prob = sum(step_log_probs_period) / len(step_log_probs_period)
-                    avg_log_probs_by_step.append(avg_log_prob)
-                else:
-                    avg_log_probs_by_step.append(0.0)
-            return avg_log_probs_by_step
-        
-        if total_episodes >= 9:
-            first_third = compute_avg_for_period(0, first_third_end)
-            second_third = compute_avg_for_period(first_third_end, second_third_end)
-            third_third = compute_avg_for_period(second_third_end, total_episodes)
+    # Plot 9: Log Probabilities by Step Index (Early/Mid/Late training periods)
+    if step_log_probs and len(step_log_probs) > 0:
+        max_steps = max(len(episode_steps) for episode_steps in step_log_probs if episode_steps)
+        if max_steps > 0:
+            step_indices = list(range(max_steps))
             
-            axes[8].plot(step_indices, first_third, 'lightcoral', linewidth=2, marker='o', 
-                         markersize=3, label=f'Early (eps 0-{first_third_end})', alpha=0.8)
-            axes[8].plot(step_indices, second_third, 'gold', linewidth=2, marker='s', 
-                         markersize=3, label=f'Mid (eps {first_third_end}-{second_third_end})', alpha=0.8)
-            axes[8].plot(step_indices, third_third, 'mediumseagreen', linewidth=2, marker='^', 
-                         markersize=3, label=f'Late (eps {second_third_end}+)', alpha=0.8)
-            axes[8].legend(fontsize=7)
+            def compute_avg_for_period(start_episode, end_episode):
+                """Compute average log probs by step index for a period."""
+                relevant_episodes = step_log_probs[start_episode:end_episode]
+                step_averages = []
+                for step_idx in range(max_steps):
+                    step_values = []
+                    for episode_steps in relevant_episodes:
+                        if step_idx < len(episode_steps):
+                            step_values.append(episode_steps[step_idx])
+                    step_averages.append(np.mean(step_values) if step_values else 0.0)
+                return step_averages
+            
+            total_episodes = len(step_log_probs)
+            first_third_end = total_episodes // 3
+            second_third_end = 2 * total_episodes // 3
+            
+            if total_episodes >= 9:
+                first_third = compute_avg_for_period(0, first_third_end)
+                second_third = compute_avg_for_period(first_third_end, second_third_end)
+                third_third = compute_avg_for_period(second_third_end, total_episodes)
+                
+                axes[8].plot(step_indices, first_third, 'lightcoral', linewidth=2, marker='o', 
+                             markersize=3, label=f'Early (eps 0-{first_third_end})', alpha=0.8)
+                axes[8].plot(step_indices, second_third, 'gold', linewidth=2, marker='s', 
+                             markersize=3, label=f'Mid (eps {first_third_end}-{second_third_end})', alpha=0.8)
+                axes[8].plot(step_indices, third_third, 'mediumseagreen', linewidth=2, marker='^', 
+                             markersize=3, label=f'Late (eps {second_third_end}+)', alpha=0.8)
+                axes[8].legend(fontsize=7)
+            else:
+                overall_avg = compute_avg_for_period(0, total_episodes)
+                axes[8].plot(step_indices, overall_avg, 'darkviolet', linewidth=2, marker='o', 
+                             markersize=4, label='Overall Average')
+                axes[8].legend(fontsize=8)
+            
+            axes[8].set_xlabel('Step Index')
+            axes[8].set_ylabel('Avg Log Prob of Selected Action')
+            axes[8].set_title(f'Log Prob by Step Index (training progression){title_suffix}')
+            axes[8].grid(True, alpha=0.3)
+            axes[8].set_xticks(step_indices)
         else:
-            overall_avg = compute_avg_for_period(0, total_episodes)
-            axes[8].plot(step_indices, overall_avg, 'darkviolet', linewidth=2, marker='o', 
-                         markersize=4, label='Overall Average')
-            axes[8].legend(fontsize=8)
-        
-        axes[8].set_xlabel('Step Index')
-        axes[8].set_ylabel('Avg Log Prob of Selected Action')
-        axes[8].set_title('Log Prob by Step Index (training progression)')
-        axes[8].grid(True, alpha=0.3)
-        axes[8].set_xticks(step_indices)
+            axes[8].text(0.5, 0.5, 'No step log prob data\navailable yet', 
+                         ha='center', va='center', transform=axes[8].transAxes, fontsize=10)
+            axes[8].set_title('Log Prob by Step Index')
     else:
         axes[8].text(0.5, 0.5, 'No step log prob data\navailable yet', 
                      ha='center', va='center', transform=axes[8].transAxes, fontsize=10)
@@ -252,43 +380,51 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[9].axhline(y=1.0, color='gray', linestyle='-', alpha=0.3, label='No change (1.0)')
     axes[9].set_xlabel('Training Step')
     axes[9].set_ylabel('Average Clipping Ratio')
-    axes[9].set_title('PPO Clipping Ratio (π_θ / π_old)')
+    axes[9].set_title(f'PPO Clipping Ratio (π_θ / π_old){title_suffix}')
     axes[9].legend(fontsize=7)
     axes[9].grid(True, alpha=0.3)
     axes[9].set_ylim(0.5, 1.5)
     
     # Plot 11: LoRA Layer Gradient Flow
-    for layer_idx, grad_history in lora_layer_gradients.items():
-        # Ensure gradient history matches training_steps length
-        grad_data = grad_history[:min_length] + [0.0] * max(0, min_length - len(grad_history))
-        color = 'red' if layer_idx == max(lora_layer_gradients.keys()) else f'C{layer_idx % 10}'
-        linewidth = 3 if layer_idx == max(lora_layer_gradients.keys()) else 1.5
-        alpha = 1.0 if layer_idx == max(lora_layer_gradients.keys()) else 0.7
-        label = f'Layer {layer_idx}' + (' (Query Layer)' if layer_idx == max(lora_layer_gradients.keys()) else '')
-        axes[10].plot(training_steps, grad_data, color=color, linewidth=linewidth, alpha=alpha, label=label)
+    if lora_layer_gradients:
+        for layer_idx, grad_history in lora_layer_gradients.items():
+            # Ensure gradient history matches training_steps length
+            grad_data = grad_history[:min_length] + [0.0] * max(0, min_length - len(grad_history))
+            # Apply smoothing to gradient data
+            grad_data_smoothed = smooth_data(grad_data, smooth_window)
+            color = 'red' if layer_idx == max(lora_layer_gradients.keys()) else f'C{layer_idx % 10}'
+            linewidth = 3 if layer_idx == max(lora_layer_gradients.keys()) else 1.5
+            alpha = 1.0 if layer_idx == max(lora_layer_gradients.keys()) else 0.7
+            label = f'Layer {layer_idx}' + (' (Query Layer)' if layer_idx == max(lora_layer_gradients.keys()) else '')
+            axes[10].plot(training_steps, grad_data_smoothed, color=color, linewidth=linewidth, alpha=alpha, label=label)
+        axes[10].legend(fontsize=6, loc='upper right')
+    else:
+        # Show message when no LoRA gradient data is available
+        axes[10].text(0.5, 0.5, 'No LoRA gradient data available', 
+                     transform=axes[10].transAxes, ha='center', va='center',
+                     fontsize=12, style='italic', alpha=0.6)
     axes[10].set_xlabel('Training Step')
     axes[10].set_ylabel('Gradient Magnitude')
-    axes[10].set_title('LoRA Layer Gradient Flow')
+    axes[10].set_title(f'LoRA Layer Gradient Flow{title_suffix}')
     axes[10].set_yscale('log')
-    axes[10].legend(fontsize=6, loc='upper right')
     axes[10].grid(True, alpha=0.3)
     
     # Plot 12: Advantage Distribution Analysis
-    positive_percentages = [d['positive_percentage'] for d in advantage_distributions]
-    negative_percentages = [d['negative_percentage'] for d in advantage_distributions]
+    positive_percentages = smooth_data([d['positive_percentage'] for d in advantage_distributions], smooth_window)
+    negative_percentages = smooth_data([d['negative_percentage'] for d in advantage_distributions], smooth_window)
     
     axes[11].plot(training_steps, positive_percentages, 'green', linewidth=2, label='Positive Advantages')
     axes[11].plot(training_steps, negative_percentages, 'red', linewidth=2, label='Negative Advantages')
     axes[11].axhline(y=50.0, color='gray', linestyle='--', alpha=0.5, label='50% (Balanced)')
     axes[11].set_xlabel('Training Step')
     axes[11].set_ylabel('Percentage (%)')
-    axes[11].set_title('Advantage Distribution (Step-Level Learning Signal)')
+    axes[11].set_title(f'Advantage Distribution (Step-Level Learning Signal){title_suffix}')
     axes[11].set_ylim(0, 100)
     axes[11].legend(fontsize=7)
     axes[11].grid(True, alpha=0.3)
     
     # Add baseline update markers
-    BASELINE_UPDATE_FREQUENCY = config['BASELINE_UPDATE_FREQUENCY']
+    BASELINE_UPDATE_FREQUENCY = config.get('BASELINE_UPDATE_FREQUENCY', 10)
     for episode in range(BASELINE_UPDATE_FREQUENCY, max(training_steps) + 1, BASELINE_UPDATE_FREQUENCY):
         if episode <= max(training_steps):
             axes[11].axvline(x=episode, color='orange', linestyle=':', alpha=0.6, linewidth=1)
@@ -296,8 +432,11 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     # Adjust layout
     plt.tight_layout(pad=2.0)
     
-    # Save the plot
-    output_path = os.path.join(output_dir, 'training_metrics.png')
+    # Save the plot with smoothing info in filename
+    base_name = 'training_metrics'
+    if smooth_window > 1:
+        base_name += f'_smooth{smooth_window}'
+    output_path = os.path.join(output_dir, f'{base_name}.png')
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
     
@@ -312,12 +451,18 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         plt.plot(training_steps, total_losses, 'b-', label='Total Loss', linewidth=2)
         plt.xlabel('Training Step')
         plt.ylabel('Loss')
-        plt.title('Loss Composition Over Time')
+        title = 'Loss Composition Over Time'
+        if smooth_window > 1:
+            title += f' (smoothed, window={smooth_window})'
+        plt.title(title)
         plt.legend(loc='upper right')
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
         
-        breakdown_path = os.path.join(output_dir, 'loss_breakdown.png')
+        breakdown_name = 'loss_breakdown'
+        if smooth_window > 1:
+            breakdown_name += f'_smooth{smooth_window}'
+        breakdown_path = os.path.join(output_dir, f'{breakdown_name}.png')
         plt.savefig(breakdown_path, dpi=150)
         plt.close()
         print(f"Saved loss breakdown to: {breakdown_path}")
@@ -326,12 +471,12 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     if len(training_steps) > 5:
         plt.figure(figsize=(15, 10))
         
-        # Extract similarity metrics
-        similarity_means = [s['mean'] for s in similarity_score_stats]
-        similarity_stds = [s['std'] for s in similarity_score_stats]
-        similarity_entropies = [s['entropy'] for s in similarity_score_stats]
-        similarity_maxs = [s['max'] for s in similarity_score_stats]
-        similarity_mins = [s['min'] for s in similarity_score_stats]
+        # Extract similarity metrics and apply smoothing
+        similarity_means = smooth_data([s['mean'] for s in similarity_score_stats], smooth_window)
+        similarity_stds = smooth_data([s['std'] for s in similarity_score_stats], smooth_window)
+        similarity_entropies = smooth_data([s['entropy'] for s in similarity_score_stats], smooth_window)
+        similarity_maxs = smooth_data([s['max'] for s in similarity_score_stats], smooth_window)
+        similarity_mins = smooth_data([s['min'] for s in similarity_score_stats], smooth_window)
         
         # Create 2x2 subplot for detailed similarity analysis
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
@@ -340,7 +485,10 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         ax1.plot(training_steps, similarity_means, 'blue', linewidth=2, label='Mean Similarity')
         ax1.set_xlabel('Training Step')
         ax1.set_ylabel('Similarity Score')
-        ax1.set_title('Mean Query-Key Similarity Evolution')
+        title = 'Mean Query-Key Similarity Evolution'
+        if smooth_window > 1:
+            title += f' (smoothed, window={smooth_window})'
+        ax1.set_title(title)
         ax1.grid(True, alpha=0.3)
         ax1.legend()
         
@@ -348,7 +496,10 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         ax2.plot(training_steps, similarity_entropies, 'green', linewidth=2, label='Similarity Entropy')
         ax2.set_xlabel('Training Step')
         ax2.set_ylabel('Entropy (nats)')
-        ax2.set_title('Query Specificity (Lower = More Specific)')
+        title = 'Query Specificity (Lower = More Specific)'
+        if smooth_window > 1:
+            title += f' (smoothed, window={smooth_window})'
+        ax2.set_title(title)
         ax2.grid(True, alpha=0.3)
         ax2.legend()
         
@@ -357,7 +508,10 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         ax3.plot(training_steps, similarity_ranges, 'orange', linewidth=2, label='Range (Max - Min)')
         ax3.set_xlabel('Training Step')
         ax3.set_ylabel('Similarity Range')
-        ax3.set_title('Query Discrimination Ability')
+        title = 'Query Discrimination Ability'
+        if smooth_window > 1:
+            title += f' (smoothed, window={smooth_window})'
+        ax3.set_title(title)
         ax3.grid(True, alpha=0.3)
         ax3.legend()
         
@@ -365,19 +519,25 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         ax4.plot(training_steps, similarity_stds, 'red', linewidth=2, label='Similarity Std Dev')
         ax4.set_xlabel('Training Step')
         ax4.set_ylabel('Standard Deviation')
-        ax4.set_title('Similarity Score Variability')
+        title = 'Similarity Score Variability'
+        if smooth_window > 1:
+            title += f' (smoothed, window={smooth_window})'
+        ax4.set_title(title)
         ax4.grid(True, alpha=0.3)
         ax4.legend()
         
         # Add baseline update markers to all subplots
-        BASELINE_UPDATE_FREQUENCY = config['BASELINE_UPDATE_FREQUENCY']
+        BASELINE_UPDATE_FREQUENCY = config.get('BASELINE_UPDATE_FREQUENCY', 10)
         for ax in [ax1, ax2, ax3, ax4]:
             for episode in range(BASELINE_UPDATE_FREQUENCY, max(training_steps) + 1, BASELINE_UPDATE_FREQUENCY):
                 if episode <= max(training_steps):
                     ax.axvline(x=episode, color='gray', linestyle=':', alpha=0.5, linewidth=1)
         
         plt.tight_layout()
-        similarity_path = os.path.join(output_dir, 'similarity_analysis.png')
+        similarity_name = 'similarity_analysis'
+        if smooth_window > 1:
+            similarity_name += f'_smooth{smooth_window}'
+        similarity_path = os.path.join(output_dir, f'{similarity_name}.png')
         plt.savefig(similarity_path, dpi=150)
         plt.close()
         print(f"Saved similarity analysis to: {similarity_path}")
@@ -386,10 +546,10 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     if len(training_steps) > 10:
         plt.figure(figsize=(12, 8))
         
-        # Extract step-level learning metrics over time
-        positive_advantages = [d['positive_percentage'] for d in advantage_distributions]
-        advantage_means = [d['mean'] for d in advantage_distributions]
-        advantage_stds = [d['std'] for d in advantage_distributions]
+        # Extract step-level learning metrics over time and apply smoothing
+        positive_advantages = smooth_data([d['positive_percentage'] for d in advantage_distributions], smooth_window)
+        advantage_means = smooth_data([d['mean'] for d in advantage_distributions], smooth_window)
+        advantage_stds = smooth_data([d['std'] for d in advantage_distributions], smooth_window)
         
         # Create 2x2 subplot for step-level analysis
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
@@ -399,7 +559,10 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         ax1.axhline(y=50.0, color='gray', linestyle='--', alpha=0.5, label='50% (Balanced)')
         ax1.set_xlabel('Training Step')
         ax1.set_ylabel('Percentage (%)')
-        ax1.set_title('Step-Level Learning Signal Strength')
+        title = 'Step-Level Learning Signal Strength'
+        if smooth_window > 1:
+            title += f' (smoothed, window={smooth_window})'
+        ax1.set_title(title)
         ax1.set_ylim(0, 100)
         ax1.grid(True, alpha=0.3)
         ax1.legend()
@@ -409,7 +572,10 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         ax2.axhline(y=0.0, color='gray', linestyle='-', alpha=0.5, label='Zero Advantage')
         ax2.set_xlabel('Training Step')
         ax2.set_ylabel('Advantage')
-        ax2.set_title('Advantage Magnitude Over Time')
+        title = 'Advantage Magnitude Over Time'
+        if smooth_window > 1:
+            title += f' (smoothed, window={smooth_window})'
+        ax2.set_title(title)
         ax2.grid(True, alpha=0.3)
         ax2.legend()
         
@@ -417,13 +583,16 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         ax3.plot(training_steps, advantage_stds, 'orange', linewidth=2, label='Advantage Std Dev')
         ax3.set_xlabel('Training Step')
         ax3.set_ylabel('Standard Deviation')
-        ax3.set_title('Learning Signal Variability')
+        title = 'Learning Signal Variability'
+        if smooth_window > 1:
+            title += f' (smoothed, window={smooth_window})'
+        ax3.set_title(title)
         ax3.grid(True, alpha=0.3)
         ax3.legend()
         
         # Subplot 4: Combined learning health score
         # Normalize metrics to 0-1 scale for combination
-        norm_positive = np.array(positive_advantages) / 100.0  # Already 0-100, normalize to 0-1
+        norm_positive = np.array(positive_advantages) / 100.0
         norm_mean_adv = np.array(advantage_means)
         norm_mean_adv = (norm_mean_adv - np.min(norm_mean_adv)) / (np.max(norm_mean_adv) - np.min(norm_mean_adv) + 1e-8)
         
@@ -432,20 +601,26 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         ax4.plot(training_steps, health_score * 100, 'purple', linewidth=2, label='Learning Health Score')
         ax4.set_xlabel('Training Step')
         ax4.set_ylabel('Health Score (%)')
-        ax4.set_title('Overall Step-Level Learning Health')
+        title = 'Overall Step-Level Learning Health'
+        if smooth_window > 1:
+            title += f' (smoothed, window={smooth_window})'
+        ax4.set_title(title)
         ax4.set_ylim(0, 100)
         ax4.grid(True, alpha=0.3)
         ax4.legend()
         
         # Add baseline update markers to all subplots
-        BASELINE_UPDATE_FREQUENCY = config['BASELINE_UPDATE_FREQUENCY']
+        BASELINE_UPDATE_FREQUENCY = config.get('BASELINE_UPDATE_FREQUENCY', 10)
         for ax in [ax1, ax2, ax3, ax4]:
             for episode in range(BASELINE_UPDATE_FREQUENCY, max(training_steps) + 1, BASELINE_UPDATE_FREQUENCY):
                 if episode <= max(training_steps):
                     ax.axvline(x=episode, color='red', linestyle=':', alpha=0.4, linewidth=1)
         
         plt.tight_layout()
-        step_analysis_path = os.path.join(output_dir, 'step_learning_analysis.png')
+        step_analysis_name = 'step_learning_analysis'
+        if smooth_window > 1:
+            step_analysis_name += f'_smooth{smooth_window}'
+        step_analysis_path = os.path.join(output_dir, f'{step_analysis_name}.png')
         plt.savefig(step_analysis_path, dpi=150)
         plt.close()
         print(f"Saved step-level learning analysis to: {step_analysis_path}")
@@ -453,17 +628,51 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
 
 def main():
     parser = argparse.ArgumentParser(description='Generate plots from saved training data')
-    parser.add_argument('data_file', help='Path to the pickle file containing plot data')
+    parser.add_argument('data_file', nargs='?', help='Path to the pickle file containing plot data')
     parser.add_argument('--output-dir', '-o', default=None,
                        help='Directory to save plots (default: same directory as input file)')
     parser.add_argument('--kl-coef', type=float, default=None,
                        help='Override KL penalty coefficient for labels')
+    parser.add_argument('--smooth-window', '-s', type=int, default=1,
+                       help='Smoothing window size (default: 1, no smoothing)')
+    parser.add_argument('--recent', type=int, metavar='N',
+                       help='Select the nth most recent log folder (0=most recent, 1=second most recent, etc.)')
+    parser.add_argument('--logs-dir', default='logs',
+                       help='Base logs directory (default: logs)')
     
     args = parser.parse_args()
     
+    # Validate smoothing window
+    if args.smooth_window < 1:
+        print("Error: Smoothing window size must be at least 1")
+        return
+    
+    # Determine data file path
+    if args.recent is not None:
+        # Use --recent flag to find log folder
+        log_folder = find_nth_most_recent_log_folder(args.recent, args.logs_dir)
+        if log_folder is None:
+            return
+        data_file = os.path.join(log_folder, "plots", "plot_data.pkl")
+        
+        # If no output directory specified, use the plots directory of the selected folder
+        if args.output_dir is None:
+            args.output_dir = os.path.join(log_folder, "plots")
+    else:
+        # Use explicit data_file argument
+        if args.data_file is None:
+            print("Error: Must specify either data_file argument or --recent flag")
+            parser.print_help()
+            return
+        data_file = args.data_file
+        
+        # If no output directory specified, use the directory of the input file
+        if args.output_dir is None:
+            args.output_dir = os.path.dirname(os.path.abspath(data_file))
+    
     # Load data
-    print(f"Loading data from: {args.data_file}")
-    data = load_plot_data(args.data_file)
+    print(f"Loading data from: {data_file}")
+    data = load_plot_data(data_file)
     
     # Print some info about the data
     metadata = data.get('metadata', {})
@@ -471,18 +680,14 @@ def main():
     print(f"Timestamp: {metadata.get('timestamp', 'unknown')}")
     print(f"Number of training steps: {len(data.get('training_steps', []))}")
     
-    # If no output directory specified, use the directory of the input file
-    if args.output_dir is None:
-        args.output_dir = os.path.dirname(os.path.abspath(args.data_file))
-    
     # Prepare custom config if needed
     custom_config = {}
     if args.kl_coef is not None:
         custom_config['KL_PENALTY_COEFFICIENT'] = args.kl_coef
     
     # Generate plots
-    generate_plots(data, args.output_dir, custom_config)
+    generate_plots(data, args.output_dir, custom_config, args.smooth_window)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main() 
