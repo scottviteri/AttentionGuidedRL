@@ -415,7 +415,8 @@ def compute_similarity(
     
     # Average over heads to get final probabilities [batch, num_keys]
     head_log_probs = torch.log(head_probabilities + 1e-8)
-    log_probabilities = torch.mean(head_log_probs, dim=1)
+    lse = torch.logsumexp(head_log_probs, dim=1)
+    log_probabilities = lse - torch.log(torch.tensor(num_heads, dtype=torch.float, device=lse.device))
     
     return log_probabilities
 
