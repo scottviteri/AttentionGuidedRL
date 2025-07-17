@@ -45,44 +45,20 @@ python -m pytest
 
 ### Model Selection
 
-Choose which model to use by setting the `MODEL_TYPE` environment variable:
+- Choose which backbone to use with the **`--model-type`** CLI flag (preferred) or the `MODEL_TYPE` environment variable.
 
 ```bash
-# Use GPT-2 (default, works on smaller GPUs)
-export MODEL_TYPE=gpt2
-python -m src.main
+# GPT-2 (default; lighter GPU requirements)
+python -m src.main --model-type gpt2
 
-# Use Llama-3.2-3B (requires more GPU memory, typically 12GB+)
-export MODEL_TYPE=llama
-python -m src.main
+# Llama-3.2-3B (≈12 GB GPU VRAM required)
+python -m src.main --model-type llama
 ```
 
-If no `MODEL_TYPE` is specified, GPT-2 is used by default.
+If neither the flag nor the env-var is supplied, GPT-2 is used by default.
 
 ### Query Token Configuration
-
-**NEW**: The project now supports using standard vocabulary tokens instead of special tokens for much better log probabilities.
-
-By default, the system uses standard tokens from the existing vocabulary (e.g., "Query", "Search") instead of adding new special tokens like `<VECTOR_QUERY>`. This provides dramatically better log probabilities since the model has seen these tokens during pre-training.
-
-#### Token Configuration Options:
-
-```bash
-# Use standard tokens (default - RECOMMENDED)
-export USE_STANDARD_QUERY_TOKEN=true  # Default: true
-python -m src.main
-
-# Use specific standard token
-export USE_STANDARD_QUERY_TOKEN=true
-export QUERY_TOKEN='Search'  # Options: Query, Search, Find, What, ?
-python -m src.main
-
-# Use original special token approach (not recommended - gives poor log probabilities)
-export USE_STANDARD_QUERY_TOKEN=false
-python -m src.main
-```
-
-**Performance Impact**: Using standard tokens improves log probabilities by 10-12 points compared to special tokens (e.g., from -17.49 to -4.96), which should significantly improve training quality.
+- **Deprecated**: The project now always uses the standard vocabulary token "Query" for the vector-query placeholder, so no extra configuration is required.
 
 ### Baseline Model Configuration
 
@@ -96,17 +72,14 @@ The previous 4-model setup caused KL loss to always be 0. The new simplified arc
 #### Baseline Update Configuration:
 
 ```bash
-# Default baseline update frequency (every 50 episodes)
-export BASELINE_UPDATE_FREQUENCY=50
-python -m src.main
+# Default baseline update frequency (every **10** episodes)
+python -m src.main --baseline-update-freq 10
 
-# Less frequent updates for more KL accumulation (every 75 episodes)
-export BASELINE_UPDATE_FREQUENCY=75
-python -m src.main
+# Less frequent updates (e.g. every 30 episodes) – more regularisation
+python -m src.main --baseline-update-freq 30
 
-# More frequent updates for faster adaptation (every 25 episodes)
-export BASELINE_UPDATE_FREQUENCY=25
-python -m src.main
+# More frequent updates (e.g. every 5 episodes) – faster policy adaptation
+python -m src.main --baseline-update-freq 5
 ```
 
 **KL Divergence Behavior**: 
@@ -132,6 +105,18 @@ python -m src.main
 export KL_PENALTY_COEFFICIENT=0.15
 export BASELINE_UPDATE_FREQUENCY=75
 python -m src.main
+```
+
+### GRPO-style Batching (NEW)
+
+By default the trainer uses the **GRPO** batching strategy in which each data item is repeated `batch_size` times. This is enabled with `--grpo-batching` (default **True**). Disable it to sample distinct items per batch position:
+
+```bash
+# Standard GRPO batching (repeat items)
+python -m src.main --grpo-batching
+
+# Classic distinct-sample batching
+python -m src.main --no-grpo-batching
 ```
 
 ### Training with Wikipedia
