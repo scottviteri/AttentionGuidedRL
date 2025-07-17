@@ -12,7 +12,8 @@ import random
 
 import torch
 from datasets import load_dataset
-from transformers import AutoTokenizer, PreTrainedTokenizer
+from transformers import AutoTokenizer
+from transformers.tokenization_utils import PreTrainedTokenizer
 
 from src.config import (
     TOKENIZER_NAME,
@@ -224,12 +225,12 @@ def iter_wikipedia_articles() -> Iterator[Dict]:
         Iterator[Dict]: Iterator yielding article dictionaries
     """
     # Use streaming mode to avoid loading the entire dataset into memory
+    # Updated to use the new Wikimedia dataset location
     dataset = load_dataset(
-        "wikipedia",
-        "20220301.en",
+        "wikimedia/wikipedia",
+        "20231101.en",
         split="train",
         streaming=True,
-        trust_remote_code=True,
     )
 
     for article in dataset:
