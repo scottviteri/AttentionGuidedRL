@@ -1,0 +1,310 @@
+"""
+Plotting data structures and utilities for the Attention-Guided RL project.
+
+This module provides a clean, type-safe way to collect and manage all plotting metrics
+without relying on global variables.
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Any, Optional
+import torch
+from datetime import datetime
+
+
+@dataclass(frozen=True)
+class PlotData:
+    """
+    Frozen dataclass containing all metrics for plotting and logging.
+    
+    This replaces the previous global variable approach with a clean,
+    type-safe data structure.
+    """
+    # Core training metrics
+    training_steps: List[int] = field(default_factory=list)
+    total_losses: List[float] = field(default_factory=list)
+    policy_losses: List[float] = field(default_factory=list)
+    kl_losses: List[float] = field(default_factory=list)
+    avg_rewards: List[float] = field(default_factory=list)
+    
+    # Model log probabilities
+    adapter_log_probs: List[float] = field(default_factory=list)
+    baseline_log_probs: List[float] = field(default_factory=list)
+    base_log_probs: List[float] = field(default_factory=list)  # Reference model
+    
+    # Advanced training metrics
+    avg_advantages: List[float] = field(default_factory=list)
+    trajectory_log_probs: List[float] = field(default_factory=list)
+    wikipedia_order_consistency: List[float] = field(default_factory=list)
+    entropy_values: List[float] = field(default_factory=list)
+    kl_penalty_terms: List[float] = field(default_factory=list)
+    reward_variance: List[float] = field(default_factory=list)
+    gradient_magnitudes: List[float] = field(default_factory=list)
+    step_log_probs: List[List[float]] = field(default_factory=list)  # List of lists
+    clipping_ratios: List[float] = field(default_factory=list)
+    batch_selection_entropy: List[float] = field(default_factory=list)
+    trajectory_samples: List[Dict[str, Any]] = field(default_factory=list)
+    kl_from_ref: List[float] = field(default_factory=list)
+    policy_gradients: List[float] = field(default_factory=list)  # Policy gradients (before negation)
+    
+    # Enhanced debugging metrics
+    lora_layer_gradients: Dict[int, List[float]] = field(default_factory=dict)
+    advantage_distributions: List[Dict[str, float]] = field(default_factory=list)
+    similarity_score_stats: List[Dict[str, float]] = field(default_factory=list)
+    
+    # Metadata
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    
+    def add_episode_data(
+        self,
+        episode: int,
+        total_loss: float,
+        policy_loss: float,
+        kl_loss: float,
+        avg_reward: float,
+        adapter_log_prob: float,
+        baseline_log_prob: float,
+        base_log_prob: float,
+        avg_advantage: float,
+        trajectory_log_prob: float,
+        wikipedia_order_consistency: float,
+        entropy_value: float,
+        kl_penalty_term: float,
+        reward_variance: float,
+        gradient_magnitude: float,
+        step_log_probs_episode: List[float],
+        clipping_ratio: float,
+        batch_selection_entropy: float,
+        kl_from_ref_value: float,
+        lora_layer_gradients_episode: Dict[int, float],
+        advantage_distribution: Dict[str, float],
+        similarity_score_stats: Dict[str, float],
+        policy_gradient: float,
+        trajectory_sample: Optional[Dict[str, Any]] = None
+    ) -> 'PlotData':
+        """
+        Add data for a single episode and return a new PlotData instance.
+        
+        This method follows the pure functional approach preferred by the user,
+        taking the current frozen instance and returning a new updated instance.
+        """
+        # Create new lists by copying existing data and appending new values
+        new_training_steps = self.training_steps + [episode]
+        new_total_losses = self.total_losses + [total_loss]
+        new_policy_losses = self.policy_losses + [policy_loss]
+        new_kl_losses = self.kl_losses + [kl_loss]
+        new_avg_rewards = self.avg_rewards + [avg_reward]
+        new_adapter_log_probs = self.adapter_log_probs + [adapter_log_prob]
+        new_baseline_log_probs = self.baseline_log_probs + [baseline_log_prob]
+        new_base_log_probs = self.base_log_probs + [base_log_prob]
+        new_avg_advantages = self.avg_advantages + [avg_advantage]
+        new_trajectory_log_probs = self.trajectory_log_probs + [trajectory_log_prob]
+        new_wikipedia_order_consistency = self.wikipedia_order_consistency + [wikipedia_order_consistency]
+        new_entropy_values = self.entropy_values + [entropy_value]
+        new_kl_penalty_terms = self.kl_penalty_terms + [kl_penalty_term]
+        new_reward_variance = self.reward_variance + [reward_variance]
+        new_gradient_magnitudes = self.gradient_magnitudes + [gradient_magnitude]
+        new_step_log_probs = self.step_log_probs + [step_log_probs_episode]
+        new_clipping_ratios = self.clipping_ratios + [clipping_ratio]
+        new_batch_selection_entropy = self.batch_selection_entropy + [batch_selection_entropy]
+        new_kl_from_ref = self.kl_from_ref + [kl_from_ref_value]
+        new_policy_gradients = self.policy_gradients + [policy_gradient]
+        new_advantage_distributions = self.advantage_distributions + [advantage_distribution]
+        new_similarity_score_stats = self.similarity_score_stats + [similarity_score_stats]
+        
+        # Handle trajectory samples (optional)
+        new_trajectory_samples = self.trajectory_samples.copy()
+        if trajectory_sample is not None:
+            new_trajectory_samples.append(trajectory_sample)
+        
+        # Update LoRA layer gradients
+        new_lora_layer_gradients = {}
+        for layer_idx, gradients_list in self.lora_layer_gradients.items():
+            new_lora_layer_gradients[layer_idx] = gradients_list.copy()
+        
+        for layer_idx, gradient_value in lora_layer_gradients_episode.items():
+            if layer_idx not in new_lora_layer_gradients:
+                new_lora_layer_gradients[layer_idx] = []
+            new_lora_layer_gradients[layer_idx].append(gradient_value)
+        
+        # Return new instance with updated data
+        return PlotData(
+            training_steps=new_training_steps,
+            total_losses=new_total_losses,
+            policy_losses=new_policy_losses,
+            kl_losses=new_kl_losses,
+            avg_rewards=new_avg_rewards,
+            adapter_log_probs=new_adapter_log_probs,
+            baseline_log_probs=new_baseline_log_probs,
+            base_log_probs=new_base_log_probs,
+            avg_advantages=new_avg_advantages,
+            trajectory_log_probs=new_trajectory_log_probs,
+            wikipedia_order_consistency=new_wikipedia_order_consistency,
+            entropy_values=new_entropy_values,
+            kl_penalty_terms=new_kl_penalty_terms,
+            reward_variance=new_reward_variance,
+            gradient_magnitudes=new_gradient_magnitudes,
+            step_log_probs=new_step_log_probs,
+            clipping_ratios=new_clipping_ratios,
+            batch_selection_entropy=new_batch_selection_entropy,
+            trajectory_samples=new_trajectory_samples,
+            kl_from_ref=new_kl_from_ref,
+            policy_gradients=new_policy_gradients,
+            lora_layer_gradients=new_lora_layer_gradients,
+            advantage_distributions=new_advantage_distributions,
+            similarity_score_stats=new_similarity_score_stats,
+            metadata=self.metadata  # Metadata is updated separately
+        )
+    
+    def with_metadata(self, metadata: Dict[str, Any]) -> 'PlotData':
+        """
+        Return a new PlotData instance with updated metadata.
+        """
+        return PlotData(
+            training_steps=self.training_steps,
+            total_losses=self.total_losses,
+            policy_losses=self.policy_losses,
+            kl_losses=self.kl_losses,
+            avg_rewards=self.avg_rewards,
+            adapter_log_probs=self.adapter_log_probs,
+            baseline_log_probs=self.baseline_log_probs,
+            base_log_probs=self.base_log_probs,
+            avg_advantages=self.avg_advantages,
+            trajectory_log_probs=self.trajectory_log_probs,
+            wikipedia_order_consistency=self.wikipedia_order_consistency,
+            entropy_values=self.entropy_values,
+            kl_penalty_terms=self.kl_penalty_terms,
+            reward_variance=self.reward_variance,
+            gradient_magnitudes=self.gradient_magnitudes,
+            step_log_probs=self.step_log_probs,
+            clipping_ratios=self.clipping_ratios,
+            batch_selection_entropy=self.batch_selection_entropy,
+            trajectory_samples=self.trajectory_samples,
+            kl_from_ref=self.kl_from_ref,
+            policy_gradients=self.policy_gradients,
+            lora_layer_gradients=self.lora_layer_gradients,
+            advantage_distributions=self.advantage_distributions,
+            similarity_score_stats=self.similarity_score_stats,
+            metadata=metadata
+        )
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert to dictionary format compatible with the existing plotting system.
+        """
+        return {
+            'training_steps': self.training_steps,
+            'total_losses': self.total_losses,
+            'policy_losses': self.policy_losses,
+            'kl_losses': self.kl_losses,
+            'avg_rewards': self.avg_rewards,
+            'adapter_log_probs': self.adapter_log_probs,
+            'baseline_log_probs': self.baseline_log_probs,
+            'base_log_probs': self.base_log_probs,
+            'avg_advantages': self.avg_advantages,
+            'trajectory_log_probs': self.trajectory_log_probs,
+            'wikipedia_order_consistency': self.wikipedia_order_consistency,
+            'entropy_values': self.entropy_values,
+            'kl_penalty_terms': self.kl_penalty_terms,
+            'reward_variance': self.reward_variance,
+            'gradient_magnitudes': self.gradient_magnitudes,
+            'step_log_probs': self.step_log_probs,
+            'clipping_ratios': self.clipping_ratios,
+            'batch_selection_entropy': self.batch_selection_entropy,
+            'trajectory_samples': self.trajectory_samples,
+            'kl_from_ref': self.kl_from_ref,
+            'policy_gradients': self.policy_gradients,
+            'lora_layer_gradients': self.lora_layer_gradients,
+            'advantage_distributions': self.advantage_distributions,
+            'similarity_score_stats': self.similarity_score_stats,
+            'metadata': self.metadata,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'PlotData':
+        """
+        Create PlotData instance from dictionary (for loading from pickle).
+        """
+        return cls(
+            training_steps=data.get('training_steps', []),
+            total_losses=data.get('total_losses', []),
+            policy_losses=data.get('policy_losses', []),
+            kl_losses=data.get('kl_losses', []),
+            avg_rewards=data.get('avg_rewards', []),
+            adapter_log_probs=data.get('adapter_log_probs', []),
+            baseline_log_probs=data.get('baseline_log_probs', []),
+            base_log_probs=data.get('base_log_probs', []),
+            avg_advantages=data.get('avg_advantages', []),
+            trajectory_log_probs=data.get('trajectory_log_probs', []),
+            wikipedia_order_consistency=data.get('wikipedia_order_consistency', []),
+            entropy_values=data.get('entropy_values', []),
+            kl_penalty_terms=data.get('kl_penalty_terms', []),
+            reward_variance=data.get('reward_variance', []),
+            gradient_magnitudes=data.get('gradient_magnitudes', []),
+            step_log_probs=data.get('step_log_probs', []),
+            clipping_ratios=data.get('clipping_ratios', []),
+            batch_selection_entropy=data.get('batch_selection_entropy', []),
+            trajectory_samples=data.get('trajectory_samples', []),
+            kl_from_ref=data.get('kl_from_ref', []),
+            policy_gradients=data.get('policy_gradients', []),
+            lora_layer_gradients=data.get('lora_layer_gradients', {}),
+            advantage_distributions=data.get('advantage_distributions', []),
+            similarity_score_stats=data.get('similarity_score_stats', []),
+            metadata=data.get('metadata', {}),
+        )
+
+
+def save_plot_data(plot_data: PlotData, log_dir: str) -> None:
+    """
+    Save plotting data to a single pickle file.
+    
+    Args:
+        plot_data: PlotData instance containing all metrics
+        log_dir: Directory where logs are saved
+    """
+    import pickle
+    import os
+    
+    # Create plots directory
+    plots_dir = f"{log_dir}/plots"
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    # Save to single pickle file (overwrites previous)
+    filename = f"{plots_dir}/plot_data.pkl"
+    with open(filename, 'wb') as f:
+        pickle.dump(plot_data.to_dict(), f)
+
+
+def load_plot_data(filepath: str) -> PlotData:
+    """
+    Load plotting data from a pickle file.
+    
+    Args:
+        filepath: Path to the pickle file
+        
+    Returns:
+        PlotData instance
+    """
+    import pickle
+    
+    with open(filepath, 'rb') as f:
+        data = pickle.load(f)
+    
+    return PlotData.from_dict(data)
+
+
+def create_metadata(episode: int, config_values: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Create metadata dictionary for the plotting data.
+    
+    Args:
+        episode: Current episode number
+        config_values: Configuration values to include
+        
+    Returns:
+        Metadata dictionary
+    """
+    return {
+        'episode': episode,
+        'timestamp': datetime.now().isoformat(),
+        'config': config_values
+    } 

@@ -47,37 +47,9 @@ from src.training import (
     train_step,
     generate_query_vector,
 )
+from src.plotting import PlotData, save_plot_data, create_metadata
 
 import wandb
-
-# Lists to store metrics for plotting
-training_steps = []
-total_losses = []
-policy_losses = []
-kl_losses = []
-avg_rewards = []
-adapter_log_probs = []
-baseline_log_probs = []
-base_log_probs = []  # Base model log probabilities
-
-# NEW: Additional metrics for comprehensive plotting
-avg_advantages = []  # Original advantages (including negative)
-trajectory_log_probs = []
-wikipedia_order_consistency = []  # Order consistency metric (1.0 = perfect order, 0.0 = perfect reverse)
-entropy_values = []  # Policy entropy for exploration tracking
-kl_penalty_terms = []  # Actual KL penalty terms added to loss
-reward_variance = []  # Variance of rewards within each trajectory
-gradient_magnitudes = []  # Gradient magnitudes over time
-step_log_probs = []  # Log probabilities by step index (list of lists)
-clipping_ratios = []  # PPO clipping ratios
-kl_from_ref = []  # KL divergence from reference model (pi_ref)
-batch_selection_entropy = []  # Entropy of key selection orders within each batch
-trajectory_samples = []  # Sample trajectories for detailed analysis
-
-# NEW: Enhanced debugging metrics
-lora_layer_gradients = {}  # Per-layer gradient magnitudes for LoRA layers
-advantage_distributions = []  # Positive vs negative advantage percentages per episode
-similarity_score_stats = []  # Similarity score distribution statistics
 
 def setup_logging(args):
     """
@@ -564,7 +536,9 @@ def compute_kl_from_reference(
     """
     all_key_embs = getattr(trajectory, "all_key_embeddings", None)
     if not isinstance(all_key_embs, torch.Tensor):
-        raise TypeError("trajectory.all_key_embeddings must be a torch.Tensor")
+        raise TypeError(f"trajectory.all_key_embeddings must be a torch.Tensor, got {type(all_key_embs)}")
+    
+
 
     # Ensure context_tokens from tokenizer is a real tensor (unit-tests may return MagicMocks)
     device = next(adapter_model.parameters()).device
@@ -908,6 +882,9 @@ def main():
         episodes_range = range(start_episode, args.episodes)
         progress_bar = tqdm(episodes_range)
         
+        # Initialize plotting data structure (replaces global variables)
+        plot_data = PlotData()
+        
         # Training loop
         reward_history = []
         loss_history = []
@@ -978,7 +955,6 @@ def main():
                 ref_model,
                 tokenizer,
             )
-
             kl_from_ref.append(kl_from_ref_value)
             
             # Update reward stats
@@ -1015,26 +991,15 @@ def main():
             
             # Calculate average reward across the batch
             avg_reward = trajectory.avg_reward.mean().item()
-                
-            # Store metrics for plotting
-            training_steps.append(episode)
-            total_losses.append(total_loss)
-            policy_losses.append(policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss)
-            kl_losses.append(kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss)
-            avg_rewards.append(avg_reward)
-            
-            # NEW: Track additional metrics for comprehensive plotting
             
             # Compute Wikipedia order consistency metric
             if args.dataset == "wikipedia":
                 order_consistency = compute_wikipedia_order_consistency(trajectory)
-                wikipedia_order_consistency.append(order_consistency)
             else:
-                wikipedia_order_consistency.append(0.5)  # Neutral for non-Wikipedia datasets
+                order_consistency = 0.5  # Neutral for non-Wikipedia datasets
             
             # Compute batch selection entropy
             selection_entropy = compute_batch_selection_entropy(trajectory)
-            batch_selection_entropy.append(selection_entropy)
             
             # Periodically log detailed trajectory information
             if episode % 50 == 0 or episode < 5:  # Log first few and then every 50 episodes
@@ -1072,7 +1037,7 @@ def main():
                     if step.value_text:
                         trajectory_info['value_texts'].append(step.value_text[0])
                 
-                trajectory_samples.append(trajectory_info)
+                # trajectory_info will be passed to PlotData later
                 
                 # Also log to console if verbose or first few episodes
                 if args.verbose or episode < 3:
@@ -1097,23 +1062,13 @@ def main():
                         if info['value_text']:
                             print(f"    Value: {info['value_text'][:50]}...")
             
-            # Track trajectory-level log probabilities (average across all trajectory steps)
+            # Calculate derived metrics for plotting
             traj_log_prob = adapter_log_probs_batch.mean().item()
-            trajectory_log_probs.append(traj_log_prob)
-            
-            # Track KL penalty terms (actual penalty added to loss)
             kl_penalty_term = (kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss) * KL_PENALTY_COEFFICIENT
-            kl_penalty_terms.append(kl_penalty_term)
-            
-            # Track reward variance within trajectory
             reward_var = trajectory.avg_reward.var().item()
-            reward_variance.append(reward_var)
-            
-            # Track current learning rate
             current_lr = optimizer.param_groups[0]['lr']
             
             # Compute and track average advantages from this episode
-            # We'll compute this from the trajectory using the same logic as in training
             if trajectory.rewards is not None:
                 from src.training import compute_advantages
                 from src.config import GAMMA, GAE_LAMBDA, USE_GRPO_BASELINE
@@ -1123,22 +1078,16 @@ def main():
                     use_grpo_baseline=USE_GRPO_BASELINE,
                 )
                 avg_advantage = advantages.mean().item()
-                
-                # NEW: Track advantage distribution
                 advantage_dist = compute_advantage_distribution(advantages)
-                advantage_distributions.append(advantage_dist)
             else:
                 avg_advantage = 0.0
-                advantage_distributions.append({
+                advantage_dist = {
                     'positive_percentage': 0.0, 'negative_percentage': 0.0, 'zero_percentage': 100.0,
                     'mean': 0.0, 'std': 0.0
-                })
-            avg_advantages.append(avg_advantage)
+                }
             
-            # For conceptual clarity, also track the policy gradient (before negation)
-            # This helps visualize what we're actually reinforcing
+            # Policy gradient for visualization (before negation)
             policy_gradient = -(policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss)
-            policy_gradients.append(policy_gradient)
             
             # Update progress bar
             progress_bar.set_description(
@@ -1185,30 +1134,25 @@ def main():
                 if args.verbose:
                     print(f"\nCheckpoint saved at episode {episode}")
                 
-            # Track gradient statistics
+            # Calculate additional metrics
             gradient_stats = get_gradient_stats(adapter_model)
             gradient_history.append(gradient_stats)
-            gradient_magnitudes.append(gradient_stats[0])
+            gradient_magnitude = gradient_stats[0]
             
-            # NEW: Track LoRA layer-specific gradients
+            # Track LoRA layer-specific gradients
             layer_grads = track_lora_layer_gradients(adapter_model)
-            for layer_idx, grad_norm in layer_grads.items():
-                if layer_idx not in lora_layer_gradients:
-                    lora_layer_gradients[layer_idx] = []
-                lora_layer_gradients[layer_idx].append(grad_norm)
             
-            # NEW: Track similarity score statistics
+            # Track similarity score statistics
             similarity_stats = compute_similarity_score_stats(trajectory)
-            similarity_score_stats.append(similarity_stats)
             
-            # Track reward history
+            # Track reward and loss history
             reward_history.append(avg_reward)
             loss_history.append(total_loss)
             
-            # Track log probabilities (average across batch and timesteps)
-            adapter_log_probs.append(adapter_log_probs_batch.mean().item())
-            baseline_log_probs.append(old_log_probs_batch.mean().item())
-            base_log_probs.append(ref_log_probs_batch.mean().item())
+            # Calculate log probabilities for plotting
+            adapter_log_prob = adapter_log_probs_batch.mean().item()
+            baseline_log_prob = old_log_probs_batch.mean().item()
+            base_log_prob = ref_log_probs_batch.mean().item()
             
             # Track log probabilities by step index (for the new plot)
             # Compute log probabilities of selected actions at each step
@@ -1232,11 +1176,49 @@ def main():
                     selected_idx = step.selected_idx
                     selected_log_prob = log_probs[torch.arange(log_probs.shape[0]), selected_idx].mean().item()
                     step_log_probs_episode.append(selected_log_prob)
-            step_log_probs.append(step_log_probs_episode)
+            # Add episode data to plot_data using the clean functional approach
+            trajectory_sample = trajectory_info if (episode % 50 == 0 or episode < 5) and 'trajectory_info' in locals() else None
+            plot_data = plot_data.add_episode_data(
+                episode=episode,
+                total_loss=total_loss,
+                policy_loss=policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss,
+                kl_loss=kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss,
+                avg_reward=avg_reward,
+                adapter_log_prob=adapter_log_prob,
+                baseline_log_prob=baseline_log_prob,
+                base_log_prob=base_log_prob,
+                avg_advantage=avg_advantage,
+                trajectory_log_prob=traj_log_prob,
+                wikipedia_order_consistency=order_consistency,
+                entropy_value=0.0,  # TODO: Calculate actual entropy if needed
+                kl_penalty_term=kl_penalty_term,
+                reward_variance=reward_var,
+                gradient_magnitude=gradient_magnitude,
+                step_log_probs_episode=step_log_probs_episode,
+                clipping_ratio=avg_clipping_ratio,
+                batch_selection_entropy=selection_entropy,
+                kl_from_ref_value=kl_from_ref_value,
+                lora_layer_gradients_episode=layer_grads,
+                advantage_distribution=advantage_dist,
+                similarity_score_stats=similarity_stats,
+                policy_gradient=policy_gradient,
+                trajectory_sample=trajectory_sample
+            )
             
-            # Save and plot metrics more frequently (every 15 episodes) for better monitoring
+            # Save and plot metrics periodically
             if episode > 0 and episode % 15 == 0:
-                save_plot_data(log_dir, episode, policy_gradients)
+                # Add metadata to plot data and save
+                metadata = create_metadata(episode, {
+                    'KL_PENALTY_COEFFICIENT': KL_PENALTY_COEFFICIENT,
+                    'GAMMA': GAMMA,
+                    'GAE_LAMBDA': GAE_LAMBDA,
+                    'USE_GRPO_BASELINE': USE_GRPO_BASELINE,
+                    'TEMPERATURE': TEMPERATURE,
+                    'NUM_KV_PAIRS': NUM_KV_PAIRS,
+                    'BASELINE_UPDATE_FREQUENCY': BASELINE_UPDATE_FREQUENCY,
+                })
+                plot_data_with_metadata = plot_data.with_metadata(metadata)
+                save_plot_data(plot_data_with_metadata, log_dir)
                 plot_metrics(log_dir, policy_gradients)
             
             # Log every LOG_INTERVAL episodes
@@ -1271,9 +1253,9 @@ def main():
                     })
                 
                 # Log gradient diagnostics
-                if len(gradient_magnitudes) > 0:
+                if len(plot_data.gradient_magnitudes) > 0:
                     logging.info(
-                        f"  Gradient Stats - Norm: {gradient_magnitudes[-1]:.6f}, "
+                        f"  Gradient Stats - Norm: {plot_data.gradient_magnitudes[-1]:.6f}, "
                         f"Weight Change: {weight_changes[-1]:.6f}"
                     )
                     
@@ -1282,17 +1264,27 @@ def main():
                         logging.warning("  WARNING: Weights are not changing!")
                     
                     # Check gradient health
-                    if gradient_magnitudes[-1] < 1e-8:
+                    if plot_data.gradient_magnitudes[-1] < 1e-8:
                         logging.warning("  WARNING: Gradients are vanishing!")
-                    elif gradient_magnitudes[-1] > 100:
+                    elif plot_data.gradient_magnitudes[-1] > 100:
                         logging.warning("  WARNING: Gradients are exploding!")
             
         # Save final checkpoint
         save_checkpoint(adapter_model, "latest")
         
         # Save final plot data and create plots
-        save_plot_data(log_dir, episode, policy_gradients)
-        plot_metrics(log_dir, policy_gradients)
+        final_metadata = create_metadata(episode, {
+            'KL_PENALTY_COEFFICIENT': KL_PENALTY_COEFFICIENT,
+            'GAMMA': GAMMA,
+            'GAE_LAMBDA': GAE_LAMBDA,
+            'USE_GRPO_BASELINE': USE_GRPO_BASELINE,
+            'TEMPERATURE': TEMPERATURE,
+            'NUM_KV_PAIRS': NUM_KV_PAIRS,
+            'BASELINE_UPDATE_FREQUENCY': BASELINE_UPDATE_FREQUENCY,
+        })
+        final_plot_data = plot_data.with_metadata(final_metadata)
+        save_plot_data(final_plot_data, log_dir)
+        plot_metrics(log_dir, None)
         
         logging.info("Training complete!")
         
@@ -1308,81 +1300,7 @@ def main():
             old_hook_remover()
 
 
-def save_plot_data(log_dir, episode, policy_gradients_data=None, all_data=None):
-    """
-    Save all plotting data to a pickle file for later visualization.
-    
-    Args:
-        log_dir: Directory where logs are saved
-        episode: Current episode number (for filename)
-        policy_gradients_data: Policy gradients data (passed separately)
-        all_data: Optional pre-collected data dict, otherwise collect from globals
-    """
-    import pickle
-    import datetime
-    from src.config import (
-        KL_PENALTY_COEFFICIENT, GAMMA, GAE_LAMBDA, USE_GRPO_BASELINE,
-        TEMPERATURE, NUM_KV_PAIRS, BASELINE_UPDATE_FREQUENCY
-    )
-    
-    # Create plots directory
-    plots_dir = f"{log_dir}/plots"
-    os.makedirs(plots_dir, exist_ok=True)
-    
-    # Collect all data if not provided
-    if all_data is None:
-        all_data = {
-            'training_steps': training_steps.copy(),
-            'total_losses': total_losses.copy(),
-            'policy_losses': policy_losses.copy(),
-            'kl_losses': kl_losses.copy(),
-            'avg_rewards': avg_rewards.copy(),
-            'adapter_log_probs': adapter_log_probs.copy(),
-            'baseline_log_probs': baseline_log_probs.copy(),
-            'base_log_probs': base_log_probs.copy(),
-            'avg_advantages': avg_advantages.copy(),
-            'trajectory_log_probs': trajectory_log_probs.copy(),
-            'wikipedia_order_consistency': wikipedia_order_consistency.copy(),
-            'kl_penalty_terms': kl_penalty_terms.copy(),
-            'reward_variance': reward_variance.copy(),
-            'gradient_magnitudes': gradient_magnitudes.copy(),
-            'step_log_probs': step_log_probs.copy(),
-            'policy_gradients': policy_gradients_data.copy() if policy_gradients_data else [],
-            'clipping_ratios': clipping_ratios.copy(),
-            'kl_from_ref': kl_from_ref.copy(),
-            'batch_selection_entropy': batch_selection_entropy.copy(),
-            'trajectory_samples': trajectory_samples.copy(),  # Add trajectory samples
-            # NEW: Enhanced debugging metrics
-            'lora_layer_gradients': {k: v.copy() for k, v in lora_layer_gradients.items()},
-            'advantage_distributions': advantage_distributions.copy(),
-            'similarity_score_stats': similarity_score_stats.copy(),
-            # Add metadata
-            'metadata': {
-                'episode': episode,
-                'timestamp': datetime.datetime.now().isoformat(),
-                'config': {
-                    'KL_PENALTY_COEFFICIENT': KL_PENALTY_COEFFICIENT,
-                    'GAMMA': GAMMA,
-                    'GAE_LAMBDA': GAE_LAMBDA,
-                    'USE_GRPO_BASELINE': USE_GRPO_BASELINE,
-                    'TEMPERATURE': TEMPERATURE,
-                    'NUM_KV_PAIRS': NUM_KV_PAIRS,
-                    'BASELINE_UPDATE_FREQUENCY': BASELINE_UPDATE_FREQUENCY,
-                }
-            }
-        }
-    
-    # Save to pickle file
-    filename = f"{plots_dir}/plot_data_episode_{episode}.pkl"
-    with open(filename, 'wb') as f:
-        pickle.dump(all_data, f)
-    
-    logging.info(f"Saved plot data to {filename}")
-    
-    # Also save a "latest" version for easy access
-    latest_filename = f"{plots_dir}/plot_data_latest.pkl"
-    with open(latest_filename, 'wb') as f:
-        pickle.dump(all_data, f)
+# Old save_plot_data function removed - now using the one from src.plotting module
 
 
 def plot_metrics(log_dir, policy_gradients_data=None):
@@ -1395,9 +1313,9 @@ def plot_metrics(log_dir, policy_gradients_data=None):
     """
     import subprocess
     
-    # Get the latest plot data file
+    # Get the plot data file
     plots_dir = f"{log_dir}/plots"
-    latest_pickle = f"{plots_dir}/plot_data_latest.pkl"
+    latest_pickle = f"{plots_dir}/plot_data.pkl"
     
     if not os.path.exists(latest_pickle):
         logging.warning(f"No plot data found at {latest_pickle}")

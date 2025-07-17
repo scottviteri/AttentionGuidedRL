@@ -7,9 +7,10 @@ The AttentionGuidedRL project includes a comprehensive plotting system that trac
 ## Key Features
 
 ### 1. Automatic Plot Generation During Training
-- Plots are automatically saved every 25 episodes and at the end of training
-- Data is saved as pickle files for later re-generation
-- Plots are saved in `logs/<timestamp>/plots/`
+- **NEW**: Uses clean `PlotData` dataclass structure and single pickle file approach
+- Plots are automatically saved every 15 episodes and at the end of training
+- Data is saved to `logs/<timestamp>/plots/plot_data.pkl` (single file, overwrites)
+- **Key improvements**: Type-safe data structure, functional updates, no global variables
 
 ### 2. Metrics Tracked (20+ metrics)
 - **Loss Components**: Total loss, policy loss, KL penalty
@@ -98,14 +99,14 @@ This creates:
 ### Regenerate Plots After Training
 ```bash
 # Find the latest plot data
-latest_data=$(find logs -name "plot_data_latest.pkl" | sort | tail -1)
+latest_data=$(find logs -name "plot_data.pkl" | sort | tail -1)
 python generate_plots.py $latest_data
 ```
 
 ### Compare Multiple Runs
 ```bash
 # The custom_plot_example.py automatically finds and compares multiple runs
-python custom_plot_example.py logs/*/plots/plot_data_latest.pkl
+python custom_plot_example.py logs/*/plots/plot_data.pkl
 ```
 
 ### Create Publication-Quality Figures
@@ -119,7 +120,15 @@ python custom_plot_example.py logs/*/plots/plot_data_latest.pkl
 
 ## Plot Data Structure
 
-Each pickle file contains:
+**NEW**: Data is now managed through a frozen `PlotData` dataclass defined in `src/plotting.py`. 
+
+The `PlotData` class provides:
+- **Type safety**: All metrics properly typed with List[float], Dict[int, List[float]], etc.
+- **Immutability**: Frozen dataclass prevents accidental mutations
+- **Functional updates**: `add_episode_data()` returns new instances (pure functions)
+- **Clean API**: No global variables, explicit data management
+
+Each pickle file contains the output of `PlotData.to_dict()`:
 ```python
 {
     'training_steps': [...],
@@ -127,9 +136,9 @@ Each pickle file contains:
     'policy_losses': [...],
     'kl_losses': [...],
     'avg_rewards': [...],
-    # ... 17+ more existing metrics ...
+    # ... 20+ metrics with proper typing ...
     
-    # NEW: Enhanced debugging metrics
+    # Enhanced debugging metrics
     'lora_layer_gradients': {0: [...], 1: [...], 10: [...]},  # Per-layer gradient magnitudes
     'advantage_distributions': [{'positive_percentage': 65.2, 'negative_percentage': 34.8, ...}],
     'similarity_score_stats': [{'mean': 0.23, 'std': 0.18, 'entropy': 2.4, ...}],

@@ -204,10 +204,9 @@ The model is saved periodically (every 100 episodes by default) and at the end o
 **NEW**: The training now automatically saves all plotting data to pickle files, allowing you to regenerate plots or create custom visualizations without re-running training.
 
 During training, plot data is saved:
-- Every 25 episodes: `logs/<timestamp>/plots/plot_data_episode_<N>.pkl`
-- At the end of training: `logs/<timestamp>/plots/plot_data_latest.pkl`
+- Every 15 episodes and at end of training: `logs/<timestamp>/plots/plot_data.pkl` (overwrites previous)
 
-**Note**: Enhanced plotting requires all new metrics. No backward compatibility with older pickle files.
+**Note**: Now uses clean `PlotData` dataclass structure with single file approach. No backward compatibility with older pickle files.
 
 ### Regenerating Plots
 
@@ -215,7 +214,7 @@ Use the standalone plotting script to regenerate plots from saved data:
 
 ```bash
 # Generate plots from the latest run
-python generate_plots.py logs/*/plots/plot_data_latest.pkl
+python generate_plots.py logs/*/plots/plot_data.pkl
 
 # Generate plots with custom output directory
 python generate_plots.py logs/*/plots/plot_data_episode_100.pkl -o custom_plots/
@@ -246,7 +245,7 @@ import pickle
 import matplotlib.pyplot as plt
 
 # Load saved data
-with open('logs/latest/plots/plot_data_latest.pkl', 'rb') as f:
+with open('logs/latest/plots/plot_data.pkl', 'rb') as f:
     data = pickle.load(f)
 
 # Access any metric

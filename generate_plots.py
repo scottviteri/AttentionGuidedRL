@@ -51,7 +51,25 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         print("No data to plot!")
         return
     
-    # Extract all metrics (no backward compatibility - all metrics must be present)
+    print(f"Plotting {len(training_steps)} training steps")
+    
+    # Check for missing required keys
+    required_keys = [
+        'total_losses', 'policy_losses', 'kl_losses', 'avg_rewards',
+        'adapter_log_probs', 'baseline_log_probs', 'base_log_probs',
+        'avg_advantages', 'trajectory_log_probs', 'wikipedia_order_consistency',
+        'kl_penalty_terms', 'reward_variance', 'gradient_magnitudes',
+        'step_log_probs', 'policy_gradients', 'clipping_ratios',
+        'kl_from_ref', 'batch_selection_entropy',
+        'lora_layer_gradients', 'advantage_distributions', 'similarity_score_stats'
+    ]
+    
+    missing_keys = [key for key in required_keys if key not in data]
+    if missing_keys:
+        print(f"Error: Missing required keys: {missing_keys}")
+        return
+    
+    # Extract all metrics (arrays must have consistent lengths)
     min_length = len(training_steps)
     
     # Core metrics
