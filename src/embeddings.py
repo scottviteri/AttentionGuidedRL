@@ -60,15 +60,24 @@ def register_llama_embedding_hook(
     Returns:
         Tuple[Dict, Callable]: The embeddings dictionary and hook removal function
     """
-    # Handle negative indexing
+    # Handle negative indexing - check if it's a HuggingFace model or a different structure
+    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+        # HuggingFace LlamaForCausalLM structure
+        layers = model.model.layers
+    elif hasattr(model, 'model') and hasattr(model.model, 'model') and hasattr(model.model.model, 'layers'):
+        # Some other wrapper structure
+        layers = model.model.model.layers
+    else:
+        raise ValueError("Cannot find layers in model structure")
+    
     if layer_idx < 0:
-        layer_idx = len(model.model.model.layers) + layer_idx
+        layer_idx = len(layers) + layer_idx
     
     # Get the target module based on embed_type
     if embed_type.lower() == "query":
-        target_module = model.model.model.layers[layer_idx].self_attn.q_proj
+        target_module = layers[layer_idx].self_attn.q_proj
     elif embed_type.lower() == "key":
-        target_module = model.model.model.layers[layer_idx].self_attn.k_proj
+        target_module = layers[layer_idx].self_attn.k_proj
     else:
         raise ValueError(f"Unsupported embed_type: {embed_type}. Must be 'query' or 'key'")
     
@@ -238,14 +247,22 @@ def get_llama_attention_params(model) -> Tuple[int, int, int]:
         Tuple[int, int, int]: Number of query heads, number of KV groups, and head dimension
     """
     # Get the first layer to extract attention parameters
-    first_layer = model.model.model.layers[0].self_attn
+    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+        # HuggingFace LlamaForCausalLM structure
+        first_layer = model.model.layers[0].self_attn
+    elif hasattr(model, 'model') and hasattr(model.model, 'model') and hasattr(model.model.model, 'layers'):
+        # Some other wrapper structure
+        first_layer = model.model.model.layers[0].self_attn
+    else:
+        raise ValueError("Cannot find layers in model structure")
     
-    # Get the number of heads and groups
-    num_query_heads = first_layer.num_heads
-    num_kv_groups = first_layer.num_key_value_heads
+    # Get the number of heads and groups from config
+    config = first_layer.config
+    num_query_heads = config.num_attention_heads
+    num_kv_groups = config.num_key_value_heads
     
     # Determine the total embedding dimension and head dimension
-    embedding_dim = first_layer.hidden_size
+    embedding_dim = config.hidden_size
     head_dim = embedding_dim // num_query_heads
     
     return num_query_heads, num_kv_groups, head_dim
