@@ -21,8 +21,7 @@ from src.config import (
     LORA_ALPHA,
     LORA_DROPOUT,
     CHECKPOINT_DIR,
-    QUERY_VEC_TOKEN,
-    USE_STANDARD_QUERY_TOKEN,
+    QUERY_VEC_TOKEN
 )
 
 
@@ -173,35 +172,14 @@ def setup_model_and_tokenizer():
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'  # Set padding side to left for decoder-only models
     
-    # Conditionally add special token or use standard token
-    if USE_STANDARD_QUERY_TOKEN:
-        # Using a standard token from existing vocabulary
-        logging.info(f"Using standard query token: '{QUERY_VEC_TOKEN}'")
-        
-        # Verify the token exists in the vocabulary
-        token_ids = tokenizer.encode(QUERY_VEC_TOKEN, add_special_tokens=False)
-        if len(token_ids) != 1:
-            logging.warning(f"Query token '{QUERY_VEC_TOKEN}' tokenizes to {len(token_ids)} tokens: {token_ids}")
-            logging.warning("This may affect embedding extraction. Consider using a single-token word.")
-        else:
-            logging.info(f"Query token '{QUERY_VEC_TOKEN}' has token ID: {token_ids[0]}")
-        
-        # No need to resize embeddings - token already exists
-        num_added_toks = 0
+    # Verify the token exists in the vocabulary
+    token_ids = tokenizer.encode(QUERY_VEC_TOKEN, add_special_tokens=False)
+    if len(token_ids) != 1:
+        logging.warning(f"Query token '{QUERY_VEC_TOKEN}' tokenizes to {len(token_ids)} tokens: {token_ids}")
+        logging.warning("This may affect embedding extraction. Consider using a single-token word.")
     else:
-        # Using the original special token approach
-        logging.info(f"Using special query token: '{QUERY_VEC_TOKEN}' (will be added to vocabulary)")
+        logging.info(f"Query token '{QUERY_VEC_TOKEN}' has token ID: {token_ids[0]}")
         
-        # Add the special query vector token
-        special_tokens_dict = {'additional_special_tokens': [QUERY_VEC_TOKEN]}
-        num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
-        
-        # Resize model embeddings to account for new token
-        if num_added_toks > 0:
-            base_model.resize_token_embeddings(len(tokenizer))
-            adapter_model.resize_token_embeddings(len(tokenizer))
-            logging.info(f"Added {num_added_toks} special tokens and resized embeddings")
-    
     return base_model, adapter_model, tokenizer
 
 

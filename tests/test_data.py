@@ -8,12 +8,16 @@ from unittest.mock import MagicMock, patch
 import itertools
 
 from src.data import (
-    iter_key_value_pairs,
-    KeyValuePair,
+    KVPair,
+    QKVSelection,
+    KVPair as KeyValuePair,
     get_tokenizer,
-    format_prompt_with_kv_pairs,
     tokenize_text,
-    filter_articles_by_length,
+    format_prompt_with_kv_pairs,
+    load_twenty_questions_dataset,
+    iter_twenty_questions_pairs,
+    iter_key_value_pairs_unified,
+    iter_key_value_pairs,
 )
 from src.config import TOKENS_PER_KEY, TOKENS_PER_VALUE, KEY_EMBEDDING_BATCH_SIZE, NUM_KV_PAIRS
 

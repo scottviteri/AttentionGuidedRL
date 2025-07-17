@@ -12,7 +12,7 @@ from unittest.mock import ANY
 import tempfile
 import shutil
 
-from src.data import KeyValuePair, QKVStep, iter_key_value_pairs, iter_key_value_pairs_unified, KVPair, QKVSelection, repeat_n_times
+from src.data import KVPair as KeyValuePair, iter_key_value_pairs, iter_key_value_pairs_unified, KVPair, QKVSelection, repeat_n_times
 from src.training import Trajectory
 from src.config import NUM_KV_PAIRS, TOKENS_PER_KEY, TOKENS_PER_VALUE
 
@@ -234,8 +234,13 @@ def test_main(
                         adapter_model = MagicMock()
                         tokenizer = MagicMock()
                         # Mock tokenizer to return proper object with input_ids
-                        mock_tokenizer_output = MagicMock()
-                        mock_tokenizer_output.input_ids = torch.zeros((2, 1), dtype=torch.long)
+                        class MockTokenOut:
+                            def __init__(self):
+                                self.input_ids = torch.zeros((2,1), dtype=torch.long)
+                            def to(self, device):
+                                self.input_ids = self.input_ids.to(device)
+                                return self
+                        mock_tokenizer_output = MockTokenOut()
                         tokenizer.return_value = mock_tokenizer_output
                         baseline_model = MagicMock()
                         

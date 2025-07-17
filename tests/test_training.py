@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import logging
 
 from src.config import KL_PENALTY_COEFFICIENT, TOKENS_PER_KEY, TOKENS_PER_VALUE, KEY_PREFIX, GAMMA
-from src.data import KeyValuePair, QKVStep, KVPair, QKVSelection
+from src.data import KVPair as KeyValuePair, KVPair, QKVSelection
 
 # Import new dataclasses
 from src.training import RawTrajectory, build_trajectory_from_raw

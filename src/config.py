@@ -7,32 +7,15 @@ Contains all the configuration constants used throughout the project.
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-# Model configuration - hardcoded default
-MODEL_TYPE = 'gpt2'  # Default to gpt2, can be overridden elsewhere if needed
+MODEL_TYPE = 'gpt2'
+MODEL_NAME = 'gpt2'
+TOKENIZER_NAME = 'gpt2'
 
-if MODEL_TYPE == 'llama':
-    MODEL_NAME = 'meta-llama/Llama-3.2-3B'
-    TOKENIZER_NAME = 'meta-llama/Llama-3.2-3B'
-elif MODEL_TYPE == 'gpt2':
-    MODEL_NAME = 'gpt2'
-    TOKENIZER_NAME = 'gpt2'
-else:
-    raise ValueError(f'Invalid MODEL_TYPE: {MODEL_TYPE}. Must be "gpt2" or "llama"')
-
-# Device configuration
-if torch.cuda.is_available():
-    device = "cuda"
-else:
-    device = "cpu"
-
-DEVICE = device
+DEVICE = "cuda" 
 DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
 # Query configuration - Vector queries only
 QUERY_VEC_TOKEN = 'Query'  # Hardcoded to 'Query'
-
-# Option to use standard vocabulary tokens instead of special tokens
-USE_STANDARD_QUERY_TOKEN = True  # Hardcoded to True
 
 # Prefix tokens for context building
 KEY_PREFIX = "Key: "
@@ -111,7 +94,6 @@ LOG_INTERVAL = 10
 GAMMA = 0.99  # Discount factor
 GAE_LAMBDA = 0.95  # For GAE (if using value function)
 
-
 # Always use GRPO baseline - no warmup needed
 USE_GRPO_BASELINE = True
 
@@ -129,4 +111,4 @@ BASELINE_UPDATE_FREQUENCY = 10  # More frequent updates (reduced from 50)
 # Whether to subtract base model log probabilities from adapter log probabilities when computing rewards
 # True: reward = adapter_log_prob - base_log_prob (classic baseline subtraction)
 # False: reward = adapter_log_prob (raw adapter performance, let GRPO handle baselines)
-SUBTRACT_BASE_MODEL_LOGPROBS = False
+SUBTRACT_BASE_MODEL_LOGPROBS = True 
