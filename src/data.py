@@ -142,6 +142,62 @@ def repeat_each(n: int, stream: Iterator):
             yield item
 
 
+def repeat_n_times(n: int, stream: Iterator):
+    """Repeat each item n times (alias for repeat_each for backward compatibility)."""
+    return repeat_each(n, stream)
+
+
+def debug_stream(stream: Iterator, name: str, max_items: int = 5):
+    """Debug stream by printing items."""
+    import logging
+    count = 0
+    for item in stream:
+        if count < max_items:
+            logging.info(f"[{name}] Item {count}: {type(item).__name__}")
+            count += 1
+        yield item
+
+
+def count_stream(stream: Iterator, name: str = "stream"):
+    """Count items in stream and log periodically."""
+    import logging
+    count = 0
+    for item in stream:
+        count += 1
+        if count % 100 == 0:
+            logging.info(f"[{name}] Processed {count} items")
+        yield item
+
+
+def time_stream(stream: Iterator, name: str = "stream"):
+    """Time stream processing."""
+    import logging
+    import time
+    start_time = time.time()
+    count = 0
+    for item in stream:
+        count += 1
+        if count % 100 == 0:
+            elapsed = time.time() - start_time
+            logging.info(f"[{name}] {count} items in {elapsed:.2f}s ({count/elapsed:.2f} items/s)")
+        yield item
+
+
+def peek_stream(stream: Iterator, peek_count: int = 1):
+    """Peek at first few items without consuming them."""
+    import logging
+    from itertools import chain
+    items = []
+    for i, item in enumerate(stream):
+        if i < peek_count:
+            items.append(item)
+            logging.info(f"[peek] Item {i}: {type(item).__name__}")
+        # Chain the peeked items back with the rest of the stream
+        return chain(items, [item] if i >= peek_count else [], stream)
+    # If stream was shorter than peek_count
+    return iter(items)
+
+
 # === Wikipedia Data Pipeline ===
 
 def wikipedia_articles() -> Iterator[Dict]:
@@ -318,6 +374,12 @@ def create_kv_stream(dataset_name: str, batch_size: int, tokenizer: PreTrainedTo
         return twenty_questions_kv_stream(batch_size, tokenizer, embedding_fn)
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
+
+
+# Backward compatibility alias
+def iter_key_value_pairs_unified_with_tokenizer(dataset_name: str, batch_size: int, tokenizer: PreTrainedTokenizer, embedding_fn: Callable[[torch.Tensor], torch.Tensor]) -> Iterator[KVPair]:
+    """Backward compatibility alias for create_kv_stream."""
+    return create_kv_stream(dataset_name, batch_size, tokenizer, embedding_fn)
 
 
 

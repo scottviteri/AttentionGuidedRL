@@ -174,6 +174,46 @@ def test_main_function_exists():
     assert len(sig.parameters) == 0
 
 
+def test_main_imports_and_setup():
+    """Test that main function imports work correctly by testing the exact imports main() uses."""
+    
+    # Test the exact import that was failing in main()
+    # This mimics the import statement in main.py lines 733-740
+    try:
+        from src.data import (
+            iter_key_value_pairs_unified_with_tokenizer, 
+            repeat_n_times,
+            debug_stream,
+            count_stream,
+            time_stream,
+            peek_stream
+        )
+        
+        # Verify these are actually callable functions
+        assert callable(iter_key_value_pairs_unified_with_tokenizer), "iter_key_value_pairs_unified_with_tokenizer should be callable"
+        assert callable(repeat_n_times), "repeat_n_times should be callable"
+        assert callable(debug_stream), "debug_stream should be callable"
+        assert callable(count_stream), "count_stream should be callable"
+        assert callable(time_stream), "time_stream should be callable"
+        assert callable(peek_stream), "peek_stream should be callable"
+        
+        # Also test that main components can be imported
+        from src.main import (
+            parse_args, generate_trajectory, compute_trajectory_rewards,
+            setup_logging, main
+        )
+        
+        assert callable(main), "main should be callable"
+        
+    except ImportError as e:
+        # If there's an import error, the test should fail with a clear message
+        pytest.fail(f"Import error in main module dependencies: {e}\n"
+                    "This indicates that main.py would fail to run.")
+    except Exception as e:
+        # Any other exception during import indicates a problem
+        pytest.fail(f"Unexpected error during imports: {e}")
+
+
 def test_reward_statistics_update():
     """Test the update_reward_stats function."""
     from src.training import update_reward_stats
