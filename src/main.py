@@ -49,8 +49,6 @@ from src.training import (
 )
 
 import wandb
-import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
 
 # Lists to store metrics for plotting
 training_steps = []
@@ -75,6 +73,11 @@ clipping_ratios = []  # PPO clipping ratios
 kl_from_ref = []  # KL divergence from reference model (pi_ref)
 batch_selection_entropy = []  # Entropy of key selection orders within each batch
 trajectory_samples = []  # Sample trajectories for detailed analysis
+
+# NEW: Enhanced debugging metrics
+lora_layer_gradients = {}  # Per-layer gradient magnitudes for LoRA layers
+advantage_distributions = []  # Positive vs negative advantage percentages per episode
+similarity_score_stats = []  # Similarity score distribution statistics
 
 def setup_logging(args):
     """
@@ -807,6 +810,98 @@ def main():
                 if p1.requires_grad:
                     total_change += (p1 - p2).norm(2).item() ** 2
             return total_change ** 0.5
+
+        def track_lora_layer_gradients(model):
+            """
+            Track gradient magnitudes for each LoRA layer.
+            
+            Returns:
+                Dict[int, float]: Mapping from layer index to gradient magnitude
+            """
+            layer_grads = {}
+            
+            for name, param in model.named_parameters():
+                if param.grad is not None and 'lora' in name.lower():
+                    # Extract layer index from parameter name
+                    # Examples: "base_model.model.layers.10.self_attn.q_proj.lora_A.default.weight"
+                    parts = name.split('.')
+                    for i, part in enumerate(parts):
+                        if part == 'layers' and i + 1 < len(parts):
+                            try:
+                                layer_idx = int(parts[i + 1])
+                                grad_norm = param.grad.norm().item()
+                                
+                                # Accumulate gradients for the same layer (multiple LoRA parameters per layer)
+                                if layer_idx in layer_grads:
+                                    layer_grads[layer_idx] += grad_norm
+                                else:
+                                    layer_grads[layer_idx] = grad_norm
+                                break
+                            except (ValueError, IndexError):
+                                continue
+            
+            return layer_grads
+
+        def compute_advantage_distribution(advantages):
+            """
+            Compute the distribution of positive vs negative advantages.
+            
+            Args:
+                advantages: Tensor of shape [batch, steps]
+                
+            Returns:
+                Dict with positive_percentage, negative_percentage, zero_percentage
+            """
+            total_advantages = advantages.numel()
+            positive_count = (advantages > 0).sum().item()
+            negative_count = (advantages < 0).sum().item()
+            zero_count = (advantages == 0).sum().item()
+            
+            return {
+                'positive_percentage': positive_count / total_advantages * 100,
+                'negative_percentage': negative_count / total_advantages * 100,
+                'zero_percentage': zero_count / total_advantages * 100,
+                'mean': advantages.mean().item(),
+                'std': advantages.std().item()
+            }
+
+        def compute_similarity_score_stats(trajectory):
+            """
+            Compute statistics about similarity scores in a trajectory.
+            
+            Args:
+                trajectory: Trajectory object with qkv_steps
+                
+            Returns:
+                Dict with mean, std, entropy, max, min of similarity scores
+            """
+            all_similarities = []
+            
+            for step in trajectory.qkv_steps:
+                if hasattr(step, 'similarity_scores') and step.similarity_scores is not None:
+                    similarities = step.similarity_scores
+                    # Apply softmax to get probabilities for entropy calculation
+                    probs = torch.softmax(similarities, dim=-1)
+                    
+                    all_similarities.append({
+                        'mean': similarities.mean().item(),
+                        'std': similarities.std().item(),
+                        'entropy': -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean().item(),
+                        'max': similarities.max().item(),
+                        'min': similarities.min().item()
+                    })
+            
+            if not all_similarities:
+                return {'mean': 0.0, 'std': 0.0, 'entropy': 0.0, 'max': 0.0, 'min': 0.0}
+            
+            # Average across all steps
+            return {
+                'mean': sum(s['mean'] for s in all_similarities) / len(all_similarities),
+                'std': sum(s['std'] for s in all_similarities) / len(all_similarities),
+                'entropy': sum(s['entropy'] for s in all_similarities) / len(all_similarities),
+                'max': sum(s['max'] for s in all_similarities) / len(all_similarities),
+                'min': sum(s['min'] for s in all_similarities) / len(all_similarities)
+            }
         
         # Training loop
         logging.info("Starting training...")
@@ -1028,8 +1123,16 @@ def main():
                     use_grpo_baseline=USE_GRPO_BASELINE,
                 )
                 avg_advantage = advantages.mean().item()
+                
+                # NEW: Track advantage distribution
+                advantage_dist = compute_advantage_distribution(advantages)
+                advantage_distributions.append(advantage_dist)
             else:
                 avg_advantage = 0.0
+                advantage_distributions.append({
+                    'positive_percentage': 0.0, 'negative_percentage': 0.0, 'zero_percentage': 100.0,
+                    'mean': 0.0, 'std': 0.0
+                })
             avg_advantages.append(avg_advantage)
             
             # For conceptual clarity, also track the policy gradient (before negation)
@@ -1086,6 +1189,17 @@ def main():
             gradient_stats = get_gradient_stats(adapter_model)
             gradient_history.append(gradient_stats)
             gradient_magnitudes.append(gradient_stats[0])
+            
+            # NEW: Track LoRA layer-specific gradients
+            layer_grads = track_lora_layer_gradients(adapter_model)
+            for layer_idx, grad_norm in layer_grads.items():
+                if layer_idx not in lora_layer_gradients:
+                    lora_layer_gradients[layer_idx] = []
+                lora_layer_gradients[layer_idx].append(grad_norm)
+            
+            # NEW: Track similarity score statistics
+            similarity_stats = compute_similarity_score_stats(trajectory)
+            similarity_score_stats.append(similarity_stats)
             
             # Track reward history
             reward_history.append(avg_reward)
@@ -1238,6 +1352,10 @@ def save_plot_data(log_dir, episode, policy_gradients_data=None, all_data=None):
             'kl_from_ref': kl_from_ref.copy(),
             'batch_selection_entropy': batch_selection_entropy.copy(),
             'trajectory_samples': trajectory_samples.copy(),  # Add trajectory samples
+            # NEW: Enhanced debugging metrics
+            'lora_layer_gradients': {k: v.copy() for k, v in lora_layer_gradients.items()},
+            'advantage_distributions': advantage_distributions.copy(),
+            'similarity_score_stats': similarity_score_stats.copy(),
             # Add metadata
             'metadata': {
                 'episode': episode,
