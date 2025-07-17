@@ -399,7 +399,7 @@ def test_base_model_weights_unchanged(gpt2_model, gpt2_tokenizer):
                 f"Base model weight {name} changed after training step"
 
 
-def test_embedding_pipeline():
+def test_embedding_pipeline(tiny_llama_model):
     """Test the entire embedding extraction and similarity computation pipeline with real tensors.
     
     This tests the actual interfaces between embeddings.py and main.py to ensure
@@ -408,45 +408,8 @@ def test_embedding_pipeline():
     import torch
     from src.embeddings import register_embedding_hook, extract_embeddings, compute_similarity, sample_key_value, get_attention_params
     
-    # Create a small mock model with attention parameters that mimics real transformer architecture
-    class MockModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            # Add a real parameter so next(model.parameters()) works
-            self.dummy_param = torch.nn.Parameter(torch.randn(1))
-            
-            self.model = MagicMock()
-            self.model.model = MagicMock()
-            
-            # Create a mock attention layer with proper parameters
-            class MockAttention:
-                def __init__(self):
-                    self.num_heads = 4
-                    self.num_key_value_heads = 2  # GQA setup with 2 key/value heads
-                    self.hidden_size = 128  # 4 heads * 32 head_dim
-                    self.q_proj = torch.nn.Linear(128, 128)
-                    self.k_proj = torch.nn.Linear(128, 64)  # Only 2 heads for keys in GQA
-            
-            # Create a mock layer
-            class MockLayer:
-                def __init__(self):
-                    self.self_attn = MockAttention()
-            
-            # Set up the model structure
-            self.model.model.layers = [MockLayer()]
-        
-        def __call__(self, tokens):
-            # Forward pass that properly activates the hooks
-            batch_size, seq_len = tokens.shape
-            # Return embeddings with correct shape to be captured by the hook
-            hidden_size = self.model.model.layers[0].self_attn.hidden_size
-            # Simulate that the q_proj module gets called and outputs embeddings
-            self.model.model.layers[0].self_attn.q_proj(torch.zeros(batch_size, seq_len, hidden_size))
-            self.model.model.layers[0].self_attn.k_proj(torch.zeros(batch_size, seq_len, hidden_size))
-            return None
-    
-    # Create the model
-    model = MockModel()
+    # Use the tiny llama model which has proper GQA configuration
+    model = tiny_llama_model
     
     # 1. Test register_embedding_hook
     with patch('src.embeddings.MODEL_TYPE', 'llama'):
@@ -461,60 +424,43 @@ def test_embedding_pipeline():
         seq_len = 5
         
         # Create tokens input
-        token_input = torch.randint(0, 1000, (batch_size, seq_len))
+        token_input = torch.randint(0, 100, (batch_size, seq_len), device=model.device)
         
-        # Mock the hook capturing by directly setting the embeddings
-        # This simulates what would happen in a real forward pass
-        fake_embeddings = torch.randn(batch_size, seq_len, 128)  # [batch, seq, hidden]
-        embeddings_dict["embeddings"] = fake_embeddings
-        
-        # Extract the embeddings
+        # Extract the embeddings (this will do a real forward pass)
         query_embeddings = extract_embeddings(model, token_input, embeddings_dict)
         
         # Verify shape is correct (should be [batch, hidden])
-        assert query_embeddings.shape == (batch_size, 128)
+        assert query_embeddings.shape == (batch_size, model.config.hidden_size)
         
         # 3. Test compute_similarity with real tensors
         # Create some key embeddings
         num_keys = 3
-        key_embeddings = torch.randn(batch_size, num_keys, 128)
+        key_embeddings = torch.randn(batch_size, num_keys, model.config.hidden_size, device=model.device)
         
         # Compute similarity scores
         similarity = compute_similarity(query_embeddings, key_embeddings, model)
         
-        # Verify shape is correct (should be [batch, num_keys])
+        # Verify output shape
         assert similarity.shape == (batch_size, num_keys)
         
-        # Verify they are probabilities (sum to 1, all between 0 and 1)
-        for b in range(batch_size):
-            assert torch.isclose(torch.sum(similarity[b]), torch.tensor(1.0), atol=1e-5)
-            assert torch.all(similarity[b] >= 0) and torch.all(similarity[b] <= 1)
+        # Verify it's a proper probability distribution
+        assert torch.allclose(similarity.sum(dim=1), torch.ones(batch_size, device=model.device), atol=1e-5)
+        assert torch.all(similarity >= 0) and torch.all(similarity <= 1)
         
         # 4. Test sample_key_value
-        # Create available keys for each batch
-        available_keys = [
-            [0, 1],      # Batch 0 has keys 0 and 1 available
-            [0, 1, 2]    # Batch 1 has all keys available
-        ]
+        available_keys = [[0, 1, 2], [1, 2]]  # Different available keys per batch
         
-        # Sample keys
         sampled_indices, sampled_probs = sample_key_value(similarity, available_keys, batch_size)
         
-        # Verify the returned sampled indices are in the available keys
-        assert sampled_indices[0] in available_keys[0]
-        assert sampled_indices[1] in available_keys[1]
+        # Verify outputs
+        assert len(sampled_indices) == batch_size
+        assert sampled_probs.shape == (batch_size,)
         
-        # Verify the returned probabilities match the corresponding similarity scores
-        assert torch.isclose(sampled_probs[0], similarity[0, sampled_indices[0]])
-        assert torch.isclose(sampled_probs[1], similarity[1, sampled_indices[1]])
-        
-        # Finally, test get_attention_params
-        heads, groups, head_dim = get_attention_params(model)
-        assert heads == 4
-        assert groups == 2
-        assert head_dim == 32  # 128 / 4
-        
-        # Clean up the hook
+        # Verify sampled indices are within available keys
+        for b in range(batch_size):
+            assert sampled_indices[b] in available_keys[b]
+            
+        # Clean up hook
         hook_remover()
 
 

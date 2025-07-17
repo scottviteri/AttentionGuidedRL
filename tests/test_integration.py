@@ -34,15 +34,20 @@ class TestDataPipelineIntegration:
         # Mock embedding function
         def mock_embedding_fn(tokens):
             batch_size = tokens.shape[0]
-            return torch.randn(batch_size, gpt2_model.config.n_embd)
+            device = tokens.device  # Use same device as input tokens
+            return torch.randn(batch_size, gpt2_model.config.n_embd, device=device)
         
-        # Mock Wikipedia articles
+        # Mock Wikipedia articles - need to be long enough to pass filters
         mock_articles = [
-            {"text": "This is a test article with enough content. " * 50, "title": "Test", "id": "1"},
-            {"text": "Another test article with sufficient length. " * 50, "title": "Test2", "id": "2"}
+            {"text": "This is a test article with enough content. " * 200, "title": "Test", "id": "1"},
+            {"text": "Another test article with sufficient length. " * 200, "title": "Test2", "id": "2"}
         ]
         
-        with patch('src.data.wikipedia_articles', return_value=iter(mock_articles)):
+        # Patch the wikipedia_articles function to return our mock articles
+        def mock_wikipedia_articles():
+            return iter(mock_articles)
+        
+        with patch('src.data.wikipedia_articles', mock_wikipedia_articles):
             try:
                 # Test that we can create the stream
                 kv_stream = wikipedia_kv_stream(
@@ -76,16 +81,24 @@ class TestDataPipelineIntegration:
             'questions': [
                 'Is it larger than a breadbox?',
                 'Is it a living thing?',
-                'Can you hold it in your hand?'
+                'Can you hold it in your hand?',
+                'Is it man-made?',
+                'Is it electronic?',
+                'Is it used for entertainment?',
+                'Is it found indoors?',
+                'Is it expensive?',
+                'Is it colorful?',
+                'Is it edible?'
             ],
             'data': [
-                {'answers': ['YES', 'NO', 'YES']},
-                {'answers': ['NO', 'YES', 'NO']}
+                {'answers': ['YES', 'NO', 'YES', 'YES', 'NO', 'YES', 'YES', 'NO', 'YES', 'NO']},
+                {'answers': ['NO', 'YES', 'NO', 'NO', 'NO', 'NO', 'YES', 'YES', 'NO', 'YES']}
             ]
         }
         
         def mock_embedding_fn(tokens):
-            return torch.randn(tokens.shape[0], 768)
+            device = tokens.device
+            return torch.randn(tokens.shape[0], 768, device=device)
         
         with patch('src.data.load_twenty_questions', return_value=mock_dataset):
             from src.data import twenty_questions_kv_stream
@@ -134,7 +147,7 @@ class TestEmbeddingIntegration:
                 
                 # Verify similarity output
                 assert similarities.shape == (2, 1)
-                assert torch.allclose(similarities.sum(dim=1), torch.ones(2), atol=1e-5)
+                assert torch.allclose(similarities.sum(dim=1), torch.ones(2, device=similarities.device), atol=1e-5)
                 
             finally:
                 query_hook_remover()

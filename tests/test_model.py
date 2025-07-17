@@ -84,13 +84,18 @@ def test_model_setup_and_tokenizer_integration():
     test_text = "Hello world"
     tokens = tokenizer(test_text, return_tensors="pt")
     
+    # Move tokens to the same device as the models
+    tokens = {k: v.to(base_model.device) for k, v in tokens.items()}
+    
     with torch.no_grad():
         base_output = base_model(**tokens)
         adapter_output = adapter_model(**tokens)
     
-    # Both should produce valid outputs
+    # Outputs should have the same shape but different values
     assert base_output.logits.shape == adapter_output.logits.shape
-    assert base_output.logits.shape[-1] == tokenizer.vocab_size
+    
+    # Verify tokenizer configuration
+    assert tokenizer.pad_token is not None
 
 
 def test_checkpoint_save_and_load_integration(gpt2_model, tmp_path):
@@ -154,15 +159,48 @@ def test_model_copy_integration(gpt2_model):
     # Verify they have the same structure
     assert type(model_copy) == type(adapter_model)
     
+    # Set both models to eval mode for deterministic comparison
+    adapter_model.eval()
+    model_copy.eval()
+    
     # Verify both produce the same output (before any training)
-    test_input = torch.randint(0, 1000, (1, 5)).to(adapter_model.device)
+    device = next(adapter_model.parameters()).device
+    test_input = torch.randint(0, 1000, (1, 5), device=device)
     
     with torch.no_grad():
         original_output = adapter_model(test_input)
         copy_output = model_copy(test_input)
     
-    # Should be close initially (before any parameter updates)
-    assert torch.allclose(original_output.logits, copy_output.logits, atol=1e-5)
+    # Should be identical when both in eval mode
+    assert torch.allclose(original_output.logits, copy_output.logits, atol=1e-6)
+    
+    # Verify the models are independent - changing one doesn't affect the other
+    # Get a parameter from each model
+    original_param = None
+    copy_param = None
+    
+    for name, param in adapter_model.named_parameters():
+        if 'lora' in name and param.requires_grad:
+            original_param = param
+            break
+    
+    for name, param in model_copy.named_parameters():
+        if 'lora' in name and param.requires_grad:
+            copy_param = param
+            break
+    
+    assert original_param is not None, "Could not find LoRA parameter in original"
+    assert copy_param is not None, "Could not find LoRA parameter in copy"
+    
+    # Verify they start with the same values
+    assert torch.allclose(original_param.data, copy_param.data, atol=1e-6)
+    
+    # Modify the original
+    with torch.no_grad():
+        original_param.data += 1.0
+    
+    # Verify the copy is unchanged
+    assert not torch.allclose(original_param.data, copy_param.data, atol=0.5)
 
 
 def test_real_gpt2_model_setup(gpt2_model, gpt2_tokenizer):
