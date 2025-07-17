@@ -23,7 +23,6 @@ from src.config import (
     DEVICE,
     KV_EVERY_N,
     QUERY_VEC_TOKEN,
-    USE_STANDARD_QUERY_TOKEN,
     KEY_EMBEDDING_BATCH_SIZE,
     KEY_PREFIX,
 )
@@ -82,8 +81,6 @@ class QKVSelection:
     
     Attributes:
         data: The selected KVPair that was chosen
-        query_text: Query text that led to selecting this key-value pair
-        query_tokens: Tokenized query that led to selecting this pair
         query_embedding: Query embeddings [batch_size, embedding_dim]
         similarity_scores: Similarity scores between query and all available keys [batch_size, num_keys]
         selected_idx: Index of the selected key in the original pool
@@ -91,9 +88,7 @@ class QKVSelection:
     # Core selected data
     data: KVPair
     
-    # Query information
-    query_text: List[str]
-    query_tokens: torch.Tensor
+    # Query embedding information (vector queries)
     query_embedding: torch.Tensor  # Shape: [batch_size, embedding_dim]
     
     # Selection metadata
@@ -105,11 +100,11 @@ class QKVSelection:
         """Validate tensor shapes and types."""
         batch_size = self.data.key_tokens.shape[0]
         
-        # Validate query data
+        # Validate query embedding
         assert isinstance(self.query_embedding, torch.Tensor), "query_embedding must be a tensor"
         assert self.query_embedding.shape[0] == batch_size, \
             f"query_embedding first dimension should be {batch_size}"
-            
+
         # Validate selection metadata
         assert isinstance(self.similarity_scores, torch.Tensor), "similarity_scores must be a tensor"
         assert self.similarity_scores.shape[0] == batch_size, \
@@ -146,12 +141,23 @@ class QKVSelection:
     def value_text(self) -> List[str]:
         return self.data.value_text
 
+@dataclass(frozen=True)
+class RawTrajectory:
+    """Trajectory skeleton produced directly by *generate_trajectory*.
 
-# Maintain backward compatibility
-QKVStep = QKVSelection  # Alias for existing code
-QKVStepWithSelection = QKVSelection  # Transition alias
-QKVData = KVPair  # Transition alias  
-KeyValuePair = KVPair  # Update the old alias
+    Contains everything except reward information so it can be created
+    without touching the reference model. Once rewards are computed the
+    object is promoted to a :class:`Trajectory`.
+    """
+    qkv_steps: List[QKVSelection]
+    all_key_embeddings: torch.Tensor  # [batch, num_keys, hidden]
+
+
+@dataclass(frozen=True)
+class Trajectory(RawTrajectory):
+    """Fully-specified trajectory used for learning and analysis."""
+    rewards: torch.Tensor             # [batch, num_steps]
+    avg_reward: torch.Tensor          # [batch]
 
 
 def get_tokenizer() -> PreTrainedTokenizer:
@@ -164,12 +170,6 @@ def get_tokenizer() -> PreTrainedTokenizer:
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'  # Set padding side to left for decoder-only models
-    
-    # Conditionally add special token only if not using standard tokens
-    if not USE_STANDARD_QUERY_TOKEN:
-        # Add the special query vector token only when using special token mode
-        special_tokens_dict = {'additional_special_tokens': [QUERY_VEC_TOKEN]}
-        tokenizer.add_special_tokens(special_tokens_dict)
     
     return tokenizer
 
@@ -256,7 +256,6 @@ def filter_articles_by_length(tokenizer: PreTrainedTokenizer) -> Iterator[Dict]:
 
         if len(tokens) >= max_len:
             yield article
-
 
 def iter_key_value_pairs(
     batch_size: int = 1, embedding_fn=None

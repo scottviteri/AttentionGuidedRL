@@ -4,26 +4,17 @@ Training module for the Attention-Guided RL project.
 Contains the main training loop and related functions for trajectory generation and optimization.
 """
 
-import copy
-import logging
-import numpy as np
 import torch
 import torch.nn.functional as F
 from typing import List, Tuple, Optional, Any, Dict
-from dataclasses import dataclass
 
-from src.data import KVPair, QKVSelection
+from src.data import RawTrajectory, Trajectory
 from src.embeddings import extract_embeddings, compute_similarity, register_embedding_hook
 from src.config import (
-    DEVICE,
-    TOKENS_PER_KEY,
-    TOKENS_PER_VALUE,
     KEY_PREFIX,
     VALUE_PREFIX,
     GRADIENT_CLIP_NORM,
-    KL_PENALTY_COEFFICIENT,
     QUERY_VEC_TOKEN,
-    NUM_KV_PAIRS,
     INITIAL_PROMPT,
     GAMMA,
     GAE_LAMBDA,
@@ -32,34 +23,6 @@ from src.config import (
     PPO_CLIP_EPSILON,
     TEMPERATURE
 )
-
-
-
-# --------------------
-# New immutable data-structures
-# --------------------
-
-
-@dataclass(frozen=True)
-class RawTrajectory:
-    """Trajectory skeleton produced directly by *generate_trajectory*.
-
-    Contains everything except reward information so it can be created
-    without touching the reference model.  Once rewards are computed the
-    object is *promoted* to a :class:`Trajectory`.
-    """
-    qkv_steps: List[QKVSelection]
-    all_key_embeddings: torch.Tensor  # [batch, num_keys, hidden]
-
-
-@dataclass(frozen=True)
-class Trajectory:
-    """Fully-specified trajectory used for learning and analysis."""
-
-    qkv_steps: List[QKVSelection]
-    rewards: torch.Tensor             # [batch, num_steps]
-    avg_reward: torch.Tensor          # [batch]
-    all_key_embeddings: torch.Tensor  # [batch, num_keys, hidden]
 
 
 # Helper to convert RawTrajectory after rewards are ready
@@ -220,9 +183,7 @@ def compute_trajectory_rewards(
         if verbose:
             print(f"\n--- Reward Calculation for Step {i+1}/{num_steps} ---")
             
-            # Display query first if available
-            if qkv_step.query_text is not None:
-                print(f"Query: {qkv_step.query_text[0]}")
+            # Vector queries do not have textual query
             
             # Then display key and value
             print(f"Key: {qkv_step.key_text[0]}")
@@ -285,9 +246,9 @@ def compute_trajectory_rewards(
                 value_tokens
             ], dim=1)
             
-            # Display vector query indicator in verbose mode
-            if verbose and qkv_step.query_text is not None and "<VECTOR_QUERY>" in qkv_step.query_text[0]:
-                print(f"Using vector query")
+            # Display vector query indicator (all steps are vector queries)
+            if verbose:
+                print("Using vector query")
         else:
             # Fallback for tests or when tokenizer is not available
             current_context = torch.cat([
@@ -375,9 +336,7 @@ def compute_returns(rewards: torch.Tensor, gamma: float = 0.99) -> torch.Tensor:
 
 def compute_advantages(
     rewards: torch.Tensor,
-    values: Optional[torch.Tensor] = None,
     gamma: float = 0.99,
-    gae_lambda: float = 0.95,
     use_grpo_baseline: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -385,47 +344,23 @@ def compute_advantages(
     
     Args:
         rewards: Tensor of rewards [batch_size, num_steps]
-        values: Tensor of value estimates [batch_size, num_steps] (optional)
         gamma: Discount factor
-        gae_lambda: GAE lambda parameter
         use_grpo_baseline: If True and values is None, use GRPO-style per-timestep batch average
         
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: (advantages, returns)
     """
     returns = compute_returns(rewards, gamma)
-    
-    if values is None:
-        if use_grpo_baseline:
-            # GRPO-style: Use batch average return at each timestep as baseline
-            # This automatically handles the step-dependent nature of returns
-            baseline = returns.mean(dim=0, keepdim=True)  # [1, num_steps]
-            advantages = returns - baseline  # Broadcasting subtracts same baseline from each batch element
-            
-            # Advantages are now zero-centered at each timestep
-        else:
-            # Original: Use average across all timesteps (high variance)
-            advantages = returns - returns.mean(dim=1, keepdim=True)
-            # Normalize advantages for stability
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    if use_grpo_baseline:
+        # GRPO-style: per-timestep batch mean as baseline
+        baseline = returns.mean(dim=0, keepdim=True)
+        advantages = returns - baseline
     else:
-        # Compute TD residuals with value function
-        batch_size, num_steps = rewards.shape
-        advantages = torch.zeros_like(rewards)
-        
-        # Append a zero for the last value (terminal state)
-        values_extended = torch.cat([values, torch.zeros(batch_size, 1, device=values.device)], dim=1)
-        
-        # Compute advantages using GAE
-        last_advantage = 0
-        for t in reversed(range(num_steps)):
-            delta = rewards[:, t] + gamma * values_extended[:, t + 1] - values[:, t]
-            advantages[:, t] = delta + gamma * gae_lambda * last_advantage
-            last_advantage = advantages[:, t]
-        
-        # Normalize advantages for stability
+        # Simpler: subtract per-trajectory mean then normalize
+        advantages = returns - returns.mean(dim=1, keepdim=True)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-    
+
     return advantages, returns
 
 
@@ -483,9 +418,7 @@ def compute_policy_loss(
     # Compute returns and advantages
     advantages, _ = compute_advantages(
         trajectory.rewards, 
-        values=None, 
         gamma=gamma,
-        gae_lambda=GAE_LAMBDA,
         use_grpo_baseline=USE_GRPO_BASELINE
     )
     
