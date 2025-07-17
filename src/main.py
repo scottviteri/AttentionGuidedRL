@@ -565,7 +565,7 @@ def compute_kl_from_reference(
     # Iterate step-by-step so we respect the autoregressive context growth
     for step in trajectory.qkv_steps:
         # 1) Adapter distribution (already computed)
-        adapter_log_probs = F.log_softmax(step.similarity_scores / TEMPERATURE, dim=-1)
+        adapter_log_probs = step.similarity_scores
 
         # 2) Reference distribution – build a query vector, compute similarities, apply mask
         with torch.no_grad():
@@ -576,7 +576,7 @@ def compute_kl_from_reference(
         if hasattr(step, "available_mask") and step.available_mask is not None:
             ref_sims = ref_sims + step.available_mask.to(device)
 
-        ref_log_probs = F.log_softmax(ref_sims / TEMPERATURE, dim=-1)
+        ref_log_probs = ref_sims
 
         # 3) KL(adapter || ref) in log-space.  "log_target=True" expects both inputs are log-probs.
         kl_step = F.kl_div(adapter_log_probs, ref_log_probs, reduction="batchmean", log_target=True)
@@ -870,15 +870,14 @@ def main():
             for step in trajectory.qkv_steps:
                 if hasattr(step, 'similarity_scores') and step.similarity_scores is not None:
                     similarities = step.similarity_scores
-                    # Apply softmax to get probabilities for entropy calculation
-                    probs = torch.softmax(similarities, dim=-1)
+                    probs = torch.exp(similarities)
                     
                     all_similarities.append({
-                        'mean': similarities.mean().item(),
-                        'std': similarities.std().item(),
-                        'entropy': -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean().item(),
-                        'max': similarities.max().item(),
-                        'min': similarities.min().item()
+                        'mean': probs.mean().item(),
+                        'std': probs.std().item(),
+                        'entropy': -(probs * similarities).sum(dim=-1).mean().item(),
+                        'max': probs.max().item(),
+                        'min': probs.min().item()
                     })
             
             if not all_similarities:
@@ -1192,7 +1191,7 @@ def main():
                     else:
                         masked_similarities = similarities
                     
-                    log_probs = F.log_softmax(masked_similarities / TEMPERATURE, dim=-1)
+                    log_probs = masked_similarities
                     # Get log prob of selected action (average over batch)
                     if not isinstance(step.selected_idx, torch.Tensor):
                         raise TypeError("selected_idx must be a torch.Tensor")

@@ -519,7 +519,7 @@ def compute_policy_loss(
             masked_similarities = current_similarities
 
         # Compute current policy log-probabilities (masked)
-        current_log_probs_full = F.log_softmax(masked_similarities / TEMPERATURE, dim=-1)
+        current_log_probs_full = masked_similarities
 
         selected_idx = qkv_step.selected_idx if hasattr(qkv_step, 'selected_idx') else torch.tensor([0]*batch_size, device=device)
         # Ensure selected_idx is tensor of shape [batch_size]
@@ -537,7 +537,8 @@ def compute_policy_loss(
         # Apply same availability mask
         old_masked_similarities = old_similarities + qkv_step.available_mask.to(device)
 
-        old_log_probs_full = F.log_softmax(old_masked_similarities / TEMPERATURE, dim=-1)
+        old_log_probs_full = old_masked_similarities
+
         old_action_log_probs = old_log_probs_full[torch.arange(batch_size, device=device), selected_idx]
 
         # Compute KL divergence between current and old policies over available keys (masked)

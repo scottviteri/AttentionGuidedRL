@@ -414,9 +414,10 @@ def compute_similarity(
     head_probabilities = F.softmax(scaled_similarities, dim=2)
     
     # Average over heads to get final probabilities [batch, num_keys]
-    probabilities = torch.mean(head_probabilities, dim=1)
+    head_log_probs = torch.log(head_probabilities + 1e-8)
+    log_probabilities = torch.mean(head_log_probs, dim=1)
     
-    return probabilities
+    return log_probabilities
 
 
 
@@ -468,8 +469,8 @@ def sample_key_value(
     sampled_indices = sampled_indices_tensor.tolist()
     
     # Get probabilities for the sampled indices
-    sampled_probs = torch.zeros(batch_size, device=device)
+    sampled_log_probs = torch.zeros(batch_size, device=device)
     for b in range(batch_size):
-        sampled_probs[b] = similarity_scores[b, sampled_indices[b]]
+        sampled_log_probs[b] = similarity_scores[b, sampled_indices[b]]
     
-    return sampled_indices, sampled_probs 
+    return sampled_indices, sampled_log_probs 
