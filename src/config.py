@@ -105,7 +105,7 @@ PPO_CLIP_EPSILON = 0.2  # Standard PPO clipping range
 
 # Baseline model update frequency (how often to update the single baseline model)
 # Since baseline model is now only used for key embeddings (not KL), we can update more frequently
-BASELINE_UPDATE_FREQUENCY = 10  # More frequent updates (reduced from 50)
+BASELINE_UPDATE_FREQUENCY = 20  # More frequent updates (reduced from 50)
 
 # Exponential Moving Average (EMA) for smooth baseline updates
 # Set to 0.0 to use the old hard update mechanism (create_model_copy every N episodes)
@@ -113,7 +113,7 @@ BASELINE_UPDATE_FREQUENCY = 10  # More frequent updates (reduced from 50)
 EMA_DECAY = 0.01  # Higher = smoother updates, Lower = faster adaptation
 
 # When using EMA, update baseline every episode instead of every N episodes
-USE_EMA_BASELINE = True  # Set to False to use the old hard update method
+USE_EMA_BASELINE = False  # Set to False to use the old hard update method
 
 # Reward computation configuration
 # Whether to subtract base model log probabilities from adapter log probabilities when computing rewards
