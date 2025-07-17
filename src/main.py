@@ -298,6 +298,7 @@ def parse_args():
     parser.add_argument('--ppo-clip-epsilon', type=float, default=0.2, help='PPO clipping parameter (epsilon)')
     parser.add_argument('--baseline-update-freq', type=int, default=10, help='How often to update baseline model (episodes)')
     parser.add_argument('--subtract-base-logprobs', action='store_true', default=False, help='Subtract base model logprobs in reward computation')
+    parser.add_argument('--debug-generators', action='store_true', default=False, help='Enable detailed debugging of generator pipelines')
     
     return parser.parse_args()
 
@@ -726,7 +727,14 @@ def main():
         old_embeddings_dict, old_hook_remover = register_embedding_hook(old_model, embed_type="key")
         
         # Import the data iterator and repeat function
-        from src.data import iter_key_value_pairs_unified_with_tokenizer, repeat_n_times
+        from src.data import (
+            iter_key_value_pairs_unified_with_tokenizer, 
+            repeat_n_times,
+            debug_stream,
+            count_stream,
+            time_stream,
+            peek_stream
+        )
         
         # Determine if we're using GRPO-style batching
         use_grpo_batching = args.grpo_batching
@@ -740,8 +748,19 @@ def main():
                 tokenizer=tokenizer,
                 embedding_fn=compute_key_embedding,
             )
+            
+            # Add debugging if requested
+            if args.debug_generators:
+                logging.info("Debug mode enabled for generators")
+                base_iterator = peek_stream(base_iterator, peek_count=1)
+                base_iterator = debug_stream(base_iterator, "unique_kv_pairs", max_items=2)
+                base_iterator = time_stream(base_iterator, "kv_generation")
+                
             # Repeat each item batch_size times for GRPO-style batching
             kv_pair_generator = repeat_n_times(args.batch_size, base_iterator)
+            
+            if args.debug_generators:
+                kv_pair_generator = debug_stream(kv_pair_generator, "repeated_kv_pairs", max_items=args.batch_size + 1)
         else:
             # Standard approach: different items in each batch position
             kv_pair_generator = iter_key_value_pairs_unified_with_tokenizer(
@@ -750,6 +769,13 @@ def main():
                 tokenizer=tokenizer,
                 embedding_fn=compute_key_embedding,
             )
+            
+            # Add debugging if requested
+            if args.debug_generators:
+                logging.info("Debug mode enabled for generators")
+                kv_pair_generator = peek_stream(kv_pair_generator, peek_count=1)
+                kv_pair_generator = debug_stream(kv_pair_generator, "standard_kv_pairs", max_items=2)
+                kv_pair_generator = time_stream(kv_pair_generator, "kv_generation")
         
         # Get reference to the base model (pi_ref)
         ref_model = base_model
