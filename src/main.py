@@ -15,29 +15,19 @@ from collections import Counter
 import torch.nn.functional as F
 from tqdm import tqdm
 from datetime import datetime
-from typing import List, Optional, Dict, Callable, Any, Tuple
-import numpy as np
-from copy import deepcopy
+from typing import List, Any
 import sys
 
 from src.config import (
     MODEL_NAME,
-    TOKENIZER_NAME,
     DEVICE,
-    LORA_RANK,
-    LORA_ALPHA,
-    LORA_DROPOUT,
     LEARNING_RATE,
-    GRADIENT_CLIP_NORM,
     NUM_EPISODES,
     CHECKPOINT_INTERVAL,
     TRAINING_BATCH_SIZE,
     KL_PENALTY_COEFFICIENT,
-    CHECKPOINT_DIR,
-    LOG_DIR,
     LOG_INTERVAL,
     ENABLE_WANDB,
-    WANDB_PROJECT,
     INITIAL_PROMPT,
     KEY_PREFIX,
     VALUE_PREFIX,
@@ -47,8 +37,8 @@ from src.config import (
     TEMPERATURE,
 )
 from src.model import setup_model_and_tokenizer, save_checkpoint, load_checkpoint, create_model_copy, get_checkpoint_path
-from src.data import iter_key_value_pairs, iter_key_value_pairs_unified, KVPair, QKVSelection, repeat_n_times
-from src.embeddings import register_embedding_hook, extract_embeddings, compute_similarity, sample_key_value
+from src.data import KVPair, QKVSelection
+from src.embeddings import register_embedding_hook, compute_similarity, sample_key_value, extract_embeddings
 from src.training import (
     RawTrajectory,
     Trajectory,  # for type hints
@@ -58,11 +48,7 @@ from src.training import (
     generate_query_vector,
 )
 
-# Import wandb for logging
 import wandb
-
-# Setup matplotlib for plotting
-import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 
@@ -148,204 +134,141 @@ def setup_logging(args):
     return log_dir
 
 
+# === Trajectory generation helpers ===
+
+def _build_available_mask(available_indices_per_batch: List[List[int]], num_keys: int, device: torch.device) -> torch.Tensor:
+    """Return a mask tensor with 0 for available keys and -inf for masked ones."""
+    batch_size = len(available_indices_per_batch)
+    mask = torch.full((batch_size, num_keys), float('-inf'), device=device)
+    for b, avail in enumerate(available_indices_per_batch):
+        mask[b, avail] = 0.0
+    return mask
+
+
+def _append_step(raw_traj: RawTrajectory, step: QKVSelection) -> RawTrajectory:
+    """Return a NEW RawTrajectory with *step* appended (dataclasses are immutable)."""
+    return RawTrajectory(
+        qkv_steps=raw_traj.qkv_steps + [step],
+        all_key_embeddings=raw_traj.all_key_embeddings,
+    )
+
+
+def _update_context(context: torch.Tensor, step: QKVSelection, tokenizer, batch_size: int, device: torch.device) -> torch.Tensor:
+    """Grow the autoregressive context by concatenating key/value tokens (no query tokens in vector mode)."""
+    key_prefix_tokens = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+    value_prefix_tokens = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+    return torch.cat([
+        context,
+        key_prefix_tokens,
+        step.key_tokens.to(device),
+        value_prefix_tokens,
+        step.value_tokens.to(device),
+    ], dim=1)
+# === End helpers ===
+
+
 def generate_trajectory(
     context_tokens: torch.Tensor,
     adapter_model: torch.nn.Module,
-    base_model: torch.nn.Module,
     tokenizer: Any,
-    embeddings_dict: Dict,
-    hook_remover: Callable,
     available_qkv_steps: List[KVPair],
     batch_size: int,
     verbose: bool = False,
 ) -> RawTrajectory:
     """
-    Generate a single trajectory using vector queries.
-    
-    Args:
-        context_tokens: Initial context tokens
-        adapter_model: The model with LoRA adapter for generation
-        base_model: The base model (unused but kept for interface compatibility)
-        tokenizer: The tokenizer
-        embeddings_dict: Dictionary for storing embeddings from hooks
-        hook_remover: Function to remove hooks
-        available_qkv_steps: List of available key-value pairs to choose from
-        batch_size: Number of trajectories to generate in parallel
-        verbose: Whether to enable verbose logging
-        
-    Returns:
-        RawTrajectory skeleton (no rewards yet)
+    Generate a single trajectory using vector queries (refactored, purely functional).
     """
-    # Ensure the context is on the same device as the model
+    # === Setup ================================================================
     device = next(adapter_model.parameters()).device
     current_context = context_tokens.to(device)
-    
-    # Decode initial context for logging
-    context_text = tokenizer.batch_decode(current_context, skip_special_tokens=True)
-    
-    if verbose:
-        print("\n=== Starting New Trajectory ===")
-        print(f"Initial context: {context_text[0][:50]}...")
-        print(f"Available query-key-value steps: {len(available_qkv_steps)}")
-        print(f"Query mode: Vector queries")
-    
-    # Initialize selected steps list
-    selected_steps = []
-    
-    # Initialize per-batch available indices (to handle independent removals)
-    # Each batch item starts with the full set of indices
+
     num_keys = len(available_qkv_steps)
-    available_indices_per_batch = [list(range(num_keys)) for _ in range(batch_size)]
-    
-    # Save all key embeddings at the beginning to store at trajectory level
-    all_initial_key_embeddings = []
-    for qkv_data in available_qkv_steps:
-        key_emb = qkv_data.key_embedding.to(device)
-        all_initial_key_embeddings.append(key_emb)
-    trajectory_key_embeddings = torch.stack(all_initial_key_embeddings, dim=1)  # [batch_size, num_keys, embedding_dim]
-    
-    # Loop until we've selected a fixed number of steps
-    for step_idx in range(NUM_KV_PAIRS):
-        # Generate query vector (deterministic mean)
-        query_embeddings = generate_query_vector(
-            adapter_model,
-            tokenizer,
-            current_context
-        )
-        
-        # For vector queries, we don't have query tokens or text
-        # We'll use placeholders for compatibility
-        query_tokens = torch.tensor([[]], device=device).long()  # Empty tensor
-        query_text = ["<VECTOR_QUERY>"] * batch_size
-        
-        # Use pre-computed key embeddings from available steps
-        key_embs = []
-        for qkv_data in available_qkv_steps:
-            # Use the pre-computed embedding, just move to device
-            key_emb = qkv_data.key_embedding.to(device)
-            # If key_emb has batch size 1 but we need batch_size, broadcast it
-            if key_emb.shape[0] == 1 and batch_size > 1:
-                key_emb = key_emb.expand(batch_size, -1)  # Broadcast to [batch_size, hidden_size]
-            key_embs.append(key_emb)
-            
-        # Stack key embeddings with shape [batch_size, num_keys, hidden_size]
-        key_embeddings = torch.stack(key_embs, dim=1)
-        
-        # Compute similarity scores
-        similarity_scores = compute_similarity(query_embeddings, key_embeddings, adapter_model)
-                   
-        # Sample next step
-        # Pass available_indices_per_batch to sample_key_value
-        sampled_indices, _ = sample_key_value(
-            similarity_scores, 
-            available_indices_per_batch,
-            batch_size
-        )
-        
-        # Use the full sampled_indices (one per batch item) instead of just the first
-        selected_indices = sampled_indices  # List or tensor of shape [batch_size]
+    available_indices_per_batch: List[List[int]] = [list(range(num_keys)) for _ in range(batch_size)]
 
-        # Since available_qkv_steps is a list of KVPair (each with shape [1, ...] in GRPO mode),
-        # we need to select different KV for each batch item, potentially allowing duplicates
-        # if sampling the same index (to explore different orders)
+    # Ensure each key embedding has batch dimension = batch_size
+    key_emb_list = []
+    for kv in available_qkv_steps:
+        emb = kv.key_embedding.to(device)
+        if emb.shape[0] == 1 and batch_size > 1:
+            emb = emb.expand(batch_size, -1)  # broadcast singleton to whole batch
+        key_emb_list.append(emb)
 
-        # To handle batch-wise selection without modifying the shared list,
-        # we'll gather the selected data for each batch item independently
+    trajectory_key_embeddings = torch.stack(key_emb_list, dim=1)  # [batch_size, num_keys, hidden]
+
+    # Start with an empty immutable RawTrajectory
+    traj: RawTrajectory = RawTrajectory(qkv_steps=[], all_key_embeddings=trajectory_key_embeddings)
+
+    if verbose:
+        decoded = tokenizer.batch_decode(current_context, skip_special_tokens=True)
+        print("\n=== Starting New Trajectory ===")
+        print(f"Initial context: {decoded[0][:50]}...")
+        print(f"Vector-query mode. Pool size: {num_keys}")
+
+    # === Autoregressive selection loop =======================================
+    for _ in range(NUM_KV_PAIRS):
+        # 1) Build query embedding
+        query_emb = generate_query_vector(adapter_model, tokenizer, current_context)
+
+        # 2) Compute similarities
+        similarity_scores = compute_similarity(query_emb, traj.all_key_embeddings, adapter_model)
+
+        # 4) Sample an index per batch item, respecting already-used keys
+        selected_indices, _ = sample_key_value(similarity_scores, available_indices_per_batch, batch_size)
+
+        # 5) Assemble tensors for the chosen KV pair
         selected_key_tokens = []
         selected_value_tokens = []
         selected_key_embeddings = []
         selected_key_texts = []
         selected_value_texts = []
 
-        for b in range(batch_size):
-            sel_idx = selected_indices[b]
-            selected_data = available_qkv_steps[sel_idx]
-            
-            # Extract for this batch item (since data might be [1, ...], squeeze and unsqueeze)
-            selected_key_tokens.append(selected_data.key_tokens[0])  # Shape [seq_len]
-            selected_value_tokens.append(selected_data.value_tokens[0])
-            selected_key_embeddings.append(selected_data.key_embedding[0])
-            selected_key_texts.append(selected_data.key_text[0])
-            selected_value_texts.append(selected_data.value_text[0])
+        for b, idx in enumerate(selected_indices):
+            kv = available_qkv_steps[idx]
+            selected_key_tokens.append(kv.key_tokens[0])
+            selected_value_tokens.append(kv.value_tokens[0])
+            selected_key_embeddings.append(kv.key_embedding[0])
+            selected_key_texts.append(kv.key_text[0])
+            selected_value_texts.append(kv.value_text[0])
 
-        # Stack back to batched tensors
-        selected_key_tokens = torch.stack(selected_key_tokens, dim=0)  # [batch_size, seq_len]
+        selected_key_tokens = torch.stack(selected_key_tokens, dim=0)
         selected_value_tokens = torch.stack(selected_value_tokens, dim=0)
-        selected_key_embedding = torch.stack(selected_key_embeddings, dim=0)
-        selected_key_text = selected_key_texts
-        selected_value_text = selected_value_texts
+        selected_key_embeddings = torch.stack(selected_key_embeddings, dim=0)
 
-        # Note: To allow exploration of different orders, we DON'T remove from available_qkv_steps
-        # This permits duplicate selections if sampled, which is fine for order exploration
-        # If you want to prevent duplicates per trajectory, we'd need per-batch available masks
-
-        # Create the batched KVPair
         step_data = KVPair(
             key_tokens=selected_key_tokens,
             value_tokens=selected_value_tokens,
-            key_embedding=selected_key_embedding,
-            key_text=selected_key_text,
-            value_text=selected_value_text
+            key_embedding=selected_key_embeddings,
+            key_text=selected_key_texts,
+            value_text=selected_value_texts,
         )
 
-        # Create QKVSelection with batched selected_idx
-        # Store the available indices mask for proper policy gradient computation
-        available_mask = torch.full((batch_size, num_keys), float('-inf'), device=device)
-        for b in range(batch_size):
-            available_mask[b, available_indices_per_batch[b]] = 0.0
-        
-        completed_step = QKVSelection(
+        # Use large negative value instead of -inf to keep log-softmax finite
+        available_mask = _build_available_mask(available_indices_per_batch, num_keys, device).clamp(min=-1e9)
+
+        qkv_step = QKVSelection(
             data=step_data,
-            query_text=query_text,
-            query_tokens=query_tokens,
-            query_embedding=query_embeddings,
+            query_embedding=query_emb,
             similarity_scores=similarity_scores,
-            selected_idx=torch.tensor(selected_indices),  # Now a tensor [batch_size]
-            available_mask=available_mask  # Store mask for policy gradient computation
+            selected_idx=torch.tensor(selected_indices, device=device),
+            available_mask=available_mask,
         )
-        
-        # Add selected step to the list
-        selected_steps.append(completed_step)
-        
-        # Remove the selected index from each batch item's available indices
-        for b in range(batch_size):
-            sel_idx = selected_indices[b]
-            if sel_idx in available_indices_per_batch[b]:
-                available_indices_per_batch[b].remove(sel_idx)  # Remove to prevent duplicates
-            else:
-                # This shouldn't happen, but log a warning if it does
-                if verbose:
-                    print(f"Warning: Batch {b} tried to select index {sel_idx} which was already removed")
-        
-        # Update context for next iteration
-        # For vector queries, we don't add query tokens to context
-        # Only add key and value tokens
-        key_prefix_tokens = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-        value_prefix_tokens = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-        
-        current_context = torch.cat([
-            current_context,
-            key_prefix_tokens, 
-            completed_step.key_tokens,
-            value_prefix_tokens,
-            completed_step.value_tokens
-        ], dim=1)
-        
-        # Update context text
-        context_text = tokenizer.batch_decode(current_context, skip_special_tokens=True)
-    
+
+        # 6) Append to immutable trajectory
+        traj = _append_step(traj, qkv_step)
+
+        # 7) Update bookkeeping lists and context
+        for b, idx in enumerate(selected_indices):
+            if idx in available_indices_per_batch[b]:
+                available_indices_per_batch[b].remove(idx)
+
+        current_context = _update_context(current_context, qkv_step, tokenizer, batch_size, device)
+
     if verbose:
-        # Print the full context at the end of the trajectory
-        full_context = tokenizer.batch_decode(current_context)[0]
-        print(f"\n=== Complete Context from Trajectory ===")
-        print(full_context)
-        print("\n=== Trajectory Complete ===\n")
-    
-    # Build and return RawTrajectory (rewards filled later)
-    return RawTrajectory(
-        qkv_steps=selected_steps,
-        all_key_embeddings=trajectory_key_embeddings,
-    )
+        full_ctx = tokenizer.batch_decode(current_context, skip_special_tokens=True)[0]
+        print("\n=== Trajectory Complete ===")
+        print(full_ctx)
+
+    return traj
 
 
 def parse_args():
@@ -635,18 +558,6 @@ def compute_kl_from_reference(
     float
         Average KL divergence across all steps in the trajectory (batch-mean inside each step).
     """
-    # Redundant local imports removed – all symbols available at module level
-    # import torch
-    # import torch.nn.functional as F
-    # from src.embeddings import compute_similarity
-    # from src.training import generate_query_vector
-    # from src.config import INITIAL_PROMPT, KEY_PREFIX, VALUE_PREFIX, TEMPERATURE
-
-    # Early exit if trajectory lacks steps or key embeddings (e.g., in unit-tests with mocks)
-    if (not trajectory.qkv_steps):
-        return 0.0
-
-    # import torch  # redundant (already at module level)
     all_key_embs = getattr(trajectory, "all_key_embeddings", None)
     if not isinstance(all_key_embs, torch.Tensor):
         raise TypeError("trajectory.all_key_embeddings must be a torch.Tensor")
@@ -760,8 +671,19 @@ def main():
     config.BASELINE_UPDATE_FREQUENCY = args.baseline_update_freq
     config.SUBTRACT_BASE_MODEL_LOGPROBS = args.subtract_base_logprobs
     
-    # Register embedding hooks
-    embeddings_dict, hook_remover = register_embedding_hook(adapter_model)
+    # Separate hooks: one for query (train-time) and one for key (data loading)
+    query_embeddings_dict, query_hook_remover = register_embedding_hook(adapter_model, embed_type="query")
+    key_embeddings_dict, key_hook_remover   = register_embedding_hook(adapter_model, embed_type="key")
+
+    # Helper to compute key embeddings once during data loading using the key-specific hook
+    def compute_key_embedding(key_token_batch: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            return extract_embeddings(
+                adapter_model,
+                key_token_batch.to(DEVICE),
+                key_embeddings_dict,
+                requires_grad=False,
+            ).detach()
     
     # Make sure hook is removed at the end
     try:
@@ -816,7 +738,7 @@ def main():
                 dataset_name=args.dataset,
                 batch_size=1,  # Generate single items
                 tokenizer=tokenizer,
-                embedding_fn=None  # embeddings computed later
+                embedding_fn=compute_key_embedding,
             )
             # Repeat each item batch_size times for GRPO-style batching
             kv_pair_generator = repeat_n_times(args.batch_size, base_iterator)
@@ -824,9 +746,9 @@ def main():
             # Standard approach: different items in each batch position
             kv_pair_generator = iter_key_value_pairs_unified_with_tokenizer(
                 dataset_name=args.dataset,
-                batch_size=args.batch_size, 
+                batch_size=args.batch_size,
                 tokenizer=tokenizer,
-                embedding_fn=None
+                embedding_fn=compute_key_embedding,
             )
         
         # Get reference to the base model (pi_ref)
@@ -900,13 +822,10 @@ def main():
             
             # Generate a *raw* trajectory (no rewards yet)
             raw_traj = generate_trajectory(
-                initial_tokens,
-                adapter_model,
-                ref_model,
-                tokenizer,
-                embeddings_dict,
-                hook_remover,
-                available_qkv_steps,
+                context_tokens=initial_tokens,
+                adapter_model=adapter_model,
+                tokenizer=tokenizer,
+                available_qkv_steps=available_qkv_steps,
                 batch_size=args.batch_size,
                 verbose=args.verbose,
             )
@@ -960,7 +879,7 @@ def main():
                 KL_PENALTY_COEFFICIENT,
                 verbose=args.verbose,
                 tokenizer=tokenizer,
-                embeddings_dict=embeddings_dict
+                embeddings_dict=query_embeddings_dict # Use query embeddings for training
             )
             
             # Track clipping ratio
@@ -1078,11 +997,9 @@ def main():
                 from src.training import compute_advantages
                 from src.config import GAMMA, GAE_LAMBDA, USE_GRPO_BASELINE
                 advantages, _ = compute_advantages(
-                    trajectory.rewards, 
-                    values=None, 
+                    trajectory.rewards,
                     gamma=GAMMA,
-                    gae_lambda=GAE_LAMBDA,
-                    use_grpo_baseline=USE_GRPO_BASELINE
+                    use_grpo_baseline=USE_GRPO_BASELINE,
                 )
                 avg_advantage = advantages.mean().item()
             else:
@@ -1245,7 +1162,8 @@ def main():
     
     finally:
         # Remove hooks
-        hook_remover()
+        query_hook_remover()
+        key_hook_remover()
         if 'old_hook_remover' in locals():
             old_hook_remover()
 
