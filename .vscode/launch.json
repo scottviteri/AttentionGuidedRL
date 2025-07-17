@@ -11,7 +11,7 @@
             "program": "${workspaceFolder}/src/main.py",
             "args": [
                 "--batch-size",
-                "16",
+                "4",
                 "--episodes",
                 "100",
                 "--verbose"
