@@ -11,4 +11,5 @@ accelerate>=0.22.0  # For device management
 scipy>=1.10.0
 matplotlib>=3.7.0
 pandas>=2.0.0
+toolz>=0.12.0
 wandb>=0.15.0 
