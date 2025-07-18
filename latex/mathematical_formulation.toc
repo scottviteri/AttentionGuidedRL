@@ -1,0 +1,25 @@
+\contentsline {section}{\numberline {1}Introduction}{2}{section.1}%
+\contentsline {section}{\numberline {2}Problem Formulation}{2}{section.2}%
+\contentsline {subsection}{\numberline {2.1}State Space and Action Space}{2}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}Trajectory and Episode Structure}{2}{subsection.2.2}%
+\contentsline {section}{\numberline {3}Policy Definition}{2}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Vector Query Generation}{2}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}Multi-Head Attention Similarity}{3}{subsection.3.2}%
+\contentsline {section}{\numberline {4}Reward Function}{4}{section.4}%
+\contentsline {section}{\numberline {5}Optimization Objective}{4}{section.5}%
+\contentsline {subsection}{\numberline {5.1}Primary Objective Function}{4}{subsection.5.1}%
+\contentsline {subsection}{\numberline {5.2}Return and Advantage Computation}{5}{subsection.5.2}%
+\contentsline {section}{\numberline {6}Loss Function and Training Algorithm}{5}{section.6}%
+\contentsline {subsection}{\numberline {6.1}PPO Loss Implementation}{5}{subsection.6.1}%
+\contentsline {subsection}{\numberline {6.2}Step-Level Credit Assignment Details}{6}{subsection.6.2}%
+\contentsline {subsection}{\numberline {6.3}KL Divergence Regularization}{6}{subsection.6.3}%
+\contentsline {section}{\numberline {7}Training Algorithm}{6}{section.7}%
+\contentsline {section}{\numberline {8}Implementation Details}{6}{section.8}%
+\contentsline {subsection}{\numberline {8.1}Model Architecture}{6}{subsection.8.1}%
+\contentsline {subsection}{\numberline {8.2}Training Configuration}{7}{subsection.8.2}%
+\contentsline {subsection}{\numberline {8.3}Data Processing}{7}{subsection.8.3}%
+\contentsline {section}{\numberline {9}Key Mathematical Properties}{7}{section.9}%
+\contentsline {subsection}{\numberline {9.1}Convergence Properties}{7}{subsection.9.1}%
+\contentsline {subsection}{\numberline {9.2}Attention Mechanism Properties}{8}{subsection.9.2}%
+\contentsline {subsection}{\numberline {9.3}GRPO Baseline Properties}{8}{subsection.9.3}%
+\contentsline {section}{\numberline {10}Conclusion}{8}{section.10}%

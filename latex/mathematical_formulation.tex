@@ -1,0 +1,377 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{tikz}
+\usepackage{pgfplots}
+
+\geometry{margin=1in}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,      
+    urlcolor=cyan,
+}
+
+\title{Mathematical Formulation of Attention-Guided Reinforcement Learning}
+\author{AttentionGuidedRL Repository}
+\date{\today}
+
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document provides a comprehensive mathematical formulation of the optimization objective implemented in the Attention-Guided Reinforcement Learning (AttentionGuidedRL) repository. The system trains a language model to autonomously guide its own training by sequencing key-value pairs from Wikipedia articles using reinforcement learning with policy gradients, multi-head attention mechanisms, and proximal policy optimization (PPO).
+\end{abstract}
+
+\tableofcontents
+
+\section{Introduction}
+
+The AttentionGuidedRL system implements a novel approach where a base language model (Llama-3.2-3B or GPT-2) learns to sequence its own training data through reinforcement learning. The model generates vector queries using attention mechanisms and selects key-value pairs to maximize learning progress, measured by conditional log probabilities of value tokens.
+
+\section{Problem Formulation}
+
+\subsection{State Space and Action Space}
+
+\begin{definition}[State Space]
+At timestep $t$, the state $s_t$ consists of:
+\begin{align}
+s_t = (c_t, \mathcal{K}_t^{\text{available}})
+\end{align}
+where:
+\begin{itemize}
+    \item $c_t \in \mathbb{Z}^{L_t}$ is the context sequence of length $L_t$
+    \item $\mathcal{K}_t^{\text{available}} \subseteq \{1, 2, \ldots, K\}$ is the set of available key indices
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Action Space]
+The action space $\mathcal{A}_t$ at timestep $t$ is the set of available key indices:
+\begin{align}
+\mathcal{A}_t = \mathcal{K}_t^{\text{available}}
+\end{align}
+\end{definition}
+
+\subsection{Trajectory and Episode Structure}
+
+A trajectory $\tau$ consists of $T$ steps:
+\begin{align}
+\tau = \{(s_1, a_1, r_1), (s_2, a_2, r_2), \ldots, (s_T, a_T, r_T)\}
+\end{align}
+
+where $T$ is the number of key-value pairs per episode (NUM\_KV\_PAIRS in the code).
+
+\section{Policy Definition}
+
+\subsection{Vector Query Generation}
+
+The policy $\pi_\theta$ operates through a vector query mechanism parameterized by LoRA adapter weights $\theta$.
+
+\begin{definition}[Query Vector Generation]
+Given context $c_t$, the query vector is generated as:
+\begin{align}
+q_t = \text{AvgPool}(\text{Embed}_\theta(c_t \oplus [\text{``Query''}]))
+\end{align}
+where:
+\begin{itemize}
+    \item $\text{Embed}_\theta(\cdot)$ extracts embeddings from the second-to-last attention layer
+    \item $\oplus$ denotes sequence concatenation
+    \item $\text{AvgPool}$ averages over the sequence dimension
+    \item $q_t \in \mathbb{R}^{d_{\text{model}}}$ where $d_{\text{model}}$ is the model dimension
+\end{itemize}
+\end{definition}
+
+\subsection{Multi-Head Attention Similarity}
+
+The system handles both standard Multi-Head Attention (MHA) and Grouped Query Attention (GQA).
+
+\begin{definition}[Head-wise Similarity Computation]
+For each attention head $h \in \{1, 2, \ldots, H\}$ and key $k$:
+\begin{align}
+\text{sim}_{t,k}^{(h)} = \frac{(q_t^{(h)})^T k_k^{(\text{group}(h))}}{\sqrt{d_{\text{head}}}} \cdot \frac{1}{\tau}
+\end{align}
+where:
+\begin{itemize}
+    \item $q_t^{(h)} \in \mathbb{R}^{d_{\text{head}}}$ is the query for head $h$
+    \item $k_k^{(\text{group}(h))} \in \mathbb{R}^{d_{\text{head}}}$ is the key for the corresponding group
+    \item $\text{group}(h) = \lfloor h \cdot G / H \rfloor$ maps heads to groups (for GQA)
+    \item $G$ is the number of key-value groups
+    \item $H$ is the number of query heads
+    \item $d_{\text{head}} = d_{\text{model}} / H$ is the head dimension
+    \item $\tau = 1.0$ is the temperature parameter
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Per-Head Probability Distribution]
+For each head $h$, the probability distribution over keys is:
+\begin{align}
+p_{t,k}^{(h)} = \frac{\exp(\text{sim}_{t,k}^{(h)})}{\sum_{k' \in \mathcal{K}_t^{\text{available}}} \exp(\text{sim}_{t,k'}^{(h)})}
+\end{align}
+\end{definition}
+
+\begin{definition}[Policy Distribution]
+The final policy distribution is obtained by averaging over heads:
+\begin{align}
+\pi_\theta(k | s_t) = \frac{1}{H} \sum_{h=1}^{H} p_{t,k}^{(h)}
+\end{align}
+\end{definition}
+
+\section{Reward Function}
+
+\begin{definition}[Step Reward]
+The reward at step $t$ is defined as the conditional log probability of value tokens:
+\begin{align}
+r_t = \begin{cases}
+\log p_\theta(v_t | c_t, k_t) - \log p_{\text{ref}}(v_t | c_t, k_t) & \text{if SUBTRACT\_BASE\_MODEL\_LOGPROBS} \\
+\log p_\theta(v_t | c_t, k_t) & \text{otherwise}
+\end{cases}
+\end{align}
+where:
+\begin{itemize}
+    \item $v_t$ are the value tokens at step $t$
+    \item $k_t$ are the selected key tokens at step $t$
+    \item $p_\theta(\cdot)$ is the adapter model probability
+    \item $p_{\text{ref}}(\cdot)$ is the reference model probability (base model without LoRA)
+\end{itemize}
+\end{definition}
+
+\begin{definition}[Conditional Log Probability]
+The conditional log probability is computed as:
+\begin{align}
+\log p_\theta(v_t | c_t, k_t) = \frac{1}{|v_t|} \sum_{i=1}^{|v_t|} \log p_\theta(v_{t,i} | c_t, k_t, v_{t,<i})
+\end{align}
+where $v_{t,i}$ is the $i$-th token in the value sequence and $v_{t,<i}$ represents the preceding tokens.
+\end{definition}
+
+\section{Optimization Objective}
+
+\subsection{Primary Objective Function}
+
+\begin{theorem}[Trajectory Sampling with Step-Level Credit Assignment]
+The system maximizes the following objective function:
+\begin{align}
+\mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=1}^T A_t(\tau) \cdot \log \pi_\theta(a_t | s_t) \right] - \beta \cdot D_{KL}(\pi_\theta || \pi_{\text{ref}})
+\end{align}
+
+where:
+\begin{itemize}
+    \item $\tau = (s_1, a_1, r_1, \ldots, s_T, a_T, r_T)$ is a complete trajectory sampled from policy $\pi_\theta$
+    \item $A_t(\tau) = R_t(\tau) - b_t$ is the \textbf{trajectory-dependent advantage} at step $t$
+    \item $R_t(\tau) = \sum_{t'=t}^T \gamma^{t'-t} r_{t'}$ are the discounted returns from step $t$ forward in trajectory $\tau$
+    \item $b_t = \mathbb{E}_{\text{batch}}[R_t(\tau)]$ is the GRPO baseline (batch average of returns at step $t$)
+    \item $\gamma = 0.99$ is the discount factor
+    \item $\beta = 0.1$ is the KL penalty coefficient
+    \item $\pi_{\text{ref}}$ is the fixed reference policy (base model without LoRA)
+\end{itemize}
+
+\textbf{Key Insight:} We sample complete trajectories first, then assign step-specific credit. Each action $a_t$ receives weight $A_t(\tau)$ that depends on the \textbf{actual future rewards} observed in that trajectory, not a trajectory-average.
+\end{theorem}
+
+\subsection{Return and Advantage Computation}
+
+\begin{definition}[Discounted Returns]
+The return at timestep $t$ is:
+\begin{align}
+R_t = \sum_{t'=t}^T \gamma^{t'-t} r_{t'}
+\end{align}
+\end{definition}
+
+\begin{definition}[GRPO Advantage Estimation]
+The system uses Group Relative Policy Optimization (GRPO) for advantage estimation:
+\begin{align}
+A_t(\tau^{(i)}) &= R_t(\tau^{(i)}) - b_t \\
+b_t &= \frac{1}{B} \sum_{i=1}^B R_t(\tau^{(i)})
+\end{align}
+where:
+\begin{itemize}
+    \item $\tau^{(i)}$ is the $i$-th trajectory in the batch
+    \item $b_t$ is the per-timestep baseline computed as the batch average of returns at step $t$
+    \item $B$ is the batch size
+    \item Each trajectory gets its own advantage based on its actual returns vs. the batch average
+\end{itemize}
+\end{definition}
+
+\section{Loss Function and Training Algorithm}
+
+\subsection{PPO Loss Implementation}
+
+\begin{theorem}[Step-Level PPO Loss with Process Supervision]
+The actual loss function implements step-level Proximal Policy Optimization where each action receives credit for its own contribution:
+\begin{align}
+\mathcal{L}(\theta) = -\sum_{t=1}^T \left[ \min\left( \rho_t(\theta) \cdot A_t, \text{clip}(\rho_t(\theta), 1-\epsilon, 1+\epsilon) \cdot A_t \right) \right] + \beta \cdot D_{KL}(\pi_\theta || \pi_{\text{ref}})
+\end{align}
+where each step $t$ contributes independently:
+\begin{itemize}
+    \item $A_t = R_t - b_t$ is the \textbf{step-specific advantage} (return from step $t$ forward minus baseline)
+    \item $\rho_t(\theta) = \frac{\pi_\theta(a_t | s_t)}{\pi_{\text{old}}(a_t | s_t)}$ is the \textbf{step-specific probability ratio}
+    \item $a_t$ is the key selection action at step $t$ given context $s_t$
+    \item $\epsilon = 0.2$ is the PPO clipping parameter
+    \item $\text{clip}(x, a, b) = \max(a, \min(x, b))$
+    \item KL divergence is computed against the fixed reference policy $\pi_{\text{ref}}$
+\end{itemize}
+
+\textbf{Process Supervision Interpretation:} Each action $a_t$ (key selection) receives credit proportional to its step-specific advantage $A_t$, enabling proper credit assignment where early selections (affecting more future rewards) receive higher weight than later selections.
+\end{theorem}
+
+\subsection{Step-Level Credit Assignment Details}
+
+\begin{definition}[Step-Level Gradient Decomposition]
+The policy gradient decomposes naturally into step-level contributions:
+\begin{align}
+\nabla_\theta \mathcal{J}(\theta) = \sum_{t=1}^T \mathbb{E}\left[ A_t \cdot \nabla_\theta \log \pi_\theta(a_t | s_t) \right]
+\end{align}
+\end{definition}
+
+This formulation ensures:
+\begin{enumerate}
+    \item \textbf{Proper Temporal Credit}: Action $a_1$ (first key selection) affects rewards $\{r_1, r_2, \ldots, r_T\}$, so $A_1 = \sum_{t'=1}^T \gamma^{t'-1} r_{t'} - b_1$
+    \item \textbf{Diminishing Influence}: Action $a_T$ (last key selection) only affects $r_T$, so $A_T = r_T - b_T$
+    \item \textbf{Independent Assessment}: Each action's contribution is evaluated against its own expected value, not averaged across the trajectory
+\end{enumerate}
+
+\textbf{Comparison with Trajectory-Level Formulation:}
+\begin{itemize}
+    \item \textbf{Trajectory-Level}: $\mathcal{L} = -\bar{A} \sum_{t=1}^T \log \pi_\theta(a_t | s_t)$ where $\bar{A} = \frac{1}{T}\sum_{t=1}^T A_t$
+    \item \textbf{Step-Level}: $\mathcal{L} = -\sum_{t=1}^T A_t \log \pi_\theta(a_t | s_t)$ (our formulation)
+\end{itemize}
+
+The step-level formulation provides \textbf{finer-grained supervision} where early actions naturally receive higher gradients due to their broader impact on trajectory outcomes.
+
+\subsection{KL Divergence Regularization}
+
+\begin{definition}[KL Divergence Term]
+The KL divergence regularization is computed as:
+\begin{align}
+D_{KL}(\pi_\theta || \pi_{\text{ref}}) = \sum_{t=1}^T \sum_{k \in \mathcal{K}_t^{\text{available}}} \pi_\theta(k|s_t) \log \frac{\pi_\theta(k|s_t)}{\pi_{\text{ref}}(k|s_t)}
+\end{align}
+\end{definition}
+
+This is implemented using PyTorch's \texttt{F.kl\_div} with \texttt{log\_target=True} for numerical stability. The reference policy $\pi_{\text{ref}}$ is the fixed base model without LoRA, providing a stable regularization target.
+
+\section{Training Algorithm}
+
+\begin{algorithm}
+\caption{Attention-Guided RL Training}
+\begin{algorithmic}[1]
+\REQUIRE Base model, tokenizer, Wikipedia dataset
+\REQUIRE Hyperparameters: $\gamma, \beta, \epsilon$, learning rate, batch size
+\STATE Initialize LoRA adapter parameters $\theta$
+\STATE Initialize reference model $\pi_{\text{ref}}$ (base model without LoRA, fixed)
+\STATE Initialize old model $\pi_{\text{old}} \leftarrow \pi_\theta$
+\STATE Initialize optimizer (AdamW with learning rate $5 \times 10^{-4}$)
+\FOR{episode $= 1$ to NUM\_EPISODES}
+    \STATE Sample Wikipedia article and extract key-value pairs
+    \STATE Generate trajectory $\tau$ using current policy $\pi_\theta$
+    \STATE Compute rewards $\{r_t\}_{t=1}^T$ using Equation (7)
+    \STATE Compute returns $\{R_t\}_{t=1}^T$ using Equation (10)
+    \STATE Compute advantages $\{A_t\}_{t=1}^T$ using GRPO (Equation 11-12)
+    \STATE Compute PPO loss $\mathcal{L}(\theta)$ using Equation (13) with KL vs $\pi_{\text{ref}}$
+    \STATE Update parameters: $\theta \leftarrow \theta - \nabla_\theta \mathcal{L}(\theta)$
+    \IF{episode $\bmod$ BASELINE\_UPDATE\_FREQUENCY $== 0$}
+        \STATE Update old model: $\pi_{\text{old}} \leftarrow \pi_\theta$ (for PPO ratios only)
+    \ENDIF
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\section{Implementation Details}
+
+\subsection{Model Architecture}
+\begin{itemize}
+    \item \textbf{Base Models}: Llama-3.2-3B or GPT-2
+    \item \textbf{LoRA Configuration}: rank=8, $\alpha$=16, dropout=0.0
+    \item \textbf{Precision}: bfloat16 for computation, float32 for similarity calculations
+    \item \textbf{Context Window}: Up to model maximum (2048 for GPT-2, 4096+ for Llama)
+\end{itemize}
+
+\subsection{Training Configuration}
+\begin{itemize}
+    \item \textbf{Optimizer}: AdamW with learning rate $5 \times 10^{-4}$
+    \item \textbf{Batch Size}: 4 trajectories per update
+    \item \textbf{Gradient Clipping}: Norm clipped to 1.0
+    \item \textbf{Episodes}: 10,000 total training episodes
+    \item \textbf{Checkpoint Frequency}: Every 100 episodes
+\end{itemize}
+
+\subsection{Data Processing}
+\begin{itemize}
+    \item \textbf{Dataset}: Wikipedia 2022-03-01 English subset
+    \item \textbf{Token Counts}: 10 tokens per key, 10 tokens per value
+    \item \textbf{Trajectory Length}: Up to 10 key-value pairs per episode
+    \item \textbf{Prefixes}: "Key: " and "Value: " for context building
+\end{itemize}
+
+\section{Key Mathematical Properties}
+
+\subsection{Convergence Properties}
+\begin{lemma}[Policy Improvement]
+Under the PPO clipped objective with appropriate clipping parameter $\epsilon$, the policy improvement is guaranteed to be conservative, preventing destructively large updates.
+\end{lemma}
+
+\subsection{Attention Mechanism Properties}
+\begin{lemma}[Multi-Head Averaging]
+The averaging operation over attention heads in Equation (6) preserves the probability distribution property:
+\begin{align}
+\sum_{k \in \mathcal{K}_t^{\text{available}}} \pi_\theta(k | s_t) = 1
+\end{align}
+\end{lemma}
+
+\subsection{GRPO Baseline Properties}
+\begin{theorem}[Unbiased Advantage Estimation]
+The GRPO baseline provides unbiased gradient estimates:
+\begin{align}
+\mathbb{E}[A_t] = 0 \quad \text{for each timestep } t
+\end{align}
+This property holds by construction since $A_t = R_t - \mathbb{E}[R_t]$ where the expectation is over the batch.
+\end{theorem}
+
+\section{Conclusion}
+
+This mathematical formulation describes a sophisticated reinforcement learning system that combines:
+\begin{enumerate}
+    \item \textbf{Vector-based policy}: Using attention layer embeddings for query generation
+    \item \textbf{Multi-head attention similarity}: Handling both MHA and GQA architectures
+    \item \textbf{Step-level PPO optimization}: With proper temporal credit assignment through step-specific advantages
+    \item \textbf{GRPO advantage estimation}: For variance reduction without additional parameters
+    \item \textbf{Process supervision}: Where each action receives credit proportional to its impact on future outcomes
+    \item \textbf{Self-supervised learning}: Where the model learns to sequence its own training data
+\end{enumerate}
+
+The key innovation is the \textbf{step-level formulation} that ensures proper credit assignment: early key selections (which affect more future rewards) naturally receive higher gradient magnitudes than later selections. This creates a natural curriculum where the model learns to prioritize the quality of early decisions while still optimizing the entire sequence.
+
+The system represents a novel approach to active learning where the model's attention mechanisms directly drive the selection of training examples, creating a feedback loop between the model's internal representations and its learning curriculum.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{schulman2017proximal}
+Schulman, J., Wolski, F., Dhariwal, P., Radford, A., \& Klimov, O. (2017).
+\textit{Proximal policy optimization algorithms}.
+arXiv preprint arXiv:1707.06347.
+
+\bibitem{shazeer2019fast}
+Shazeer, N. (2019).
+\textit{Fast transformer decoding: One write-head is all you need}.
+arXiv preprint arXiv:1911.02150.
+
+\bibitem{hu2021lora}
+Hu, E. J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., ... \& Chen, W. (2021).
+\textit{LoRA: Low-rank adaptation of large language models}.
+arXiv preprint arXiv:2106.09685.
+
+\end{thebibliography}
+
+\end{document} 

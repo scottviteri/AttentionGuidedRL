@@ -34,6 +34,10 @@ from src.config import (
     KEY_PREFIX,
 )
 
+import time
+import torch
+import logging # Ensure logging is imported here
+
 
 # === Core Data Structures ===
 
@@ -263,14 +267,37 @@ def extract_kv_pairs(tokenizer: PreTrainedTokenizer):
 def compute_embeddings(embedding_fn: Callable[[torch.Tensor], torch.Tensor], batch_size: int):
     """Compute embeddings for keys in batches."""
     def compute_for_keys(all_keys: List[torch.Tensor]) -> List[torch.Tensor]:
+        # Start timing and memory tracking for key embedding computation
+        start_time = time.time()
+        initial_mem_allocated = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+        initial_mem_cached = torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
+
         all_embeddings = []
         for start_idx in range(0, NUM_KV_PAIRS, KEY_EMBEDDING_BATCH_SIZE):
             end_idx = min(start_idx + KEY_EMBEDDING_BATCH_SIZE, NUM_KV_PAIRS)
             key_batch = torch.stack(all_keys[start_idx:end_idx], dim=0)
             key_batch_flat = key_batch.view(-1, TOKENS_PER_KEY)
+            
             embeddings_flat = embedding_fn(key_batch_flat)
+            
             embeddings = embeddings_flat.view(end_idx - start_idx, batch_size, -1)
             all_embeddings.extend(embeddings)
+        
+        end_time = time.time()
+        final_mem_allocated = torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+        final_mem_cached = torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
+
+        total_time_ms = (end_time - start_time) * 1000
+        
+        logging.info(f"Key embedding computation took: {total_time_ms:.2f} ms")
+        if torch.cuda.is_available():
+            # Report increase in allocated memory
+            allocated_increase_mb = (final_mem_allocated - initial_mem_allocated) / (1024 * 1024)
+            # Report total cached/reserved memory
+            cached_memory_mb = final_mem_cached / (1024 * 1024)
+            logging.info(f"  CUDA Allocated Memory Increase: {allocated_increase_mb:.2f} MB")
+            logging.info(f"  CUDA Total Cached Memory: {cached_memory_mb:.2f} MB")
+
         return all_embeddings
     return compute_for_keys
 

@@ -370,6 +370,7 @@ def compute_advantages(
 def compute_policy_loss(
     trajectory: Trajectory,
     adapter_model: torch.nn.Module,
+    ref_model: torch.nn.Module,
     old_model: torch.nn.Module,
     kl_penalty_coef: float,
     verbose: bool = False,
@@ -383,7 +384,8 @@ def compute_policy_loss(
     Args:
         trajectory: The trajectory to train on
         adapter_model: The language model with LoRA adapter
-        old_model: The old model for KL divergence computation and probability ratios (pi_old)
+        ref_model: The reference model for KL divergence computation (pi_ref, fixed)
+        old_model: The old model for probability ratios (pi_old, for PPO)
         kl_penalty_coef: KL penalty coefficient (beta)
         verbose: Flag to enable verbose logging
         gamma: Discount factor for returns
@@ -527,7 +529,7 @@ def compute_policy_loss(
             selected_idx = torch.tensor(selected_idx, device=device)
         current_action_log_probs = current_log_probs_full[torch.arange(batch_size, device=device), selected_idx]
 
-        # --- Compute old-policy log-probabilities with same mask ---
+        # --- Compute old-policy log-probabilities with same mask for PPO ---
         old_query_emb = old_query_means[t]  # [batch, hidden]
 
         # Require full key embeddings
@@ -541,8 +543,15 @@ def compute_policy_loss(
 
         old_action_log_probs = old_log_probs_full[torch.arange(batch_size, device=device), selected_idx]
 
-        # Compute KL divergence between current and old policies over available keys (masked)
-        kl_step = F.kl_div(current_log_probs_full, old_log_probs_full, reduction="batchmean", log_target=True)
+        # --- Compute reference-policy log-probabilities for KL divergence ---
+        with torch.no_grad():
+            ref_query_emb = generate_query_vector(ref_model, tokenizer, context_tokens, layer_idx=-2)
+            ref_similarities = compute_similarity(ref_query_emb, key_embs_full, ref_model)
+            ref_masked_similarities = ref_similarities + qkv_step.available_mask.to(device)
+            ref_log_probs_full = ref_masked_similarities
+
+        # Compute KL divergence between current and reference policies over available keys (masked)
+        kl_step = F.kl_div(current_log_probs_full, ref_log_probs_full, reduction="batchmean", log_target=True)
 
         step_advantages = advantages[:, t].to(device)
 
@@ -573,7 +582,7 @@ def compute_policy_loss(
         if verbose and t == 0:  # Print info for first step
             print(f"PPO ratio mean: {ratio.mean().item():.4f}, std: {ratio.std().item():.4f}")
             print(f"Clipped ratio range: [{clipped_ratio.min().item():.4f}, {clipped_ratio.max().item():.4f}]")
-            print(f"KL divergence (masked): {kl_step.item():.4f}")
+            print(f"KL divergence vs ref (masked): {kl_step.item():.4f}")
         
         count += 1
     
@@ -628,8 +637,8 @@ def train_step(
     Args:
         trajectory: The trajectory to train on
         adapter_model: The language model with LoRA adapter (trainable)
-        ref_model: The reference language model without LoRA (pi_ref for reward computation)
-        old_model: The old model for KL divergence computation (pi_old, updated every N episodes)
+        ref_model: The reference language model without LoRA (pi_ref for KL computation)
+        old_model: The old model for PPO probability ratios (pi_old, updated every N episodes)
         optimizer: The optimizer
         reward_stats: Reward statistics (for logging only with GRPO)
         kl_penalty_coef: KL penalty coefficient (beta)
@@ -664,11 +673,12 @@ def train_step(
     # Removed redundant local GAMMA import; constant already available
     # from src.config import GAMMA
     
-    # Compute policy loss using old_model for KL computation
+    # Compute policy loss using ref_model for KL computation and old_model for PPO
     total_loss, policy_loss, kl_loss, avg_clipping_ratio = compute_policy_loss(
         trajectory,  # Use original trajectory, not filtered
         adapter_model,
-        old_model,  # Use old_model instead of baseline_model for KL computation
+        ref_model,  # Use ref_model for KL computation (fixed reference)
+        old_model,  # Use old_model for PPO probability ratios
         kl_penalty_coef,
         verbose=verbose,
         gamma=GAMMA,

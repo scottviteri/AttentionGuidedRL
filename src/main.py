@@ -17,6 +17,7 @@ from tqdm import tqdm
 from datetime import datetime
 from typing import List, Any, Iterator
 import sys
+import time # Import time for overall timing
 
 from src.config import (
     MODEL_NAME,
@@ -269,7 +270,7 @@ def parse_args():
     parser.add_argument('--use-grpo-baseline', action='store_true', default=True, help='Use GRPO baseline in advantages')
     
     # Add new CLI flags for previously env-var configs
-    parser.add_argument('--key-embedding-batch-size', type=int, default=4, help='Number of keys to process together in forward pass')
+    # parser.add_argument('--key-embedding-batch-size', type=int, default=4, help='Number of keys to process together in forward pass')
     parser.add_argument('--kl-penalty-coef', type=float, default=0.1, help='KL penalty coefficient for regularization')
     parser.add_argument('--enable-wandb', action='store_true', default=False, help='Enable Weights & Biases logging')
     parser.add_argument('--ppo-clip-epsilon', type=float, default=0.2, help='PPO clipping parameter (epsilon)')
@@ -600,6 +601,9 @@ def compute_kl_from_reference(
 
 def main():
     """Main training function."""
+    # Start overall training timer
+    overall_start_time = time.time()
+
     # Parse arguments
     args = parse_args()
     
@@ -646,7 +650,7 @@ def main():
     config.USE_GRPO_BASELINE = args.use_grpo_baseline
     
     # Set additional config values from CLI args
-    config.KEY_EMBEDDING_BATCH_SIZE = args.key_embedding_batch_size
+    config.KEY_EMBEDDING_BATCH_SIZE = args.batch_size # Default to batch_size
     config.KL_PENALTY_COEFFICIENT = args.kl_penalty_coef
     config.ENABLE_WANDB = args.enable_wandb
     config.PPO_CLIP_EPSILON = args.ppo_clip_epsilon
@@ -1320,6 +1324,10 @@ def main():
         key_hook_remover()
         if 'old_hook_remover' in locals():
             old_hook_remover()
+        # End overall training timer
+        overall_end_time = time.time()
+        total_overall_time_minutes = (overall_end_time - overall_start_time) / 60
+        logging.info(f"Overall training duration: {total_overall_time_minutes:.2f} minutes")
 
 
 # Old save_plot_data function removed - now using the one from src.plotting module
