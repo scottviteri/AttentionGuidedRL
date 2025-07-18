@@ -1,3 +1,4 @@
+
 """
 Text-based analysis generation from plotting data for LM consumption.
 
@@ -302,10 +303,10 @@ Detected {len(training_phases)} training phases:
 CONFIGURATION HIGHLIGHTS
 -----------------------
 • KL Penalty Coefficient: {config.get('KL_PENALTY_COEFFICIENT', 'unknown')}
-• Gamma (discount): {config.get('GAMMA', 'unknown')}
+• Gamma (discount): {config.get('CONFIG.gamma', 'unknown')}
 • Baseline Update Frequency: {config.get('BASELINE_UPDATE_FREQUENCY', 'unknown')} episodes
-• Temperature: {config.get('TEMPERATURE', 'unknown')}
-• PPO Clip Epsilon: {config.get('PPO_CLIP_EPSILON', 'unknown')}
+• Temperature: {config.get('CONFIG.temperature', 'unknown')}
+• PPO Clip Epsilon: {config.get('CONFIG.ppo_clip_epsilon', 'unknown')}
 
 DATA SUMMARY
 -----------

@@ -14,7 +14,7 @@ import shutil
 
 from src.data import KVPair, QKVSelection
 from src.training import Trajectory
-from src.config import NUM_KV_PAIRS, TOKENS_PER_KEY, TOKENS_PER_VALUE
+from src.config import CONFIG
 
 
 class MockArgs:
@@ -57,7 +57,6 @@ def test_generate_trajectory(gpt2_model, gpt2_tokenizer):
     from src.main import generate_trajectory
     from src.training import RawTrajectory
     from src.embeddings import register_embedding_hook
-    from src.config import NUM_KV_PAIRS
     import torch
     
     # Move model to GPU
@@ -65,7 +64,7 @@ def test_generate_trajectory(gpt2_model, gpt2_tokenizer):
     gpt2_model = gpt2_model.to(device)
     
     # Register embedding hook
-    with patch('src.embeddings.MODEL_TYPE', 'gpt2'):
+    with patch("src.config.CONFIG.model_type", 'gpt2'):
         embeddings_dict, hook_remover = register_embedding_hook(gpt2_model)
     
     try:
@@ -98,7 +97,7 @@ def test_generate_trajectory(gpt2_model, gpt2_tokenizer):
         assert isinstance(trajectory, RawTrajectory)
         assert hasattr(trajectory, 'qkv_steps')
         assert hasattr(trajectory, 'all_key_embeddings')
-        assert len(trajectory.qkv_steps) == NUM_KV_PAIRS
+        assert len(trajectory.qkv_steps) == CONFIG.num_kv_pairs
         assert trajectory.all_key_embeddings.shape == (batch_size, len(mock_kv_pairs), gpt2_model.config.n_embd)
         
     finally:
@@ -116,8 +115,7 @@ def test_parse_args():
         args = parse_args()
         
         # Check defaults
-        from src.config import TRAINING_BATCH_SIZE
-        assert args.batch_size == TRAINING_BATCH_SIZE
+        assert args.batch_size == CONFIG.batch_size
         assert not args.resume
         assert args.log_interval == 10
     
@@ -264,7 +262,6 @@ def test_weights_update_with_real_model(gpt2_model, gpt2_tokenizer):
     """Test that model weights are actually updated during training using a real model."""
     from src.training import train_step, RawTrajectory, build_trajectory_from_raw
     from src.model import apply_lora_adapter
-    from src.config import TOKENS_PER_KEY, TOKENS_PER_VALUE
     from src.data import KVPair, QKVSelection
     
     # Create a copy of the model with LoRA adapter
@@ -288,8 +285,8 @@ def test_weights_update_with_real_model(gpt2_model, gpt2_tokenizer):
     for i in range(num_steps):
         # Create base data first
         qkv_data = KVPair(
-            key_tokens=torch.randint(0, 100, (batch_size, TOKENS_PER_KEY), device=device_cuda),
-            value_tokens=torch.randint(0, 100, (batch_size, TOKENS_PER_VALUE), device=device_cuda),
+            key_tokens=torch.randint(0, 100, (batch_size, CONFIG.tokens_per_key), device=device_cuda),
+            value_tokens=torch.randint(0, 100, (batch_size, CONFIG.tokens_per_value), device=device_cuda),
             key_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=device_cuda),
             key_text=[f"key_{i}" for i in range(batch_size)],
             value_text=[f"value_{i}" for i in range(batch_size)]
@@ -360,7 +357,6 @@ def test_base_model_weights_unchanged(gpt2_model, gpt2_tokenizer):
     from src.training import train_step, RawTrajectory, build_trajectory_from_raw
     from src.model import apply_lora_adapter
     from src.data import KVPair, QKVSelection
-    from src.config import TOKENS_PER_KEY, TOKENS_PER_VALUE
     
     # Create a deep copy of the base model before applying LoRA
     original_base_model = copy.deepcopy(gpt2_model)
@@ -385,8 +381,8 @@ def test_base_model_weights_unchanged(gpt2_model, gpt2_tokenizer):
     # Create the base data first with explicit device handling
     device_str = 'cuda' if torch.cuda.is_available() else 'cpu'
     qkv_data = KVPair(
-        key_tokens=torch.randint(0, 100, (batch_size, TOKENS_PER_KEY), device=device_str),
-        value_tokens=torch.randint(0, 100, (batch_size, TOKENS_PER_VALUE), device=device_str),
+        key_tokens=torch.randint(0, 100, (batch_size, CONFIG.tokens_per_key), device=device_str),
+        value_tokens=torch.randint(0, 100, (batch_size, CONFIG.tokens_per_value), device=device_str),
         key_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=device_str),
         key_text=["Test key"],
         value_text=["Test value"]
@@ -447,7 +443,7 @@ def test_embedding_pipeline(tiny_llama_model):
     model = tiny_llama_model
     
     # 1. Test register_embedding_hook
-    with patch('src.embeddings.MODEL_TYPE', 'llama'):
+    with patch("src.config.CONFIG.model_type", 'llama'):
         embeddings_dict, hook_remover = register_embedding_hook(model, embed_type="query")
         
         # Verify the hook was registered and has the right structure
@@ -531,9 +527,8 @@ def test_twenty_questions_integration_with_trajectory(gpt2_model, gpt2_tokenizer
         )
         
         # Get a batch of twenty questions key-value pairs
-        # We need enough pairs to generate a trajectory (NUM_KV_PAIRS will be selected)
-        from src.config import NUM_KV_PAIRS
-        available_qkv_steps = [next(kv_pair_generator) for _ in range(NUM_KV_PAIRS + 5)]  # Get extra pairs
+        # We need enough pairs to generate a trajectory (CONFIG.num_kv_pairs will be selected)
+        available_qkv_steps = [next(kv_pair_generator) for _ in range(CONFIG.num_kv_pairs + 5)]  # Get extra pairs
         
         # Verify they are from twenty questions dataset
         for step in available_qkv_steps:
@@ -562,7 +557,7 @@ def test_twenty_questions_integration_with_trajectory(gpt2_model, gpt2_tokenizer
         
         # Verify the trajectory structure
         assert hasattr(raw_traj, 'qkv_steps')
-        assert len(raw_traj.qkv_steps) == NUM_KV_PAIRS  # Should sample all available keys
+        assert len(raw_traj.qkv_steps) == CONFIG.num_kv_pairs  # Should sample all available keys
         assert isinstance(raw_traj, RawTrajectory)
         assert hasattr(raw_traj, 'all_key_embeddings')
         
@@ -578,7 +573,6 @@ def test_batched_trajectory_explores_different_orders(gpt2_model, gpt2_tokenizer
     from src.embeddings import register_embedding_hook
     from src.data import KVPair
     from src.model import apply_lora_adapter
-    from src.config import NUM_KV_PAIRS
     import torch
     
     # Create adapter model
@@ -593,9 +587,9 @@ def test_batched_trajectory_explores_different_orders(gpt2_model, gpt2_tokenizer
         batch_size = 4
         device = next(adapter_model.parameters()).device
         
-        # Create exactly NUM_KV_PAIRS unique KV pairs
+        # Create exactly CONFIG.num_kv_pairs unique KV pairs
         available_qkv_steps = []
-        for i in range(NUM_KV_PAIRS):
+        for i in range(CONFIG.num_kv_pairs):
             kv_pair = KVPair(
                 key_tokens=torch.full((1, 10), i, device=device),  # Unique token pattern
                 value_tokens=torch.full((1, 10), i+100, device=device),
@@ -624,7 +618,7 @@ def test_batched_trajectory_explores_different_orders(gpt2_model, gpt2_tokenizer
         )
         
         # Verify trajectory was created
-        assert len(raw_traj.qkv_steps) == NUM_KV_PAIRS
+        assert len(raw_traj.qkv_steps) == CONFIG.num_kv_pairs
         assert isinstance(raw_traj, RawTrajectory)
         
         # Extract selected indices per batch item
@@ -642,9 +636,9 @@ def test_batched_trajectory_explores_different_orders(gpt2_model, gpt2_tokenizer
         # Verify no duplicates per batch item
         for b in range(batch_size):
             indices = selected_per_batch[b]
-            assert len(indices) == NUM_KV_PAIRS, f"Batch {b} has {len(indices)} selections, expected {NUM_KV_PAIRS}"
-            assert len(set(indices)) == NUM_KV_PAIRS, f"Batch {b} has duplicates: {indices}"
-            assert set(indices) == set(range(NUM_KV_PAIRS)), f"Batch {b} didn't cover all indices: {indices}"
+            assert len(indices) == CONFIG.num_kv_pairs, f"Batch {b} has {len(indices)} selections, expected {CONFIG.num_kv_pairs}"
+            assert len(set(indices)) == CONFIG.num_kv_pairs, f"Batch {b} has duplicates: {indices}"
+            assert set(indices) == set(range(CONFIG.num_kv_pairs)), f"Batch {b} didn't cover all indices: {indices}"
         
         # Verify different orders explored (with high probability)
         # Since we're using random sampling, not all batches will have different orders,

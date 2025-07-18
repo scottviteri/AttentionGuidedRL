@@ -22,7 +22,7 @@ from data import (
     compute_embeddings,
     KVPair
 )
-from config import TOKENS_PER_KEY, TOKENS_PER_VALUE, NUM_KV_PAIRS, KV_EVERY_N, DEVICE
+from src.config import CONFIG
 
 
 def mock_embedding_fn(tokens: torch.Tensor) -> torch.Tensor:
@@ -102,7 +102,7 @@ def demonstrate_pipeline():
     
     # Stage 2: Filter articles with sufficient length
     print_stage_header("Filtered Articles (Sufficient Length)", 2)
-    min_length = (TOKENS_PER_KEY + TOKENS_PER_VALUE) * NUM_KV_PAIRS * KV_EVERY_N
+    min_length = (CONFIG.tokens_per_key + CONFIG.tokens_per_value) * CONFIG.num_kv_pairs * CONFIG.kv_every_n
     print(f"Filtering articles with minimum length of {min_length} tokens...")
     
     filtered_articles = []
@@ -141,7 +141,7 @@ def demonstrate_pipeline():
     print_stage_header("Tokenized Article Batches", 4)
     print("Converting article text to token tensors...")
     
-    max_len = (TOKENS_PER_KEY + TOKENS_PER_VALUE) * NUM_KV_PAIRS * KV_EVERY_N
+    max_len = (CONFIG.tokens_per_key + CONFIG.tokens_per_value) * CONFIG.num_kv_pairs * CONFIG.kv_every_n
     tokenize_fn = tokenize_articles(tokenizer, max_len)
     
     # Process first batch only to avoid complexity
@@ -227,8 +227,8 @@ def demonstrate_pipeline():
     print_stage_header("Pipeline Summary", 8)
     print(f"Successfully processed {len(kv_pairs)} KVPair objects through the complete pipeline.")
     print(f"Each KVPair contains:")
-    print(f"  - Key tokens: {TOKENS_PER_KEY} tokens")
-    print(f"  - Value tokens: {TOKENS_PER_VALUE} tokens") 
+    print(f"  - Key tokens: {CONFIG.tokens_per_key} tokens")
+    print(f"  - Value tokens: {CONFIG.tokens_per_value} tokens") 
     print(f"  - Key embedding: 768-dimensional vector")
     print(f"  - Human-readable key and value text")
     print("\nThis demonstrates the complete Wikipedia data loading pipeline!")

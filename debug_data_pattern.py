@@ -6,7 +6,7 @@ to understand the gradient spike pattern.
 
 from src.data import iter_key_value_pairs_unified_with_tokenizer
 from src.model import setup_model_and_tokenizer
-from src.config import NUM_KV_PAIRS
+from src.config import CONFIG
 import torch
 
 def identify_article(key_text):
@@ -52,7 +52,7 @@ def main():
         embedding_fn=mock_embedding_fn,
     )
     
-    print(f"Tracking data across episodes (NUM_KV_PAIRS = {NUM_KV_PAIRS})")
+    print(f"Tracking data across episodes (NUM_KV_PAIRS = {CONFIG.num_kv_pairs})")
     print("Episode | Key Index | Article Identifier")
     print("--------|-----------|------------------")
     
@@ -66,7 +66,7 @@ def main():
             episode_articles = set()
             
             # Get NUM_KV_PAIRS items for this episode
-            for key_idx in range(NUM_KV_PAIRS):
+            for key_idx in range(CONFIG.num_kv_pairs):
                 try:
                     kv_pair = next(kv_iterator)
                     key_text = kv_pair.key_text[0] if kv_pair.key_text else None

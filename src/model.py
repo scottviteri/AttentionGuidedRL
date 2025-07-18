@@ -1,3 +1,4 @@
+
 """
 Model setup module for the Attention-Guided RL project.
 
@@ -12,18 +13,7 @@ from transformers.utils.quantization_config import BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model
 import logging
 
-from src.config import (
-    MODEL_NAME,
-    TOKENIZER_NAME,
-    MODEL_TYPE,
-    DEVICE,
-    DTYPE,
-    LORA_RANK,
-    LORA_ALPHA,
-    LORA_DROPOUT,
-    CHECKPOINT_DIR,
-    QUERY_VEC_TOKEN
-)
+from src.config import CONFIG
 
 
 def load_base_model():
@@ -44,9 +34,9 @@ def load_base_model():
     # Load the model with appropriate configurations
     # Assumes CUDA is available as an explicit dependency
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        device_map=DEVICE,
-        torch_dtype=DTYPE,
+        CONFIG.model_name,
+        device_map=CONFIG.device,
+        torch_dtype=CONFIG.dtype,
         quantization_config=quantization_config,
     )
     
@@ -64,14 +54,14 @@ def get_target_modules():
     Returns:
         List of target module names
     """
-    if MODEL_TYPE == "llama":
+    if CONFIG.model_type == "llama":
         # For Llama models, target the attention projection layers
         return ["q_proj", "k_proj", "v_proj"]
-    elif MODEL_TYPE == "gpt2":
+    elif CONFIG.model_type == "gpt2":
         # For GPT-2, target the attention layers
         return ["c_attn"]
     else:
-        raise ValueError(f"Unsupported model type: {MODEL_TYPE}")
+        raise ValueError(f"Unsupported model type: {CONFIG.model_type}")
 
 
 def apply_lora_adapter(model):
@@ -89,10 +79,10 @@ def apply_lora_adapter(model):
     
     # Configure LoRA
     lora_config = LoraConfig(
-        r=LORA_RANK,
-        lora_alpha=LORA_ALPHA,
+        r=CONFIG.lora_rank,
+        lora_alpha=CONFIG.lora_alpha,
         target_modules=get_target_modules(),
-        lora_dropout=LORA_DROPOUT,
+        lora_dropout=CONFIG.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
         init_lora_weights="gaussian",  # Use Gaussian initialization for more randomness
@@ -237,17 +227,17 @@ def setup_model_and_tokenizer():
     adapter_model = apply_lora_adapter(base_model)
     
     # Load the tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(CONFIG.tokenizer_name)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'  # Set padding side to left for decoder-only models
     
     # Verify the token exists in the vocabulary
-    token_ids = tokenizer.encode(QUERY_VEC_TOKEN, add_special_tokens=False)
+    token_ids = tokenizer.encode(CONFIG.query_vec_token, add_special_tokens=False)
     if len(token_ids) != 1:
-        logging.warning(f"Query token '{QUERY_VEC_TOKEN}' tokenizes to {len(token_ids)} tokens: {token_ids}")
+        logging.warning(f"Query token '{CONFIG.query_vec_token}' tokenizes to {len(token_ids)} tokens: {token_ids}")
         logging.warning("This may affect embedding extraction. Consider using a single-token word.")
     else:
-        logging.info(f"Query token '{QUERY_VEC_TOKEN}' has token ID: {token_ids[0]}")
+        logging.info(f"Query token '{CONFIG.query_vec_token}' has token ID: {token_ids[0]}")
         
     return base_model, adapter_model, tokenizer
 
@@ -263,9 +253,9 @@ def get_checkpoint_path(episode):
         The checkpoint path
     """
     if episode == "latest":
-        return os.path.join(CHECKPOINT_DIR, "model_latest.pt")
+        return os.path.join(CONFIG.checkpoint_dir, "model_latest.pt")
     else:
-        return os.path.join(CHECKPOINT_DIR, f"model_episode_{episode}.pt")
+        return os.path.join(CONFIG.checkpoint_dir, f"model_episode_{episode}.pt")
 
 
 def save_checkpoint(model, episode):

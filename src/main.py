@@ -20,18 +20,7 @@ import sys
 import time # Import time for overall timing
 
 # Import configuration management - clean pattern!
-from src.config import (
-    TrainingConfig,
-    create_training_config_from_args,
-    training_config_to_dict,
-    log_training_config,
-    INITIAL_PROMPT,
-    KEY_PREFIX,
-    VALUE_PREFIX,
-    DEVICE,
-    MEMORY_EFFICIENT_LORA,
-    CHECKPOINT_INTERVAL,
-)
+from src.config import CONFIG, TrainingConfig, create_training_config_from_args, log_training_config, training_config_to_dict
 from src.model import setup_model_and_tokenizer, save_checkpoint, load_checkpoint, create_model_copy, get_checkpoint_path, update_model_ema
 from src.data import KVPair, QKVSelection
 from src.embeddings import register_embedding_hook, compute_similarity, sample_key_value, extract_embeddings
@@ -123,8 +112,8 @@ def _append_step(raw_traj: RawTrajectory, step: QKVSelection) -> RawTrajectory:
 
 def _update_context(context: torch.Tensor, step: QKVSelection, tokenizer, batch_size: int, device: torch.device) -> torch.Tensor:
     """Grow the autoregressive context by concatenating key/value tokens (no query tokens in vector mode)."""
-    key_prefix_tokens = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-    value_prefix_tokens = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+    key_prefix_tokens = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+    value_prefix_tokens = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
     return torch.cat([
         context,
         key_prefix_tokens,
@@ -539,7 +528,7 @@ def compute_kl_from_reference(
     batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
 
     context_tokens_obj = tokenizer(
-        [INITIAL_PROMPT] * batch_size,
+        [CONFIG.initial_prompt] * batch_size,
         return_tensors="pt",
         padding=True,
         add_special_tokens=False,
@@ -573,8 +562,8 @@ def compute_kl_from_reference(
         kl_vals.append(kl_step.item())
 
         # 4) Advance context for next timestep
-        kp = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-        vp = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        kp = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        vp = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
         context_tokens = torch.cat([
             context_tokens,
             kp,
@@ -599,6 +588,9 @@ def main():
     # Create resolved configuration object - SINGLE point of configuration!
     config = create_training_config_from_args(args)
     
+    # Set the runtime config for use throughout the system
+    CONFIG.set_config(config)
+    
     # Suppress warnings
     import warnings
     warnings.filterwarnings("ignore", message="Token indices sequence length is longer than the specified maximum sequence length")
@@ -610,7 +602,7 @@ def main():
     logging.info("Query mode: Vector queries")
     
     # Log reward computation mode
-    if config.subtract_base_model_logprobs:
+    if CONFIG.training_config.subtract_base_model_logprobs:
         logging.info("Reward computation: Using adapter - base model (classic baseline subtraction)")
     else:
         logging.info("Reward computation: Using raw adapter log probabilities (GRPO handles baselines)")
@@ -631,7 +623,7 @@ def main():
         with torch.no_grad():
             return extract_embeddings(
                 adapter_model,
-                key_token_batch.to(DEVICE),
+                key_token_batch.to(CONFIG.device),
                 key_embeddings_dict,
                 requires_grad=False,
             ).detach()
@@ -639,7 +631,7 @@ def main():
     # Make sure hook is removed at the end
     try:
         # Create optimizer
-        optimizer = optim.Adam(adapter_model.parameters(), lr=config.learning_rate)
+        optimizer = optim.Adam(adapter_model.parameters(), lr=CONFIG.training_config.learning_rate)
         
         # Initialize reward stats
         reward_stats = {"mean": 0.0, "std": 1.0, "count": 0}
@@ -671,7 +663,7 @@ def main():
         
         # Create a copy of the adapter model to serve as the old model (pi_old)
         # This will be updated every BASELINE_UPDATE_FREQUENCY episodes
-        if MEMORY_EFFICIENT_LORA:
+        if CONFIG.training_config.memory_efficient_lora:
             # Use memory-efficient LoRA state management
             lora_manager = MemoryEfficientLoRAManager(adapter_model)
             old_model = None  # Not needed with memory-efficient training
@@ -762,13 +754,13 @@ def main():
         logging.info("- old_model: Old model (pi_old, for KL computation, updated periodically)")
         logging.info(f"- GRPO batching: {'Enabled' if use_grpo_batching else 'Disabled'}")
         # No separate previous_model - use old_model for KL computation
-        logging.info(f"Old model will be updated every {config.baseline_update_frequency} episodes")
+        logging.info(f"Old model will be updated every {CONFIG.training_config.baseline_update_frequency} episodes")
         
         # Log baseline update method
-        if config.use_ema_baseline:
-            logging.info(f"✅ Using EMA baseline updates (decay={config.ema_decay:.3f}) - eliminates spikes")
+        if CONFIG.training_config.use_ema_baseline:
+            logging.info(f"✅ Using EMA baseline updates (decay={CONFIG.training_config.ema_decay:.3f}) - eliminates spikes")
         else:
-            logging.info(f"⚠️  Using HARD baseline updates - may cause training spikes every {config.baseline_update_frequency} episodes")
+            logging.info(f"⚠️  Using HARD baseline updates - may cause training spikes every {CONFIG.training_config.baseline_update_frequency} episodes")
         
         # Function to compute gradient statistics
         def get_gradient_stats(model):
@@ -904,7 +896,7 @@ def main():
                 print(f"\n\n======== EPISODE {episode}/{args.episodes} ========")
             
             # Get a batch of key-value pairs
-            available_qkv_steps = [next(kv_pair_generator) for _ in range(config.num_kv_pairs)]  # Get a pool of QKV steps
+            available_qkv_steps = [next(kv_pair_generator) for _ in range(CONFIG.training_config.num_kv_pairs)]  # Get a pool of QKV steps
             
             if args.verbose:
                 print(f"Generated pool of {len(available_qkv_steps)} query-key-value steps")
@@ -917,7 +909,7 @@ def main():
             # Tokenize the initial prompt
             device = next(adapter_model.parameters()).device
             initial_tokens = tokenizer(
-                [INITIAL_PROMPT] * batch_size,
+                [CONFIG.initial_prompt] * batch_size,
                 return_tensors="pt",
                 padding=True,
                 add_special_tokens=False
@@ -930,7 +922,7 @@ def main():
                 tokenizer=tokenizer,
                 available_qkv_steps=available_qkv_steps,
                 batch_size=args.batch_size,
-                config=config,
+                config=CONFIG.training_config,
                 verbose=args.verbose,
             )
             
@@ -945,7 +937,7 @@ def main():
             )
             
             # Also get old model log probabilities for comparison plotting
-            if not MEMORY_EFFICIENT_LORA:
+            if not CONFIG.training_config.memory_efficient_lora:
                 # Only compute old model log probs for traditional mode (for plotting)
                 assert old_model is not None, "old_model should not be None in traditional mode"
                 _, _, old_log_probs_batch = compute_trajectory_rewards(
@@ -978,7 +970,7 @@ def main():
                 print(f"  Count: {reward_stats['count']}")
             
             # Perform training step
-            if MEMORY_EFFICIENT_LORA:
+            if CONFIG.training_config.memory_efficient_lora:
                 # Use memory-efficient training step
                 assert lora_manager is not None, "lora_manager should not be None in memory-efficient mode"
                 total_loss, policy_loss, kl_loss, avg_clipping_ratio = memory_efficient_train_step(
@@ -988,7 +980,7 @@ def main():
                     lora_manager,  # Use LoRA manager instead of old_model
                     optimizer,
                     reward_stats,
-                    config.kl_penalty_coefficient,
+                    CONFIG.training_config.kl_penalty_coefficient,
                     verbose=args.verbose,
                     tokenizer=tokenizer,
                     embeddings_dict=query_embeddings_dict,
@@ -1003,7 +995,7 @@ def main():
                     old_model,  # Use old_model for KL computation
                     optimizer,
                     reward_stats,
-                    config.kl_penalty_coefficient,
+                    CONFIG.training_config.kl_penalty_coefficient,
                     verbose=args.verbose,
                     tokenizer=tokenizer,
                     embeddings_dict=query_embeddings_dict, # Use query embeddings for training
@@ -1094,19 +1086,19 @@ def main():
             
             # Calculate derived metrics for plotting
             traj_log_prob = adapter_log_probs_batch.mean().item()
-            kl_penalty_term = (kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss) * config.kl_penalty_coefficient
+            kl_penalty_term = (kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss) * CONFIG.training_config.kl_penalty_coefficient
             reward_var = trajectory.avg_reward.var().item()
             current_lr = optimizer.param_groups[0]['lr']
             
             # Compute and track average advantages from this episode
             if trajectory.rewards is not None:
                 from src.training import compute_advantages
-                from src.config import GAMMA, GAE_LAMBDA, USE_GRPO_BASELINE
+                pass  # All config values now accessed via CONFIG
                 advantages, _ = compute_advantages(
                     trajectory.rewards,
-                    gamma=GAMMA,
-                    gae_lambda=GAE_LAMBDA,
-                    use_grpo_baseline=USE_GRPO_BASELINE,
+                    gamma=CONFIG.gamma,
+                    gae_lambda=CONFIG.gae_lambda,
+                    use_grpo_baseline=CONFIG.training_config.use_grpo_baseline,
                 )
                 avg_advantage = advantages.mean().item()
                 advantage_dist = compute_advantage_distribution(advantages)
@@ -1130,29 +1122,29 @@ def main():
             
             # Update old_model using EMA (smooth) updates to prevent gradient spikes
             # Based on debugging: frozen old_model causes accumulated changes -> gradient explosions
-            if config.memory_efficient_lora:
+            if CONFIG.training_config.memory_efficient_lora:
                 # Use memory-efficient LoRA state updates
                 assert lora_manager is not None, "lora_manager should not be None in memory-efficient mode"
-                if config.use_ema_baseline:
-                    lora_manager.update_old_state_ema(decay=config.ema_decay)
-                    if episode % config.baseline_update_frequency == 0:
-                        logging.info(f"Memory-efficient EMA LoRA state update (decay={config.ema_decay:.3f})")
+                if CONFIG.training_config.use_ema_baseline:
+                    lora_manager.update_old_state_ema(decay=CONFIG.training_config.ema_decay)
+                    if episode % CONFIG.training_config.baseline_update_frequency == 0:
+                        logging.info(f"Memory-efficient EMA LoRA state update (decay={CONFIG.training_config.ema_decay:.3f})")
                 else:
                     # Hard update at intervals
-                    if (episode + 1) % config.baseline_update_frequency == 0:
+                    if (episode + 1) % CONFIG.training_config.baseline_update_frequency == 0:
                         lora_manager.update_old_state_hard()
                         logging.info("Memory-efficient hard LoRA state update")
             else:
                 # Traditional model updates
                 assert old_model is not None, "old_model should not be None in traditional mode"
-                if config.use_ema_baseline:
+                if CONFIG.training_config.use_ema_baseline:
                     # Smooth EMA update every episode - prevents spikes
-                    update_model_ema(old_model, adapter_model, decay=config.ema_decay)
-                    if episode % config.baseline_update_frequency == 0:
-                        logging.info(f"Smooth EMA baseline update (decay={config.ema_decay:.3f}) - prevents gradient spikes")
+                    update_model_ema(old_model, adapter_model, decay=CONFIG.training_config.ema_decay)
+                    if episode % CONFIG.training_config.baseline_update_frequency == 0:
+                        logging.info(f"Smooth EMA baseline update (decay={CONFIG.training_config.ema_decay:.3f}) - prevents gradient spikes")
                 else:
                     # Hard update at intervals - may cause gradient spikes
-                    if (episode + 1) % config.baseline_update_frequency == 0:
+                    if (episode + 1) % CONFIG.training_config.baseline_update_frequency == 0:
                         # Update the old_model to reflect learning progress
                         old_model = create_model_copy(adapter_model)
                         
@@ -1185,7 +1177,7 @@ def main():
                     logging.warning("Adapter LoRA weights have not changed – investigate optimizer/grad flow ⚠️")
             
             # Save checkpoint if needed
-            if episode > 0 and episode % CHECKPOINT_INTERVAL == 0:
+            if episode > 0 and episode % CONFIG.checkpoint_interval == 0:
                 save_checkpoint(adapter_model, "latest")
                 if args.verbose:
                     print(f"\nCheckpoint saved at episode {episode}")
@@ -1265,20 +1257,20 @@ def main():
             if episode > 0 and episode % 15 == 0:
                 # Add metadata to plot data and save
                 metadata = create_metadata(episode, {
-                    'KL_PENALTY_COEFFICIENT': config.kl_penalty_coefficient,
-                    'GAMMA': config.gamma,
-                    'GAE_LAMBDA': config.gae_lambda,
-                    'USE_GRPO_BASELINE': config.use_grpo_baseline,
-                    'TEMPERATURE': config.temperature,
-                    'NUM_KV_PAIRS': config.num_kv_pairs,
-                    'BASELINE_UPDATE_FREQUENCY': config.baseline_update_frequency,
+                    'KL_PENALTY_COEFFICIENT': CONFIG.training_config.kl_penalty_coefficient,
+                    'GAMMA': CONFIG.gamma,
+                    'GAE_LAMBDA': CONFIG.gae_lambda,
+                    'USE_GRPO_BASELINE': CONFIG.training_config.use_grpo_baseline,
+                    'TEMPERATURE': CONFIG.training_config.temperature,
+                    'NUM_KV_PAIRS': CONFIG.training_config.num_kv_pairs,
+                    'BASELINE_UPDATE_FREQUENCY': CONFIG.training_config.baseline_update_frequency,
                 })
                 plot_data_with_metadata = plot_data.with_metadata(metadata)
                 save_plot_data(plot_data_with_metadata, log_dir)
                 plot_metrics(log_dir, policy_gradients)
             
             # Log every log_interval episodes
-            if episode % config.log_interval == 0:
+            if episode % CONFIG.training_config.log_interval == 0:
                 # Convert tensors to floats for logging
                 policy_loss_val = policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss
                 kl_loss_val = kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss
@@ -1295,13 +1287,13 @@ def main():
                 )
                 
                 # Log to wandb if enabled
-                if config.enable_wandb:
+                if CONFIG.training_config.enable_wandb:
                     wandb.log({
                         "episode": episode,
                         "total_loss": total_loss,
                         "policy_loss": policy_loss_val,
                         "kl_loss": kl_loss_val,
-                        "kl_penalty_term": kl_loss_val * config.kl_penalty_coefficient,
+                        "kl_penalty_term": kl_loss_val * CONFIG.training_config.kl_penalty_coefficient,
                         "reward": avg_reward,
                         "reward_mean": reward_stats["mean"],
                         "reward_std": reward_stats["std"],
@@ -1330,13 +1322,13 @@ def main():
         
         # Save final plot data and create plots
         final_metadata = create_metadata(episode, {
-            'KL_PENALTY_COEFFICIENT': config.kl_penalty_coefficient,
-            'GAMMA': config.gamma,
-            'GAE_LAMBDA': config.gae_lambda,
-            'USE_GRPO_BASELINE': config.use_grpo_baseline,
-            'TEMPERATURE': config.temperature,
-            'NUM_KV_PAIRS': config.num_kv_pairs,
-            'BASELINE_UPDATE_FREQUENCY': config.baseline_update_frequency,
+            'KL_PENALTY_COEFFICIENT': CONFIG.training_config.kl_penalty_coefficient,
+            'GAMMA': CONFIG.gamma,
+            'GAE_LAMBDA': CONFIG.gae_lambda,
+            'USE_GRPO_BASELINE': CONFIG.training_config.use_grpo_baseline,
+            'TEMPERATURE': CONFIG.training_config.temperature,
+            'NUM_KV_PAIRS': CONFIG.training_config.num_kv_pairs,
+            'BASELINE_UPDATE_FREQUENCY': CONFIG.training_config.baseline_update_frequency,
         })
         final_plot_data = plot_data.with_metadata(final_metadata)
         save_plot_data(final_plot_data, log_dir)
@@ -1345,7 +1337,7 @@ def main():
         logging.info("Training complete!")
         
         # Close wandb if enabled
-        if config.enable_wandb:
+        if CONFIG.training_config.enable_wandb:
             wandb.finish()
     
     finally:

@@ -23,7 +23,7 @@ from src.model import (
     update_lora_ema,
     create_model_copy
 )
-from src.config import MODEL_TYPE
+from src.config import CONFIG
 
 
 class TestLoRAStateOperations:

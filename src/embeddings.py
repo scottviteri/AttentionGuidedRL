@@ -1,3 +1,4 @@
+
 """
 Embeddings module for the Attention-Guided RL project.
 
@@ -11,7 +12,7 @@ from typing import Dict, List, Tuple, Optional, Callable, Union
 import torch
 import torch.nn.functional as F
 
-from src.config import DEVICE, MODEL_TYPE
+from src.config import CONFIG
 
 
 def register_embedding_hook(
@@ -33,13 +34,13 @@ def register_embedding_hook(
     # Dictionary to store the embeddings
     embeddings_dict = {"embeddings": None}
     
-    if MODEL_TYPE == "llama":
+    if CONFIG.model_type == "llama":
         return register_llama_embedding_hook(model, embeddings_dict, embed_type, layer_idx)
-    elif MODEL_TYPE == "gpt2":
+    elif CONFIG.model_type == "gpt2":
         # For GPT-2, we'll need to handle this differently as it uses a combined QKV projection
         return register_gpt2_embedding_hook(model, embeddings_dict, embed_type, layer_idx)
     else:
-        raise ValueError(f"Unsupported model type: {MODEL_TYPE}")
+        raise ValueError(f"Unsupported model type: {CONFIG.model_type}")
 
 
 def register_llama_embedding_hook(
@@ -228,12 +229,12 @@ def get_attention_params(model) -> Tuple[int, int, int]:
     Returns:
         Tuple[int, int, int]: Number of query heads, number of KV groups, and head dimension
     """
-    if MODEL_TYPE == "llama":
+    if CONFIG.model_type == "llama":
         return get_llama_attention_params(model)
-    elif MODEL_TYPE == "gpt2":
+    elif CONFIG.model_type == "gpt2":
         return get_gpt2_attention_params(model)
     else:
-        raise ValueError(f"Unsupported model type: {MODEL_TYPE}")
+        raise ValueError(f"Unsupported model type: {CONFIG.model_type}")
 
 
 def get_llama_attention_params(model) -> Tuple[int, int, int]:

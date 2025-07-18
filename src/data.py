@@ -1,3 +1,4 @@
+
 """
 Data handling module for the Attention-Guided RL project.
 
@@ -22,16 +23,7 @@ from toolz import (
 )
 from toolz.curried import map as cmap, filter as cfilter
 
-from src.config import (
-    TOKENIZER_NAME,
-    TOKENS_PER_KEY,
-    TOKENS_PER_VALUE,
-    NUM_KV_PAIRS,
-    VALUE_PREFIX,
-    DEVICE,
-    KV_EVERY_N,
-    KEY_PREFIX,
-)
+from src.config import CONFIG
 
 import time
 import torch
@@ -43,8 +35,8 @@ import logging # Ensure logging is imported here
 @dataclass(frozen=True)
 class KVPair:
     """Immutable key-value pair representation."""
-    key_tokens: torch.Tensor       # [batch_size, TOKENS_PER_KEY]
-    value_tokens: torch.Tensor     # [batch_size, TOKENS_PER_VALUE]
+    key_tokens: torch.Tensor       # [batch_size, CONFIG.tokens_per_key]
+    value_tokens: torch.Tensor     # [batch_size, CONFIG.tokens_per_value]
     key_embedding: torch.Tensor    # [batch_size, embedding_dim]
     key_text: List[str]           # For debugging
     value_text: List[str]         # For debugging
@@ -55,8 +47,8 @@ class KVPair:
         assert isinstance(self.key_tokens, torch.Tensor)
         assert isinstance(self.value_tokens, torch.Tensor)
         assert isinstance(self.key_embedding, torch.Tensor)
-        assert self.key_tokens.shape == (batch_size, TOKENS_PER_KEY)
-        assert self.value_tokens.shape == (batch_size, TOKENS_PER_VALUE)
+        assert self.key_tokens.shape == (batch_size, CONFIG.tokens_per_key)
+        assert self.value_tokens.shape == (batch_size, CONFIG.tokens_per_value)
         assert self.key_embedding.shape[0] == batch_size
         assert len(self.key_text) == batch_size
         assert len(self.value_text) == batch_size
@@ -111,7 +103,7 @@ class Trajectory(RawTrajectory):
 
 def get_tokenizer() -> PreTrainedTokenizer:
     """Get configured tokenizer."""
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(CONFIG.tokenizer_name)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'
     return tokenizer
@@ -211,7 +203,7 @@ def wikipedia_articles() -> Iterator[Dict]:
 
 def articles_with_sufficient_length(tokenizer: PreTrainedTokenizer) -> Iterator[Dict]:
     """Filter articles by minimum token length."""
-    min_length = (TOKENS_PER_KEY + TOKENS_PER_VALUE) * NUM_KV_PAIRS * KV_EVERY_N
+    min_length = (CONFIG.tokens_per_key + CONFIG.tokens_per_value) * CONFIG.num_kv_pairs * CONFIG.kv_every_n
     
     def has_sufficient_tokens(article: Dict) -> bool:
         tokens = tokenize_text(article["text"], tokenizer)
@@ -232,21 +224,21 @@ def tokenize_articles(tokenizer: PreTrainedTokenizer, max_len: int):
             max_length=max_len,
             return_tensors="pt",
         )
-        return tokens.input_ids.to(DEVICE)
+        return tokens.input_ids.to(CONFIG.device)
     return tokenize_batch
 
 
 def extract_kv_pairs(tokenizer: PreTrainedTokenizer):
     """Extract key-value pairs from tokenized articles."""
     def extract_from_tokens(batch_tokens: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[List[str]], List[List[str]]]:
-        chunk_size = TOKENS_PER_KEY + TOKENS_PER_VALUE
+        chunk_size = CONFIG.tokens_per_key + CONFIG.tokens_per_value
         all_keys, all_values, all_key_texts, all_value_texts = [], [], [], []
         
-        for i in range(NUM_KV_PAIRS):
-            j = i * KV_EVERY_N
+        for i in range(CONFIG.num_kv_pairs):
+            j = i * CONFIG.kv_every_n
             start_idx = j * chunk_size
-            key_end_idx = start_idx + TOKENS_PER_KEY
-            value_end_idx = key_end_idx + TOKENS_PER_VALUE
+            key_end_idx = start_idx + CONFIG.tokens_per_key
+            value_end_idx = key_end_idx + CONFIG.tokens_per_value
 
             pair_keys = batch_tokens[:, start_idx:key_end_idx]
             pair_values = batch_tokens[:, key_end_idx:value_end_idx]
@@ -272,10 +264,10 @@ def compute_embeddings(embedding_fn: Callable[[torch.Tensor], torch.Tensor], bat
         initial_mem_cached = torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
 
         all_embeddings = []
-        for start_idx in range(0, NUM_KV_PAIRS, 12): # Use a reasonable default batch size
-            end_idx = min(start_idx + 12, NUM_KV_PAIRS)
+        for start_idx in range(0, CONFIG.num_kv_pairs, 12): # Use a reasonable default batch size
+            end_idx = min(start_idx + 12, CONFIG.num_kv_pairs)
             key_batch = torch.stack(all_keys[start_idx:end_idx], dim=0)
-            key_batch_flat = key_batch.view(-1, TOKENS_PER_KEY)
+            key_batch_flat = key_batch.view(-1, CONFIG.tokens_per_key)
             
             embeddings_flat = embedding_fn(key_batch_flat)
             
@@ -303,7 +295,7 @@ def compute_embeddings(embedding_fn: Callable[[torch.Tensor], torch.Tensor], bat
 
 def articles_to_kv_pairs(tokenizer: PreTrainedTokenizer, embedding_fn: Callable[[torch.Tensor], torch.Tensor]):
     """Convert article batches to KV pairs."""
-    max_len = (TOKENS_PER_KEY + TOKENS_PER_VALUE) * NUM_KV_PAIRS * KV_EVERY_N
+    max_len = (CONFIG.tokens_per_key + CONFIG.tokens_per_value) * CONFIG.num_kv_pairs * CONFIG.kv_every_n
     
     def process_article_batch(articles: List[Dict]) -> Iterator[KVPair]:
         # Pipeline: articles -> tokens -> kv_data -> embeddings -> KVPairs
@@ -311,7 +303,7 @@ def articles_to_kv_pairs(tokenizer: PreTrainedTokenizer, embedding_fn: Callable[
         all_keys, all_values, all_key_texts, all_value_texts = extract_kv_pairs(tokenizer)(batch_tokens)
         all_embeddings = compute_embeddings(embedding_fn, len(articles))(all_keys)
         
-        for i in range(NUM_KV_PAIRS):
+        for i in range(CONFIG.num_kv_pairs):
             yield KVPair(
                 key_tokens=all_keys[i],
                 value_tokens=all_values[i],
@@ -357,14 +349,14 @@ def twenty_questions_kv_stream(batch_size: int, tokenizer: PreTrainedTokenizer, 
         batch_size_actual = len(game_batch)
         all_key_tokens, all_value_tokens, all_key_texts, all_value_texts = [], [], [], []
         
-        for q_idx in range(min(len(questions), NUM_KV_PAIRS)):
+        for q_idx in range(min(len(questions), CONFIG.num_kv_pairs)):
             key_texts = [questions[q_idx] for _ in game_batch]
             value_texts = [game['answers'][q_idx] for game in game_batch]
             
             key_tokens = tokenizer(key_texts, add_special_tokens=False, padding="max_length", 
-                                 truncation=True, max_length=TOKENS_PER_KEY, return_tensors="pt")["input_ids"].to(DEVICE)
+                                 truncation=True, max_length=CONFIG.tokens_per_key, return_tensors="pt")["input_ids"].to(CONFIG.device)
             value_tokens = tokenizer(value_texts, add_special_tokens=False, padding="max_length",
-                                   truncation=True, max_length=TOKENS_PER_VALUE, return_tensors="pt")["input_ids"].to(DEVICE)
+                                   truncation=True, max_length=CONFIG.tokens_per_value, return_tensors="pt")["input_ids"].to(CONFIG.device)
             
             all_key_tokens.append(key_tokens)
             all_value_tokens.append(value_tokens)

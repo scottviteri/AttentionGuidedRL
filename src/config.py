@@ -244,31 +244,47 @@ def log_training_config(config: TrainingConfig, logger) -> None:
     logger.info("=" * 45)
 
 
-# Essential exports for other modules (using config defaults)
+# ============================================================================
+# SINGLETON CONFIGURATION PATTERN
+# 
+# The CONFIG object acts as a module-level singleton that is set once at
+# startup. This provides a clean migration path:
+# 1. Replace constant imports with CONFIG imports
+# 2. Access values as CONFIG.key_prefix instead of KEY_PREFIX
+# 3. Tests can set their own CONFIG for isolation
+# ============================================================================
+
 _default_config = TrainingConfig()
-INITIAL_PROMPT = _default_config.initial_prompt
-KEY_PREFIX = _default_config.key_prefix  
-VALUE_PREFIX = _default_config.value_prefix
-DEVICE = _default_config.device
-MEMORY_EFFICIENT_LORA = _default_config.memory_efficient_lora
-CHECKPOINT_INTERVAL = _default_config.checkpoint_interval
-QUERY_VEC_TOKEN = _default_config.query_vec_token
-TOKENS_PER_KEY = _default_config.tokens_per_key
-TOKENS_PER_VALUE = _default_config.tokens_per_value
-KV_EVERY_N = _default_config.kv_every_n
-LORA_RANK = _default_config.lora_rank
-LORA_ALPHA = _default_config.lora_alpha
-LORA_DROPOUT = _default_config.lora_dropout
-CHECKPOINT_DIR = _default_config.checkpoint_dir
-NUM_KV_PAIRS = 5  # Default value, actual computed in TrainingConfig
-GRADIENT_CLIP_NORM = _default_config.gradient_clip_norm
-GAMMA = _default_config.gamma
-GAE_LAMBDA = _default_config.gae_lambda
-USE_GRPO_BASELINE = _default_config.use_grpo_baseline
-SUBTRACT_BASE_MODEL_LOGPROBS = _default_config.subtract_base_model_logprobs
-PPO_CLIP_EPSILON = _default_config.ppo_clip_epsilon
-TEMPERATURE = _default_config.temperature
-MODEL_NAME = _default_config.model_name
-MODEL_TYPE = _default_config.model_type
-TOKENIZER_NAME = _default_config.tokenizer_name
-DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32 
+
+class _ConfigProxy:
+    """
+    A proxy that provides attribute access to the current configuration.
+    This allows CONFIG.attribute syntax while deferring to either the
+    runtime config (if set) or default config.
+    """
+    def __init__(self):
+        # Use object.__setattr__ to avoid recursion
+        object.__setattr__(self, '_runtime_config', None)
+    
+    def __getattr__(self, name):
+        # Use the runtime config if available, otherwise default
+        runtime_config = object.__getattribute__(self, '_runtime_config')
+        config = runtime_config or _default_config
+        return getattr(config, name)
+    
+    def set_config(self, config: TrainingConfig):
+        """Set the runtime configuration."""
+        object.__setattr__(self, '_runtime_config', config)
+    
+    def reset_to_default(self):
+        """Reset to default configuration (useful for tests)."""
+        object.__setattr__(self, '_runtime_config', None)
+    
+    def __repr__(self):
+        runtime_config = object.__getattribute__(self, '_runtime_config')
+        config = runtime_config or _default_config
+        return f"CONFIG({config})"
+
+
+# Create the singleton CONFIG object
+CONFIG = _ConfigProxy() 

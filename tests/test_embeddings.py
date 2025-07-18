@@ -12,11 +12,10 @@ from unittest.mock import MagicMock, patch
 from src.embeddings import (
     register_embedding_hook,
     extract_embeddings,
-    get_attention_params,
     compute_similarity,
     sample_key_value,
 )
-from src.config import MODEL_TYPE
+from src.config import CONFIG
 from src.model import apply_lora_adapter
 
 
@@ -26,7 +25,7 @@ def test_extract_embeddings_integration(gpt2_model):
     """Test extracting embeddings with a real model."""
     from src.embeddings import register_embedding_hook, extract_embeddings
     
-    with patch('src.embeddings.MODEL_TYPE', 'gpt2'):
+    with patch("src.config.CONFIG.model_type", 'gpt2'):
         # Register hook on real model
         embeddings_dict, hook_remover = register_embedding_hook(gpt2_model, embed_type="query")
         
@@ -163,7 +162,7 @@ def test_compute_similarity_batch_behavior(gpt2_model):
 
 def test_compute_similarity_real_gpt2(gpt2_model, gpt2_tokenizer):
     """Test similarity computation using a real GPT-2 model"""
-    with patch('src.embeddings.MODEL_TYPE', 'gpt2'):
+    with patch("src.config.CONFIG.model_type", 'gpt2'):
         # Get real model parameters
         batch_size = 2
         num_keys = 3
@@ -196,7 +195,7 @@ def test_compute_similarity_real_gpt2(gpt2_model, gpt2_tokenizer):
 
 def test_embedding_hook_registration_real_gpt2(gpt2_model):
     """Test embedding hook registration with a real GPT-2 model."""
-    with patch('src.embeddings.MODEL_TYPE', 'gpt2'):
+    with patch("src.config.CONFIG.model_type", 'gpt2'):
         embed_dict, remove_hook = register_embedding_hook(gpt2_model, embed_type="query")
         assert "embeddings" in embed_dict
         assert callable(remove_hook)
@@ -215,7 +214,7 @@ def test_embedding_hook_registration_real_gpt2(gpt2_model):
 
 def test_extract_embeddings_real_gpt2(gpt2_model, gpt2_tokenizer):
     """Test embedding extraction with a real GPT-2 model."""
-    with patch('src.embeddings.MODEL_TYPE', 'gpt2'):
+    with patch("src.config.CONFIG.model_type", 'gpt2'):
         # Register embedding hook
         embeddings_dict, hook_remover = register_embedding_hook(gpt2_model)
         
@@ -254,7 +253,7 @@ def test_extract_embeddings_real_gpt2(gpt2_model, gpt2_tokenizer):
 
 def test_get_attention_params_real_gpt2(gpt2_model):
     """Test getting attention parameters from a real GPT-2 model."""
-    with patch('src.embeddings.MODEL_TYPE', 'gpt2'):
+    with patch("src.config.CONFIG.model_type", 'gpt2'):
         num_heads, num_groups, head_dim = get_attention_params(gpt2_model)
         
         # Verify parameters match the model's config
@@ -265,7 +264,7 @@ def test_get_attention_params_real_gpt2(gpt2_model):
 
 def test_batch_processing_real_gpt2(gpt2_model):
     """Test batch processing consistency with a real GPT-2 model."""
-    with patch('src.embeddings.MODEL_TYPE', 'gpt2'):
+    with patch("src.config.CONFIG.model_type", 'gpt2'):
         batch_size = 3
         num_keys = 4
         hidden_size = gpt2_model.config.n_embd
@@ -293,7 +292,7 @@ def test_batch_processing_real_gpt2(gpt2_model):
 
 def test_temperature_scaling_real_gpt2(gpt2_model):
     """Test temperature scaling effect on attention with a real GPT-2 model."""
-    with patch('src.embeddings.MODEL_TYPE', 'gpt2'):
+    with patch("src.config.CONFIG.model_type", 'gpt2'):
         batch_size = 2
         num_keys = 5
         hidden_size = gpt2_model.config.n_embd
@@ -332,7 +331,7 @@ def test_temperature_scaling_real_gpt2(gpt2_model):
 
 def test_sample_key_value_real_gpt2(gpt2_model):
     """Test key-value sampling with real GPT-2 similarity scores."""
-    with patch('src.embeddings.MODEL_TYPE', 'gpt2'):
+    with patch("src.config.CONFIG.model_type", 'gpt2'):
         batch_size = 2
         num_keys = 6
         hidden_size = gpt2_model.config.n_embd
@@ -403,7 +402,7 @@ def test_extract_embeddings_difference_with_lora(gpt2_model, gpt2_tokenizer):
     input_ids = inputs["input_ids"].to(device)
     
     # Apply LoRA adapter with patch for GPT-2
-    with patch("src.model.MODEL_TYPE", "gpt2"):
+    with patch("src.config.CONFIG.model_type", "gpt2"):
         adapter_model = apply_lora_adapter(gpt2_model)
     
     # Extract embeddings from base model
@@ -543,7 +542,7 @@ def test_llama_gqa_embedding_hook(tiny_llama_model):
     """Test embedding hook registration and extraction for Llama with GQA."""
     from src.embeddings import register_embedding_hook, extract_embeddings, get_attention_params
     
-    with patch('src.embeddings.MODEL_TYPE', 'llama'):
+    with patch("src.config.CONFIG.model_type", 'llama'):
         # Test query embedding hook
         embeddings_dict, hook_remover = register_embedding_hook(tiny_llama_model, embed_type="query")
         
@@ -579,7 +578,7 @@ def test_llama_gqa_attention_params(tiny_llama_model):
     """Test that Llama GQA parameters are correctly extracted."""
     from src.embeddings import get_attention_params
     
-    with patch('src.embeddings.MODEL_TYPE', 'llama'):
+    with patch("src.config.CONFIG.model_type", 'llama'):
         num_heads, num_groups, head_dim = get_attention_params(tiny_llama_model)
         
         # Verify parameters match our tiny model config
@@ -592,7 +591,7 @@ def test_llama_gqa_similarity_computation(tiny_llama_model):
     """Test GQA similarity computation with Llama model."""
     from src.embeddings import compute_similarity, register_embedding_hook, extract_embeddings
     
-    with patch('src.embeddings.MODEL_TYPE', 'llama'):
+    with patch("src.config.CONFIG.model_type", 'llama'):
         batch_size = 2
         num_keys = 3
         

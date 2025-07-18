@@ -1,11 +1,12 @@
 # tests/conftest.py
 import pytest
+from transformers import GPT2Tokenizer, GPT2LMHeadModel
 import torch
 import numpy as np
 from unittest.mock import MagicMock
 
-# Assuming CUDA is available as an explicit requirement
-device = torch.device("cuda")
+# Use CPU for tests to avoid CUDA compatibility issues
+device = torch.device("cpu")
 
 
 @pytest.fixture
@@ -59,12 +60,13 @@ def mock_gpt2_model():
     model.config.n_head = 12
     
     # Mock device properties - assume CUDA is available
-    device = torch.device("cuda")
+    device = torch.device("cpu")
+    model.device = device
     
     def mock_parameters():
-        # Return a mock parameter on the correct device
+        # Return a list instead of generator to make it pickleable
         param = torch.randn(10, 10, device=device, requires_grad=True)
-        yield param
+        return [param]
     
     model.parameters.return_value = mock_parameters()
     
@@ -97,3 +99,16 @@ def mock_gpt2_model():
     model.cuda.return_value = model
     
     return model
+
+
+# Add the expected fixture names that map to the mock fixtures
+@pytest.fixture
+def gpt2_model(mock_gpt2_model):
+    """Fixture that provides a GPT-2 model for testing."""
+    return mock_gpt2_model
+
+
+@pytest.fixture 
+def gpt2_tokenizer(mock_tokenizer):
+    """Fixture that provides a GPT-2 tokenizer for testing."""
+    return mock_tokenizer

@@ -1,3 +1,4 @@
+
 """
 Memory-efficient training loop implementation using LoRA state management.
 
@@ -17,10 +18,7 @@ from src.training import (
     compute_trajectory_rewards as original_compute_trajectory_rewards
 )
 from src.embeddings import compute_similarity
-from src.config import (
-    INITIAL_PROMPT, KEY_PREFIX, VALUE_PREFIX, USE_GRPO_BASELINE, 
-    GAMMA, GAE_LAMBDA, PPO_CLIP_EPSILON, GRADIENT_CLIP_NORM
-)
+from src.config import CONFIG
 
 
 class MemoryEfficientLoRAManager:
@@ -128,8 +126,8 @@ def memory_efficient_compute_policy_loss(
     advantages, _ = compute_advantages(
         trajectory.rewards, 
         gamma=gamma,
-        gae_lambda=GAE_LAMBDA,
-        use_grpo_baseline=USE_GRPO_BASELINE
+        gae_lambda=CONFIG.gae_lambda,
+        use_grpo_baseline=CONFIG.use_grpo_baseline
     )
     
     batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
@@ -145,7 +143,7 @@ def memory_efficient_compute_policy_loss(
     
     # Initialize context for old model queries
     context_tokens = tokenizer(
-        [INITIAL_PROMPT] * batch_size,
+        [CONFIG.initial_prompt] * batch_size,
         return_tensors="pt",
         padding=True,
         add_special_tokens=False
@@ -168,8 +166,8 @@ def memory_efficient_compute_policy_loss(
             old_query_embeddings.append(old_query_emb)
         
         # Update context for next iteration
-        key_prefix_tokens = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-        value_prefix_tokens = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        key_prefix_tokens = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        value_prefix_tokens = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
         
         current_context = torch.cat([
             current_context,
@@ -198,8 +196,8 @@ def memory_efficient_compute_policy_loss(
                 break
             else:
                 # Add previous steps to context
-                key_prefix = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-                value_prefix = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+                key_prefix = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+                value_prefix = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
                 current_context_step = torch.cat([
                     current_context_step, key_prefix, step.key_tokens.to(device),
                     value_prefix, step.value_tokens.to(device)
@@ -238,12 +236,12 @@ def memory_efficient_compute_policy_loss(
         
         # PPO computation
         import src.config as config
-        if config.USE_PPO:
+        if config.CONFIG.use_ppo:
             # PPO with ratio clipping
             log_ratio = current_action_log_probs - old_action_log_probs
             ratio = torch.exp(log_ratio)
             
-            clipped_ratio = torch.clamp(ratio, 1.0 - PPO_CLIP_EPSILON, 1.0 + PPO_CLIP_EPSILON)
+            clipped_ratio = torch.clamp(ratio, 1.0 - CONFIG.ppo_clip_epsilon, 1.0 + CONFIG.ppo_clip_epsilon)
             all_clipping_ratios.extend(ratio.detach().cpu().tolist())
             
             unclipped_surrogate = ratio * step_advantages
@@ -269,7 +267,7 @@ def memory_efficient_compute_policy_loss(
         total_loss = total_policy_loss + kl_penalty_coef * total_kl_loss
         
         if verbose:
-            method_name = "PPO" if config.USE_PPO else "Vanilla PG"
+            method_name = "PPO" if config.CONFIG.use_ppo else "Vanilla PG"
             logging.info(f"Memory-efficient {method_name} loss computed")
             logging.info(f"Policy loss: {total_policy_loss.item():.4f}")
             logging.info(f"KL loss: {total_kl_loss.item():.4f}")
@@ -316,7 +314,7 @@ def memory_efficient_train_step(
         lora_manager,
         kl_penalty_coef,
         verbose=verbose,
-        gamma=GAMMA,
+        gamma=CONFIG.gamma,
         tokenizer=tokenizer,
         embeddings_dict=embeddings_dict
     )
@@ -328,7 +326,7 @@ def memory_efficient_train_step(
     total_loss.backward()
     
     # Clip gradients
-    grad_norm = torch.nn.utils.clip_grad_norm_(adapter_model.parameters(), GRADIENT_CLIP_NORM)
+    grad_norm = torch.nn.utils.clip_grad_norm_(adapter_model.parameters(), CONFIG.gradient_clip_norm)
     
     if verbose:
         logging.info(f"Gradient norm: {grad_norm:.4f}")

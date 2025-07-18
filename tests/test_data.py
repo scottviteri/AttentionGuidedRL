@@ -20,7 +20,7 @@ from src.data import (
     load_twenty_questions,
     get_twenty_questions_path,
 )
-from src.config import TOKENS_PER_KEY, TOKENS_PER_VALUE, NUM_KV_PAIRS
+from src.config import CONFIG
 
 
 def print_separator():
@@ -34,8 +34,8 @@ class TestKVPair:
     def test_init_valid(self):
         """Test initializing a KVPair with valid inputs."""
         batch_size = 2
-        key_tokens = torch.ones((batch_size, TOKENS_PER_KEY), dtype=torch.long)
-        value_tokens = torch.ones((batch_size, TOKENS_PER_VALUE), dtype=torch.long)
+        key_tokens = torch.ones((batch_size, CONFIG.tokens_per_key), dtype=torch.long)
+        value_tokens = torch.ones((batch_size, CONFIG.tokens_per_value), dtype=torch.long)
         key_embedding = torch.ones((batch_size, 768))
         key_text = ["key1", "key2"]
         value_text = ["value1", "value2"]
@@ -61,8 +61,8 @@ class TestKVPair:
         # Wrong key_tokens shape
         with pytest.raises(AssertionError):
             KVPair(
-                key_tokens=torch.ones((batch_size, TOKENS_PER_KEY + 1)),  # Wrong shape
-                value_tokens=torch.ones((batch_size, TOKENS_PER_VALUE)),
+                key_tokens=torch.ones((batch_size, CONFIG.tokens_per_key + 1)),  # Wrong shape
+                value_tokens=torch.ones((batch_size, CONFIG.tokens_per_value)),
                 key_embedding=torch.ones((batch_size, 768)),
                 key_text=["key1", "key2"],
                 value_text=["value1", "value2"],
@@ -71,8 +71,8 @@ class TestKVPair:
         # Wrong batch size in text
         with pytest.raises(AssertionError):
             KVPair(
-                key_tokens=torch.ones((batch_size, TOKENS_PER_KEY)),
-                value_tokens=torch.ones((batch_size, TOKENS_PER_VALUE)),
+                key_tokens=torch.ones((batch_size, CONFIG.tokens_per_key)),
+                value_tokens=torch.ones((batch_size, CONFIG.tokens_per_value)),
                 key_embedding=torch.ones((batch_size, 768)),
                 key_text=["key1"],  # Wrong length
                 value_text=["value1", "value2"],
@@ -215,8 +215,8 @@ class TestQKVSelection:
     def test_qkv_selection_properties(self):
         """Test QKVSelection convenience properties."""
         batch_size = 2
-        key_tokens = torch.ones((batch_size, TOKENS_PER_KEY), dtype=torch.long)
-        value_tokens = torch.ones((batch_size, TOKENS_PER_VALUE), dtype=torch.long)
+        key_tokens = torch.ones((batch_size, CONFIG.tokens_per_key), dtype=torch.long)
+        value_tokens = torch.ones((batch_size, CONFIG.tokens_per_value), dtype=torch.long)
         key_embedding = torch.ones((batch_size, 768))
         key_text = ["key1", "key2"]
         value_text = ["value1", "value2"]

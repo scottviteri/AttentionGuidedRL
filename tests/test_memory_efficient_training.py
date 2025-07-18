@@ -21,6 +21,7 @@ from src.memory_efficient_training import (
 )
 from src.model import save_lora_state, load_lora_state
 from src.data import RawTrajectory, Trajectory, QKVSelection, KVPair
+from src.config import CONFIG
 
 
 class TestMemoryEfficientLoRAManager:

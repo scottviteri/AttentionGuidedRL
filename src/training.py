@@ -10,19 +10,7 @@ from typing import List, Tuple, Optional, Any, Dict
 
 from src.data import RawTrajectory, Trajectory
 from src.embeddings import extract_embeddings, compute_similarity, register_embedding_hook
-from src.config import (
-    KEY_PREFIX,
-    VALUE_PREFIX,
-    GRADIENT_CLIP_NORM,
-    QUERY_VEC_TOKEN,
-    INITIAL_PROMPT,
-    GAMMA,
-    GAE_LAMBDA,
-    USE_GRPO_BASELINE,
-    SUBTRACT_BASE_MODEL_LOGPROBS,
-    PPO_CLIP_EPSILON,
-    TEMPERATURE
-)
+from src.config import CONFIG, TrainingConfig
 
 
 # Helper to convert RawTrajectory after rewards are ready
@@ -87,7 +75,8 @@ def generate_query_vector(
     model: torch.nn.Module,
     tokenizer: Any,
     context_tokens: torch.Tensor,
-    layer_idx: int = -2
+    layer_idx: int = -2,
+    config: Optional[TrainingConfig] = None
 ) -> torch.Tensor:
     """
     Generate a single query vector by appending QUERY_VEC_TOKEN and extracting query embeddings.
@@ -111,7 +100,7 @@ def generate_query_vector(
     try:
         # Tokenize the QUERY_VEC_TOKEN
         query_vec_token_ids = tokenizer(
-            [QUERY_VEC_TOKEN] * batch_size,
+            [CONFIG.query_vec_token] * batch_size,
             add_special_tokens=False,
             return_tensors="pt"
         ).input_ids.to(device)
@@ -213,7 +202,7 @@ def compute_trajectory_rewards(
         ref_log_probs[:, i] = ref_log_prob
         
         # Calculate reward - conditionally subtract reference model baseline
-        if SUBTRACT_BASE_MODEL_LOGPROBS:
+        if CONFIG.subtract_base_model_logprobs:
             # Classic approach: reward = improvement over reference model
             rewards[:, i] = adapter_log_prob - ref_log_prob
         else:
@@ -223,7 +212,7 @@ def compute_trajectory_rewards(
         if verbose:
             print(f"Adapter model log prob: {adapter_log_prob[0].item():.4f}")
             print(f"Reference model log prob: {ref_log_prob[0].item():.4f}")
-            if SUBTRACT_BASE_MODEL_LOGPROBS:
+            if CONFIG.subtract_base_model_logprobs:
                 print(f"Reward (adapter - ref): {rewards[0, i].item():.4f}")
             else:
                 print(f"Reward (raw adapter): {rewards[0, i].item():.4f}")
@@ -234,8 +223,8 @@ def compute_trajectory_rewards(
         if tokenizer:
             # Add prefixes if tokenizer is available
             batch_size = current_context.shape[0]
-            key_prefix_tokens = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-            value_prefix_tokens = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+            key_prefix_tokens = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+            value_prefix_tokens = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
             
             # Vector queries - no query tokens to add to context
             current_context = torch.cat([
@@ -441,8 +430,8 @@ def compute_policy_loss(
     advantages, _ = compute_advantages(
         trajectory.rewards, 
         gamma=gamma,
-        gae_lambda=GAE_LAMBDA,
-        use_grpo_baseline=USE_GRPO_BASELINE
+        gae_lambda=CONFIG.gae_lambda,
+        use_grpo_baseline=CONFIG.use_grpo_baseline
     )
     
 
@@ -456,7 +445,7 @@ def compute_policy_loss(
     
     # Initialize context with the initial prompt
     context_tokens = tokenizer(
-        [INITIAL_PROMPT] * batch_size,
+        [CONFIG.initial_prompt] * batch_size,
         return_tensors="pt",
         padding=True,
         add_special_tokens=False
@@ -475,8 +464,8 @@ def compute_policy_loss(
             old_query_means.append(prev_query_mean)
         
         # Update context for next iteration (add key and value tokens)
-        key_prefix_tokens = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-        value_prefix_tokens = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        key_prefix_tokens = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        value_prefix_tokens = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
         
         context_tokens = torch.cat([
             context_tokens,
@@ -497,7 +486,7 @@ def compute_policy_loss(
         # Reconstruct context up to this step
         batch_size = qkv_step.key_tokens.shape[0]
         context_tokens = tokenizer(
-            [INITIAL_PROMPT] * batch_size,
+            [CONFIG.initial_prompt] * batch_size,
             return_tensors="pt",
             padding=True,
             add_special_tokens=False
@@ -506,8 +495,8 @@ def compute_policy_loss(
         # Add all previous steps to context
         for prev_t in range(t):
             prev_step = trajectory.qkv_steps[prev_t]
-            key_prefix_tokens = tokenizer([KEY_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-            value_prefix_tokens = tokenizer([VALUE_PREFIX] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+            key_prefix_tokens = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+            value_prefix_tokens = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
             
             context_tokens = torch.cat([
                 context_tokens,
@@ -579,14 +568,14 @@ def compute_policy_loss(
         # Import config dynamically to get the current USE_PPO setting
         import src.config as config
         
-        if config.USE_PPO:
+        if CONFIG.use_ppo:
             # PPO: Use ratio clipping
             # Compute probability ratio: pi_theta(a|s) / pi_old(a|s)
             log_ratio = current_action_log_probs - old_action_log_probs
             ratio = torch.exp(log_ratio)
             
             # PPO clipped surrogate objective
-            clipped_ratio = torch.clamp(ratio, 1.0 - PPO_CLIP_EPSILON, 1.0 + PPO_CLIP_EPSILON)
+            clipped_ratio = torch.clamp(ratio, 1.0 - CONFIG.ppo_clip_epsilon, 1.0 + CONFIG.ppo_clip_epsilon)
             
             # Track clipping ratios for monitoring
             all_clipping_ratios.extend(ratio.detach().cpu().tolist())
@@ -644,7 +633,7 @@ def compute_policy_loss(
         if verbose:
             # Import config dynamically for the current USE_PPO setting
             import src.config as config
-            method_name = "PPO" if config.USE_PPO else "Vanilla PG"
+            method_name = "PPO" if CONFIG.use_ppo else "Vanilla PG"
             print(f"\n=== {method_name} Loss Components ===")
             print(f"Policy gradient sum (before negation): {-total_policy_loss.item():.4f}")
             print(f"Policy loss (after negation): {total_policy_loss.item():.4f}")
@@ -652,7 +641,7 @@ def compute_policy_loss(
             print(f"KL penalty coefficient: {kl_penalty_coef:.4f}")
             print(f"Total loss: {total_loss.item():.4f}")
             print(f"  = {total_policy_loss.item():.4f} + {kl_penalty_term.item():.4f}")
-            if config.USE_PPO:
+            if CONFIG.use_ppo:
                 print(f"Average clipping ratio: {avg_clipping_ratio:.4f}")
             else:
                 print(f"Method: Vanilla Policy Gradient (no clipping)")
@@ -727,7 +716,7 @@ def train_step(
         old_model,  # Use old_model for PPO probability ratios
         kl_penalty_coef,
         verbose=verbose,
-        gamma=GAMMA,
+        gamma=CONFIG.gamma,
         tokenizer=tokenizer,
         embeddings_dict=embeddings_dict
     )
@@ -739,7 +728,7 @@ def train_step(
     total_loss.backward()
     
     # Get gradient norm for logging
-    grad_norm = torch.nn.utils.clip_grad_norm_(adapter_model.parameters(), GRADIENT_CLIP_NORM)
+    grad_norm = torch.nn.utils.clip_grad_norm_(adapter_model.parameters(), CONFIG.gradient_clip_norm)
     
     if verbose:
         print(f"Gradient norm (before clipping): {grad_norm:.4f}")

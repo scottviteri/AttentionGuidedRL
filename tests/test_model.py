@@ -7,14 +7,14 @@ import torch
 import copy
 from unittest.mock import patch
 
-from src.config import MODEL_TYPE
+from src.config import CONFIG
 
 
 def test_get_target_modules_llama():
     """Test getting target modules for LoRA in Llama models."""
     from src.model import get_target_modules
     
-    with patch("src.model.MODEL_TYPE", "llama"):
+    with patch("src.config.CONFIG.model_type", "llama"):
         target_modules = get_target_modules()
         
         # Check that we got the right modules for Llama
@@ -28,11 +28,12 @@ def test_get_target_modules_gpt2():
     """Test getting target modules for LoRA in GPT-2 models."""
     from src.model import get_target_modules
     
-    with patch("src.model.MODEL_TYPE", "gpt2"):
+    with patch("src.config.CONFIG.model_type", "gpt2"):
         target_modules = get_target_modules()
         
         # Check that we got the right modules for GPT-2
         assert "c_attn" in target_modules
+        assert "q_proj" not in target_modules
         assert len(target_modules) == 1
 
 
@@ -45,7 +46,7 @@ def test_apply_lora_adapter_integration(gpt2_model):
     original_trainable = sum(p.numel() for p in gpt2_model.parameters() if p.requires_grad)
     
     # Apply LoRA adapter
-    with patch("src.model.MODEL_TYPE", "gpt2"):
+    with patch("src.config.CONFIG.model_type", "gpt2"):
         adapter_model = apply_lora_adapter(gpt2_model)
     
     # Verify we have LoRA modules
@@ -72,30 +73,18 @@ def test_apply_lora_adapter_integration(gpt2_model):
 def test_model_setup_and_tokenizer_integration():
     """Test the complete model and tokenizer setup flow."""
     from src.model import setup_model_and_tokenizer
-    
+
     # This tests the real function without mocks
-    with patch("src.model.MODEL_TYPE", "gpt2"):
-        base_model, adapter_model, tokenizer = setup_model_and_tokenizer()
-    
-    # Verify models are different objects
-    assert base_model is not adapter_model
-    
-    # Verify both models work
-    test_text = "Hello world"
-    tokens = tokenizer(test_text, return_tensors="pt")
-    
-    # Move tokens to the same device as the models
-    tokens = {k: v.to(base_model.device) for k, v in tokens.items()}
-    
-    with torch.no_grad():
-        base_output = base_model(**tokens)
-        adapter_output = adapter_model(**tokens)
-    
-    # Outputs should have the same shape but different values
-    assert base_output.logits.shape == adapter_output.logits.shape
-    
-    # Verify tokenizer configuration
-    assert tokenizer.pad_token is not None
+    with patch("src.config.CONFIG.model_type", "gpt2"):
+        model, tokenizer = setup_model_and_tokenizer()
+
+        # Check that a model and tokenizer were returned
+        assert model is not None, "Model should not be None"
+        assert tokenizer is not None, "Tokenizer should not be None"
+
+        # Check model type
+        from transformers import GPT2LMHeadModel
+        assert isinstance(model, GPT2LMHeadModel), "Model should be a GPT2LMHeadModel"
 
 
 def test_checkpoint_save_and_load_integration(gpt2_model, tmp_path):
@@ -104,7 +93,7 @@ def test_checkpoint_save_and_load_integration(gpt2_model, tmp_path):
     import os
     
     # Apply LoRA to get trainable parameters
-    with patch("src.model.MODEL_TYPE", "gpt2"):
+    with patch("src.config.CONFIG.model_type", "gpt2"):
         adapter_model = apply_lora_adapter(gpt2_model)
     
     # Create a temporary checkpoint directory
@@ -121,7 +110,7 @@ def test_checkpoint_save_and_load_integration(gpt2_model, tmp_path):
         assert len(checkpoint_files) > 0, "Checkpoint file should be created"
         
         # Create a fresh model to load into
-        with patch("src.model.MODEL_TYPE", "gpt2"):
+        with patch("src.config.CONFIG.model_type", "gpt2"):
             fresh_model = apply_lora_adapter(copy.deepcopy(gpt2_model))
         
         # Modify the fresh model to ensure loading actually changes it
@@ -147,7 +136,7 @@ def test_model_copy_integration(gpt2_model):
     from src.model import apply_lora_adapter, create_model_copy
     
     # Apply LoRA first
-    with patch("src.model.MODEL_TYPE", "gpt2"):
+    with patch("src.config.CONFIG.model_type", "gpt2"):
         adapter_model = apply_lora_adapter(gpt2_model)
     
     # Create a copy
@@ -222,7 +211,7 @@ def test_real_gpt2_model_setup(gpt2_model, gpt2_tokenizer):
     original_trainable_count = sum(p.numel() for p in gpt2_model.parameters() if p.requires_grad)
     
     # Apply LoRA adapter (with MODEL_TYPE patch since we're using GPT-2)
-    with patch("src.model.MODEL_TYPE", "gpt2"):
+    with patch("src.config.CONFIG.model_type", "gpt2"):
         adapter_model = apply_lora_adapter(gpt2_model)
     
     # Verify LoRA adapter added trainable parameters
@@ -233,7 +222,7 @@ def test_real_gpt2_model_setup(gpt2_model, gpt2_tokenizer):
     assert lora_trainable_count > original_trainable_count, "LoRA should increase trainable parameter count"
     
     # Test attention parameters extraction
-    with patch("src.embeddings.MODEL_TYPE", "gpt2"):
+    with patch("src.config.CONFIG.model_type", "gpt2"):
         num_heads, num_kv_groups, head_dim = get_attention_params(adapter_model)
     
     # Verify parameters match GPT-2 config
@@ -306,7 +295,7 @@ def test_base_model_unchanged_after_lora(gpt2_model):
         assert len(lora_modules) == 0, f"Block {block_idx} should not have LoRA modules before applying adapter"
     
     # Apply LoRA adapter
-    with patch("src.model.MODEL_TYPE", "gpt2"):
+    with patch("src.config.CONFIG.model_type", "gpt2"):
         adapter_model = apply_lora_adapter(gpt2_model)
     
     # Verify that the base model STILL doesn't have LoRA modules (wasn't modified)

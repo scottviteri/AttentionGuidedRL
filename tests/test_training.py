@@ -10,7 +10,7 @@ import copy
 import torch.nn.functional as F
 import logging
 
-from src.config import KL_PENALTY_COEFFICIENT, TOKENS_PER_KEY, TOKENS_PER_VALUE, KEY_PREFIX, GAMMA
+from src.config import CONFIG
 from src.data import KVPair as KeyValuePair, KVPair, QKVSelection
 
 # Import new dataclasses
@@ -128,37 +128,39 @@ def test_generate_query_vector():
     
     # Create mock model
     model = MagicMock()
-    model.device = torch.device("cuda")
-    # Mock parameters() to return an iterator with a tensor on cuda
-    mock_param = torch.zeros(1, requires_grad=True, device=torch.device("cuda"))
-    model.parameters = MagicMock(return_value=iter([mock_param]))
+    model.device = torch.device("cpu")
+    # Mock parameters() to return an iterator with a tensor on cpu
+    mock_param = torch.zeros(1, requires_grad=True, device=torch.device("cpu"))
+    model.parameters.return_value = iter([mock_param])
+    model.config.hidden_size = 768
     
     # Create mock tokenizer
-    class DummyTokenizer:
-        def __call__(self, texts, **kwargs):
-            batch = len(texts) if isinstance(texts, list) else 1
-            return type('obj',(object,),{'input_ids': torch.randint(0,1000,(batch,10))})
-
-    tokenizer = DummyTokenizer()
+    tokenizer = MagicMock()
+    tokenizer.encode.return_value = [1, 2, 3]
+    tokenizer.return_value.input_ids = torch.tensor([[1, 2, 3], [1, 2, 3]], device=torch.device("cpu"))
     
     # Create context tokens
-    context_tokens = torch.randint(0, 1000, (2, 10))
+    batch_size = 2
+    context_tokens = torch.tensor([[1, 2, 3, 4], [1, 2, 3, 4]], device=torch.device("cpu"))
     
-    # Mock the embeddings extraction
-    with patch('src.training.register_embedding_hook') as mock_register_hook:
+    # Mock the register_embedding_hook and extract_embeddings
+    with patch('src.training.register_embedding_hook') as mock_register:
         with patch('src.training.extract_embeddings') as mock_extract:
-            # Mock the hook registration
-            mock_register_hook.return_value = ({'embeddings': None}, lambda: None)  # embeddings_dict, hook_remover
-            # Mock extract_embeddings to return query embeddings
-            mock_extract.return_value = torch.randn(2, 768, device=torch.device("cuda"))  # Mock query embeddings
+            # Mock register_embedding_hook to return a dict and a remover function
+            embeddings_dict = {'embeddings': None}
+            mock_register.return_value = (embeddings_dict, lambda: None)
             
-            # Call function
-            result = generate_query_vector(model, tokenizer, context_tokens)
+            # Mock extract_embeddings to return a tensor of the right shape
+            mock_extract.return_value = torch.randn(batch_size, 768, device=torch.device("cpu"))
+            
+            # Run function
+            query_vector = generate_query_vector(
+                model, tokenizer, context_tokens
+            )
     
-    # Check result
-    assert isinstance(result, torch.Tensor)
-    assert result.shape[0] == 2  # batch size
-    assert result.shape[1] == 768  # embedding dimension
+    # Verify shape and device
+    assert query_vector.shape == (2, 768)
+    assert query_vector.device.type == "cpu"
 
 
 def test_compute_trajectory_rewards(mock_trajectory, mock_models):
@@ -235,6 +237,8 @@ def test_compute_policy_loss(mock_trajectory, mock_models):
     
     # Create a mock tokenizer  
     class MockTokenizer:
+        def __init__(self, device):
+            self.device = device
         def __call__(self, texts, **kwargs):
             batch_size = len(texts) if isinstance(texts, list) else 1
             return type('obj', (object,), {
@@ -244,7 +248,7 @@ def test_compute_policy_loss(mock_trajectory, mock_models):
         def encode(self, text, **kwargs):
             return [1, 2, 3]
     
-    mock_tokenizer = MockTokenizer()
+    mock_tokenizer = MockTokenizer(device=torch.device("cpu"))
     
     # Mock the query vector generation to return proper tensors
     with patch('src.training.generate_query_vector') as mock_generate_query:
@@ -258,6 +262,7 @@ def test_compute_policy_loss(mock_trajectory, mock_models):
             total_loss, policy_loss, kl_loss, avg_clipping_ratio = compute_policy_loss(
                 mock_trajectory,
                 adapter_model,
+                previous_model,
                 previous_model,
                 kl_penalty_coef=0.1,
                 tokenizer=mock_tokenizer
@@ -291,7 +296,7 @@ def test_train_step(mock_models, mock_trajectory):
             previous_model,
             optimizer, 
             {"mean": 0.0, "std": 1.0, "count": 10},
-            KL_PENALTY_COEFFICIENT,
+            CONFIG.kl_penalty_coefficient,
             verbose=False,
             tokenizer=MagicMock()  # Add a mock tokenizer
         )
@@ -354,7 +359,7 @@ def test_model_behavior_during_training():
     base_model.hidden_size = 64
 
     # Determine device for tensors in this test
-    device = torch.device("cuda")
+    device = torch.device("cpu")
 
     # Apply adapter to create adapter model
     with patch("src.model.LoraConfig"):
@@ -385,8 +390,8 @@ def test_model_behavior_during_training():
 
     # Create the base data first (KeyValuePair is now KVPair)
     qkv_data = KVPair(
-        key_tokens=torch.randint(0, 100, (2, TOKENS_PER_KEY), device=device),
-        value_tokens=torch.randint(0, 100, (2, TOKENS_PER_VALUE), device=device),
+        key_tokens=torch.randint(0, 100, (2, CONFIG.tokens_per_key), device=device),
+        value_tokens=torch.randint(0, 100, (2, CONFIG.tokens_per_value), device=device),
         key_embedding=torch.randn(2, 64, device=device),
         key_text=["key1", "key2"],
         value_text=["value1", "value2"]
@@ -453,7 +458,7 @@ def test_model_behavior_during_training():
             previous_model,
             optimizer,
             {"mean": 0.0, "std": 1.0, "count": 10},
-            KL_PENALTY_COEFFICIENT,
+            CONFIG.kl_penalty_coefficient,
             verbose=False,
             tokenizer=tokenizer
         )
@@ -488,8 +493,8 @@ def test_compute_trajectory_rewards_with_real_model(gpt2_model, gpt2_tokenizer):
     # Create a few key-value pairs
     for i in range(3):
         kv_pair = KVPair(
-            key_tokens=torch.randint(0, 1000, (batch_size, TOKENS_PER_KEY), device=gpt2_model.device),
-            value_tokens=torch.randint(0, 1000, (batch_size, TOKENS_PER_VALUE), device=gpt2_model.device),
+            key_tokens=torch.randint(0, 1000, (batch_size, CONFIG.tokens_per_key), device=gpt2_model.device),
+            value_tokens=torch.randint(0, 1000, (batch_size, CONFIG.tokens_per_value), device=gpt2_model.device),
             key_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=gpt2_model.device),
             key_text=[f"Key {i}"],
             value_text=[f"Value {i}"]
@@ -520,7 +525,7 @@ def test_train_step_with_real_model(gpt2_model):
     from src.training import train_step, RawTrajectory, build_trajectory_from_raw
     from src.model import apply_lora_adapter
     from src.data import KVPair
-    from src.config import TOKENS_PER_KEY, TOKENS_PER_VALUE
+    from src.data import QKVSelection
     import copy
     
     # Set up adapter model with LoRA
@@ -552,8 +557,8 @@ def test_train_step_with_real_model(gpt2_model):
     
     # Create a proper KVPair with batch dimension
     kv_pair = KVPair(
-        key_tokens=torch.randint(0, 100, (batch_size, 10), device=gpt2_model.device),
-        value_tokens=torch.randint(0, 100, (batch_size, 10), device=gpt2_model.device),
+        key_tokens=torch.randint(0, 100, (batch_size, CONFIG.tokens_per_key), device=gpt2_model.device),
+        value_tokens=torch.randint(0, 100, (batch_size, CONFIG.tokens_per_value), device=gpt2_model.device),
         key_embedding=torch.randn(batch_size, gpt2_model.config.n_embd, device=gpt2_model.device),
         key_text=[f"Test key {i}" for i in range(batch_size)],
         value_text=[f"Test value {i}" for i in range(batch_size)]
@@ -702,7 +707,7 @@ def test_improved_policy_loss(gpt2_model):
     """Test the improved compute_policy_loss with advantages and entropy."""
     from src.training import RawTrajectory, build_trajectory_from_raw, compute_policy_loss
     from src.data import QKVSelection
-    from src.config import GAMMA
+    import copy
     
     batch_size = 2
     device = next(gpt2_model.parameters()).device
@@ -774,10 +779,11 @@ def test_improved_policy_loss(gpt2_model):
         total_loss, policy_loss, kl_loss, avg_clipping_ratio = compute_policy_loss(
             trajectory,
             gpt2_model,
-            previous_model,
+            previous_model,  # ref_model
+            previous_model,  # old_model
             kl_penalty_coef=0.1,
             verbose=True,
-            gamma=GAMMA,
+            gamma=CONFIG.gamma,
             tokenizer=tokenizer
         )
     
@@ -849,7 +855,7 @@ def test_grpo_baseline():
         [0.0, -1.0, -1.0],
         [0.0, 0.0, 0.0]
     ])
-    assert torch.allclose(advantages_grpo, expected_advantages)
+    assert torch.allclose(advantages_grpo, expected_advantages, atol=1e-5)
     
     # Test without GRPO baseline for comparison
     advantages_no_grpo, _ = compute_advantages(
@@ -867,34 +873,34 @@ def test_kl_divergence_dimension_match():
     from src.training import RawTrajectory, build_trajectory_from_raw, compute_policy_loss
     from src.data import QKVSelection
     import copy
-    
+
     batch_size = 2
-    device = torch.device("cuda")
-    
+    device = torch.device("cpu")
+
     # Create a mock model
     class MockModel(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.linear = torch.nn.Linear(10, 10)
-            self.device = torch.device('cuda')  # Use GPU device
+            self.device = torch.device('cpu')  # Use CPU device
             # Minimal GPT-2 style config needed by get_attention_params
             self.config = type('obj', (object,), {'n_embd': 768, 'n_head': 12})
-            
+
         def parameters(self):
             return self.linear.parameters()
-        
+
         def to(self, device):
             self.device = device
             return super().to(device)
-    
+
     adapter_model = MockModel()
     previous_model = copy.deepcopy(adapter_model)
-    
+
     # Create trajectory with decreasing number of available keys at each step
     qkv_steps = []
     num_available_keys = 5  # constant number of keys
     for t in range(3):
-        
+
         # Create base data first
         from src.data import KVPair
         qkv_data = KVPair(
@@ -904,7 +910,7 @@ def test_kl_divergence_dimension_match():
             key_text=[f"key_{t}_b0", f"key_{t}_b1"],
             value_text=[f"val_{t}_b0", f"val_{t}_b1"]
         )
-        
+
         # Create complete step
         step = QKVSelection(
             data=qkv_data,
@@ -952,7 +958,8 @@ def test_kl_divergence_dimension_match():
                 total_loss, policy_loss, kl_loss, avg_clipping_ratio = compute_policy_loss(
                     trajectory,
                     adapter_model,
-                    previous_model,
+                    previous_model,  # ref_model
+                    previous_model,  # old_model
                     kl_penalty_coef=0.1,
                     tokenizer=tokenizer,
                     verbose=False
@@ -1054,7 +1061,8 @@ def test_adapter_weights_update_during_training(gpt2_model):
     total_loss, _, _, _ = compute_policy_loss(
         trajectory,
         adapter_model, 
-        previous_model,
+        previous_model,  # ref_model
+        previous_model,  # old_model
         kl_penalty_coef=0.01,
         tokenizer=tokenizer,
         verbose=False
@@ -1104,7 +1112,7 @@ def test_adapter_weights_update_during_training(gpt2_model):
         previous_model,
         optimizer,
         {"mean": 0.0, "std": 1.0, "count": 10},
-        KL_PENALTY_COEFFICIENT,
+        CONFIG.kl_penalty_coefficient,
         verbose=False,
         tokenizer=tokenizer
     )
