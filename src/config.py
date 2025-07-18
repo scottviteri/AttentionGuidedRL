@@ -5,106 +5,55 @@ Contains all the configuration constants used throughout the project.
 """
 
 import torch
+import argparse
+from dataclasses import dataclass
+from typing import Dict, Any
 from transformers import AutoConfig, AutoTokenizer
 
-MODEL_TYPE = 'gpt2'
-MODEL_NAME = 'gpt2'
-TOKENIZER_NAME = 'gpt2'
+# Only torch imports needed here
 
-DEVICE = "cuda" 
-DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-
-# Query configuration - Vector queries only
-QUERY_VEC_TOKEN = 'Query'  # Hardcoded to 'Query'
-
-# Prefix tokens for context building
-KEY_PREFIX = "Key: "
-VALUE_PREFIX = "Value: "
-
-# Core constants - basic values that don't require computation
-TOKENS_PER_KEY = 10
-TOKENS_PER_VALUE = 10
-KV_EVERY_N = 4  # Skip 4 chunks between each extraction for diversity
-
-# Fixed text constants
-INITIAL_PROMPT = "Search for relevant information using learned vector queries."
-
-# NOTE: All derived values (token counts, context lengths, num_kv_pairs) are now
-# computed in TrainingConfig.from_args_and_defaults() to eliminate redundancy.
-
-# Configuration constants (for backwards compatibility and TrainingConfig defaults)
-LORA_RANK = 8 
-LORA_ALPHA = 16
-LEARNING_RATE = 5e-4
-GRADIENT_CLIP_NORM = 1.0
-NUM_EPISODES = 10000
-CHECKPOINT_INTERVAL = 100
-TRAINING_BATCH_SIZE = 4
-KL_PENALTY_COEFFICIENT = 0.1
-ENABLE_WANDB = False
-LOG_INTERVAL = 10
-GAMMA = 0.99
-GAE_LAMBDA = 0.95
-USE_GRPO_BASELINE = True
-TEMPERATURE = 1.0 
-PPO_CLIP_EPSILON = 0.2
-USE_PPO = True
-BASELINE_UPDATE_FREQUENCY = 50
-EMA_DECAY = 0.99
-USE_EMA_BASELINE = True
-SUBTRACT_BASE_MODEL_LOGPROBS = False 
-MEMORY_EFFICIENT_LORA = True 
-
-# === Frozen Configuration Management ===
-
-from dataclasses import dataclass
-from typing import Any, Dict
-import argparse
 
 @dataclass(frozen=True)
 class TrainingConfig:
     """
-    Frozen configuration that resolves all values once from config.py defaults + CLI overrides.
+    Frozen configuration that resolves all values once from defaults + CLI overrides.
     
-    This eliminates the confusing pattern of:
-    1. Import from config.py
-    2. Update config.py values from CLI args  
-    3. Mix usage of original imports vs config.X references
-    
+    This eliminates the confusing pattern of importing constants and reassigning them.
     Instead: Create one immutable config object with final resolved values.
     """
     # Core model configuration
-    model_name: str = MODEL_NAME
-    model_type: str = MODEL_TYPE
-    tokenizer_name: str = TOKENIZER_NAME
-    device: str = DEVICE
+    model_name: str = 'gpt2'
+    model_type: str = 'gpt2'
+    tokenizer_name: str = 'gpt2'
+    device: str = "cuda"
     
     # Training hyperparameters
-    learning_rate: float = LEARNING_RATE
-    num_episodes: int = NUM_EPISODES
-    batch_size: int = TRAINING_BATCH_SIZE
+    learning_rate: float = 5e-4
+    num_episodes: int = 10000
+    batch_size: int = 4
     
     # RL-specific parameters
-    kl_penalty_coefficient: float = KL_PENALTY_COEFFICIENT
-    ppo_clip_epsilon: float = PPO_CLIP_EPSILON
-    gamma: float = GAMMA
-    gae_lambda: float = GAE_LAMBDA
-    temperature: float = TEMPERATURE
+    kl_penalty_coefficient: float = 0.1
+    ppo_clip_epsilon: float = 0.2
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    temperature: float = 1.0
     
     # Training behavior
-    use_grpo_baseline: bool = USE_GRPO_BASELINE
-    use_ema_baseline: bool = USE_EMA_BASELINE
-    ema_decay: float = EMA_DECAY
-    baseline_update_frequency: int = BASELINE_UPDATE_FREQUENCY
-    subtract_base_model_logprobs: bool = SUBTRACT_BASE_MODEL_LOGPROBS
-    use_ppo: bool = True  # vs vanilla policy gradient (default to PPO)
-    memory_efficient_lora: bool = MEMORY_EFFICIENT_LORA
+    use_grpo_baseline: bool = True
+    use_ema_baseline: bool = True
+    ema_decay: float = 0.99
+    baseline_update_frequency: int = 50
+    subtract_base_model_logprobs: bool = False
+    use_ppo: bool = True  # vs vanilla policy gradient
+    memory_efficient_lora: bool = True  # Default to true per user request
     grpo_batching: bool = True  # GRPO-style batching
     
     # Training infrastructure
-    checkpoint_interval: int = CHECKPOINT_INTERVAL
-    log_interval: int = LOG_INTERVAL
-    enable_wandb: bool = ENABLE_WANDB
+    checkpoint_interval: int = 100
+    checkpoint_dir: str = "checkpoints"
+    log_interval: int = 10
+    enable_wandb: bool = False
     
     # Token configuration (computed - will be filled by create_training_config_from_args)
     prefix_tokens_per_key: int = 0
@@ -115,21 +64,25 @@ class TrainingConfig:
     max_context_length: int = 0
     
     # Fixed constants (rarely changed)
-    tokens_per_key: int = TOKENS_PER_KEY
-    tokens_per_value: int = TOKENS_PER_VALUE
-    lora_rank: int = LORA_RANK
-    lora_alpha: int = LORA_ALPHA
-    kv_every_n: int = KV_EVERY_N
-    initial_prompt: str = INITIAL_PROMPT
-    key_prefix: str = KEY_PREFIX
-    value_prefix: str = VALUE_PREFIX
+    tokens_per_key: int = 10
+    tokens_per_value: int = 10
+    lora_rank: int = 8
+    lora_alpha: int = 16
+    lora_dropout: float = 0.0  # Set to 0 per user request
+    kv_every_n: int = 4  # Skip 4 chunks between each extraction for diversity
+    initial_prompt: str = "Search for relevant information using learned vector queries."
+    key_prefix: str = "Key: "
+    value_prefix: str = "Value: "
+    query_vec_token: str = 'Query'  # Hardcoded to 'Query'
+    dtype: str = "bfloat16"  # Will be converted to torch.dtype
+    gradient_clip_norm: float = 1.0
 
 
 # === Standalone functions for TrainingConfig ===
 
 def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig:
     """
-    Create TrainingConfig from CLI args, using config.py as defaults.
+    Create TrainingConfig from CLI args, using dataclass defaults.
     
     This is the SINGLE point where all configuration gets resolved.
     After this, everything uses the frozen config object.
@@ -155,19 +108,18 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
         raise ValueError(f'Invalid model type: {model_type}')
     
     # Initialize tokenizer for calculations
-    from transformers import AutoTokenizer, AutoConfig
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
     # Calculate token counts
-    prefix_tokens_per_key = len(tokenizer.encode(KEY_PREFIX, add_special_tokens=False))
-    prefix_tokens_per_value = len(tokenizer.encode(VALUE_PREFIX, add_special_tokens=False))
+    prefix_tokens_per_key = len(tokenizer.encode(base_config.key_prefix, add_special_tokens=False))
+    prefix_tokens_per_value = len(tokenizer.encode(base_config.value_prefix, add_special_tokens=False))
     tokens_per_round = (
-        prefix_tokens_per_key + TOKENS_PER_KEY +
-        prefix_tokens_per_value + TOKENS_PER_VALUE
+        prefix_tokens_per_key + base_config.tokens_per_key +
+        prefix_tokens_per_value + base_config.tokens_per_value
     )
-    initial_prompt_tokens = len(tokenizer.encode(INITIAL_PROMPT, add_special_tokens=False))
+    initial_prompt_tokens = len(tokenizer.encode(base_config.initial_prompt, add_special_tokens=False))
     
     # Context window calculation
     model_config = AutoConfig.from_pretrained(model_name)
@@ -213,6 +165,7 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
         
         # Infrastructure
         checkpoint_interval=base_config.checkpoint_interval,
+        checkpoint_dir=base_config.checkpoint_dir,
         log_interval=getattr(args, 'log_interval', None) or base_config.log_interval,
         enable_wandb=getattr(args, 'enable_wandb', False) or base_config.enable_wandb,
         
@@ -223,6 +176,17 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
         initial_prompt_tokens=initial_prompt_tokens,
         num_kv_pairs=num_kv_pairs,
         max_context_length=max_context_length,
+        
+        # Pass through fixed constants
+        tokens_per_key=base_config.tokens_per_key,
+        tokens_per_value=base_config.tokens_per_value,
+        lora_rank=base_config.lora_rank,
+        lora_alpha=base_config.lora_alpha,
+        lora_dropout=base_config.lora_dropout,
+        kv_every_n=base_config.kv_every_n,
+        initial_prompt=base_config.initial_prompt,
+        key_prefix=base_config.key_prefix,
+        value_prefix=base_config.value_prefix,
     )
 
 
@@ -277,5 +241,34 @@ def log_training_config(config: TrainingConfig, logger) -> None:
         
     logger.info(f"Context: {config.num_kv_pairs} KV pairs, {config.tokens_per_round} tokens/round")
     logger.info(f"         {config.max_context_length} max context, {config.initial_prompt_tokens} prompt tokens")
-    logger.info("=" * 45)  
- 
+    logger.info("=" * 45)
+
+
+# Essential exports for other modules (using config defaults)
+_default_config = TrainingConfig()
+INITIAL_PROMPT = _default_config.initial_prompt
+KEY_PREFIX = _default_config.key_prefix  
+VALUE_PREFIX = _default_config.value_prefix
+DEVICE = _default_config.device
+MEMORY_EFFICIENT_LORA = _default_config.memory_efficient_lora
+CHECKPOINT_INTERVAL = _default_config.checkpoint_interval
+QUERY_VEC_TOKEN = _default_config.query_vec_token
+TOKENS_PER_KEY = _default_config.tokens_per_key
+TOKENS_PER_VALUE = _default_config.tokens_per_value
+KV_EVERY_N = _default_config.kv_every_n
+LORA_RANK = _default_config.lora_rank
+LORA_ALPHA = _default_config.lora_alpha
+LORA_DROPOUT = _default_config.lora_dropout
+CHECKPOINT_DIR = _default_config.checkpoint_dir
+NUM_KV_PAIRS = 5  # Default value, actual computed in TrainingConfig
+GRADIENT_CLIP_NORM = _default_config.gradient_clip_norm
+GAMMA = _default_config.gamma
+GAE_LAMBDA = _default_config.gae_lambda
+USE_GRPO_BASELINE = _default_config.use_grpo_baseline
+SUBTRACT_BASE_MODEL_LOGPROBS = _default_config.subtract_base_model_logprobs
+PPO_CLIP_EPSILON = _default_config.ppo_clip_epsilon
+TEMPERATURE = _default_config.temperature
+MODEL_NAME = _default_config.model_name
+MODEL_TYPE = _default_config.model_type
+TOKENIZER_NAME = _default_config.tokenizer_name
+DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32 

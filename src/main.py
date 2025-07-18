@@ -28,7 +28,6 @@ from src.config import (
     INITIAL_PROMPT,
     KEY_PREFIX,
     VALUE_PREFIX,
-    # Remaining legacy imports (to be fully removed in future cleanup)
     DEVICE,
     MEMORY_EFFICIENT_LORA,
     CHECKPOINT_INTERVAL,
@@ -268,7 +267,7 @@ def parse_args():
     parser.add_argument('--ema-decay', type=float, help='EMA decay for smooth baseline updates (0.01-0.1, higher=smoother)')
     parser.add_argument('--use-ema-baseline', action='store_true', help='Use EMA baseline updates instead of hard updates (reduces spikes)')
     parser.add_argument('--vanilla-pg', action='store_true', help='Use vanilla policy gradient (REINFORCE) instead of PPO')
-    parser.add_argument('--memory-efficient', action='store_true', help='Use memory-efficient LoRA state management (saves 60-90% memory)')
+    parser.add_argument('--memory-efficient', action='store_true', help='Use memory-efficient LoRA state management (saves 60-90%% memory)')
     
     return parser.parse_args()
 
@@ -640,7 +639,7 @@ def main():
     # Make sure hook is removed at the end
     try:
         # Create optimizer
-        optimizer = optim.Adam(adapter_model.parameters(), lr=args.learning_rate)
+        optimizer = optim.Adam(adapter_model.parameters(), lr=config.learning_rate)
         
         # Initialize reward stats
         reward_stats = {"mean": 0.0, "std": 1.0, "count": 0}
