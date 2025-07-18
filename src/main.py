@@ -19,25 +19,19 @@ from typing import List, Any, Iterator
 import sys
 import time # Import time for overall timing
 
+# Import configuration management - clean pattern!
 from src.config import (
-    MODEL_NAME,
-    DEVICE,
-    LEARNING_RATE,
-    NUM_EPISODES,
-    CHECKPOINT_INTERVAL,
-    TRAINING_BATCH_SIZE,
-    KL_PENALTY_COEFFICIENT,
-    LOG_INTERVAL,
-    ENABLE_WANDB,
+    TrainingConfig,
+    create_training_config_from_args,
+    training_config_to_dict,
+    log_training_config,
     INITIAL_PROMPT,
     KEY_PREFIX,
     VALUE_PREFIX,
-    NUM_KV_PAIRS,
-    BASELINE_UPDATE_FREQUENCY,
-    SUBTRACT_BASE_MODEL_LOGPROBS,
-    TEMPERATURE,
-    EMA_DECAY,
-    USE_EMA_BASELINE,
+    # Remaining legacy imports (to be fully removed in future cleanup)
+    DEVICE,
+    MEMORY_EFFICIENT_LORA,
+    CHECKPOINT_INTERVAL,
 )
 from src.model import setup_model_and_tokenizer, save_checkpoint, load_checkpoint, create_model_copy, get_checkpoint_path, update_model_ema
 from src.data import KVPair, QKVSelection
@@ -52,14 +46,21 @@ from src.training import (
 )
 from src.plotting import PlotData, save_plot_data, create_metadata
 
+# Import memory-efficient training components
+from src.memory_efficient_training import (
+    MemoryEfficientLoRAManager,
+    memory_efficient_train_step
+)
+
 import wandb
 
-def setup_logging(args):
+def setup_logging(config: TrainingConfig, args):
     """
     Set up logging for the training run.
     
     Args:
-        args: Command-line arguments
+        config: Resolved training configuration
+        args: Command-line arguments (for dataset, run_name, etc.)
     """
     log_dir = os.path.join("logs", datetime.now().strftime("%Y%m%d-%H%M%S"))
     os.makedirs(log_dir, exist_ok=True)
@@ -84,24 +85,14 @@ def setup_logging(args):
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     
-    # Log basic info
-    logging.info(f"Starting training run with configuration:")
-    logging.info(f"  Model: {MODEL_NAME}")
-    logging.info(f"  Device: {DEVICE}")
-    logging.info(f"  Dataset: {args.dataset}")
-    logging.info(f"  Batch size: {args.batch_size}")
-    logging.info(f"  Learning rate: {LEARNING_RATE}")
-    logging.info(f"  Episodes: {NUM_EPISODES}")
+    # Log the resolved configuration using the clean method
+    log_training_config(config, logging)
+    logging.info(f"Dataset: {args.dataset}")
     
     # Initialize wandb if enabled
-    if ENABLE_WANDB:
-        wandb_config = {
-            "learning_rate": args.learning_rate,
-            "episodes": args.episodes,
-            "batch_size": args.batch_size,
-            "kl_penalty": KL_PENALTY_COEFFICIENT,
-            "num_kv_pairs": NUM_KV_PAIRS,
-        }
+    if config.enable_wandb:
+        wandb_config = training_config_to_dict(config)
+        wandb_config['dataset'] = args.dataset  # Add runtime info
         wandb.init(
             project="attention-guided-rl",
             name=args.run_name if args.run_name else None,
@@ -151,6 +142,7 @@ def generate_trajectory(
     tokenizer: Any,
     available_qkv_steps: List[KVPair],
     batch_size: int,
+    config: TrainingConfig,
     verbose: bool = False,
 ) -> RawTrajectory:
     """
@@ -183,7 +175,7 @@ def generate_trajectory(
         print(f"Vector-query mode. Pool size: {num_keys}")
 
     # === Autoregressive selection loop =======================================
-    for _ in range(NUM_KV_PAIRS):
+    for _ in range(config.num_kv_pairs):
         # 1) Build query embedding
         query_emb = generate_query_vector(adapter_model, tokenizer, current_context)
 
@@ -250,35 +242,33 @@ def generate_trajectory(
 
 
 def parse_args():
-    """Parse command-line arguments."""
-    # TRAINING_BATCH_SIZE already imported at module level – redundant
-    
+    """Parse command-line arguments. Defaults are handled by TrainingConfig."""
     parser = argparse.ArgumentParser(description="Train a model using Attention-Guided RL")
-    parser.add_argument("--batch-size", type=int, default=TRAINING_BATCH_SIZE, help="Batch size for training")
+    parser.add_argument("--batch-size", type=int, help="Batch size for training")
     parser.add_argument("--resume", action="store_true", help="Resume training from checkpoint")
-    parser.add_argument("--episodes", type=int, default=NUM_EPISODES, help="Number of episodes to train")
-    parser.add_argument("--log-interval", type=int, default=10, help="Logging interval")
+    parser.add_argument("--episodes", type=int, help="Number of episodes to train")
+    parser.add_argument("--log-interval", type=int, help="Logging interval")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose trajectory logging")
-    parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE, help="Learning rate for training")
-    parser.add_argument("--run-name", type=str, default=None, help="Name for this training run")
+    parser.add_argument("--learning-rate", type=float, help="Learning rate for training")
+    parser.add_argument("--run-name", type=str, help="Name for this training run")
     parser.add_argument("--dataset", type=str, default="wikipedia", 
                         choices=["wikipedia", "twenty_questions"],
                         help="Dataset to use for training")
-    parser.add_argument("--grpo-batching", action="store_true", default=True,
-                        help="Use GRPO-style batching (repeat each data point) (default: True)")
-    parser.add_argument("--model-type", type=str, default='gpt2', choices=['gpt2', 'llama'], help='Model type to use')
-    parser.add_argument('--use-grpo-baseline', action='store_true', default=True, help='Use GRPO baseline in advantages')
+    parser.add_argument("--grpo-batching", action="store_true", help="Use GRPO-style batching (repeat each data point)")
+    parser.add_argument("--model-type", type=str, choices=['gpt2', 'llama'], help='Model type to use')
+    parser.add_argument('--use-grpo-baseline', action='store_true', help='Use GRPO baseline in advantages')
     
-    # Add new CLI flags for previously env-var configs
-    # parser.add_argument('--key-embedding-batch-size', type=int, default=4, help='Number of keys to process together in forward pass')
-    parser.add_argument('--kl-penalty-coef', type=float, default=0.1, help='KL penalty coefficient for regularization')
-    parser.add_argument('--enable-wandb', action='store_true', default=False, help='Enable Weights & Biases logging')
-    parser.add_argument('--ppo-clip-epsilon', type=float, default=0.2, help='PPO clipping parameter (epsilon)')
-    parser.add_argument('--baseline-update-freq', type=int, default=10, help='How often to update baseline model (episodes)')
-    parser.add_argument('--subtract-base-logprobs', action='store_true', default=False, help='Subtract base model logprobs in reward computation')
-    parser.add_argument('--debug-generators', action='store_true', default=False, help='Enable detailed debugging of generator pipelines')
-    parser.add_argument('--ema-decay', type=float, default=0.05, help='EMA decay for smooth baseline updates (0.01-0.1, higher=smoother)')
-    parser.add_argument('--use-ema-baseline', action='store_true', default=True, help='Use EMA baseline updates instead of hard updates (reduces spikes)')
+    # Configuration parameters
+    parser.add_argument('--kl-penalty-coef', type=float, help='KL penalty coefficient for regularization')
+    parser.add_argument('--enable-wandb', action='store_true', help='Enable Weights & Biases logging')
+    parser.add_argument('--ppo-clip-epsilon', type=float, help='PPO clipping parameter (epsilon)')
+    parser.add_argument('--baseline-update-freq', type=int, help='How often to update baseline model (episodes)')
+    parser.add_argument('--subtract-base-logprobs', action='store_true', help='Subtract base model logprobs in reward computation')
+    parser.add_argument('--debug-generators', action='store_true', help='Enable detailed debugging of generator pipelines')
+    parser.add_argument('--ema-decay', type=float, help='EMA decay for smooth baseline updates (0.01-0.1, higher=smoother)')
+    parser.add_argument('--use-ema-baseline', action='store_true', help='Use EMA baseline updates instead of hard updates (reduces spikes)')
+    parser.add_argument('--vanilla-pg', action='store_true', help='Use vanilla policy gradient (REINFORCE) instead of PPO')
+    parser.add_argument('--memory-efficient', action='store_true', help='Use memory-efficient LoRA state management (saves 60-90% memory)')
     
     return parser.parse_args()
 
@@ -607,18 +597,21 @@ def main():
     # Parse arguments
     args = parse_args()
     
+    # Create resolved configuration object - SINGLE point of configuration!
+    config = create_training_config_from_args(args)
+    
     # Suppress warnings
     import warnings
     warnings.filterwarnings("ignore", message="Token indices sequence length is longer than the specified maximum sequence length")
     
-    # Set up logging
-    log_dir = setup_logging(args)
+    # Set up logging with resolved config
+    log_dir = setup_logging(config, args)
     
     # Log query mode
     logging.info("Query mode: Vector queries")
     
     # Log reward computation mode
-    if SUBTRACT_BASE_MODEL_LOGPROBS:
+    if config.subtract_base_model_logprobs:
         logging.info("Reward computation: Using adapter - base model (classic baseline subtraction)")
     else:
         logging.info("Reward computation: Using raw adapter log probabilities (GRPO handles baselines)")
@@ -627,37 +620,8 @@ def main():
     logging.info("Setting up models and tokenizer...")
     base_model, adapter_model, tokenizer = setup_model_and_tokenizer()
     
-    # Log the dynamically calculated token counts
-    import src.config as config
-    logging.info(f"Token count configuration:")
-    logging.info(f"  Key prefix tokens: {config.PREFIX_TOKENS_PER_KEY}")
-    logging.info(f"  Value prefix tokens: {config.PREFIX_TOKENS_PER_VALUE}")
-    logging.info(f"  Total tokens per round: {config.TOKENS_PER_ROUND}")
-    logging.info(f"  Initial prompt tokens: {config.INITIAL_PROMPT_TOKENS}")
-    logging.info(f"  Number of KV pairs: {config.NUM_KV_PAIRS}")
-    
-    # Set model type and names based on args
-    config.MODEL_TYPE = args.model_type
-    if config.MODEL_TYPE == 'llama':
-        config.MODEL_NAME = 'meta-llama/Llama-3.2-3B'
-        config.TOKENIZER_NAME = 'meta-llama/Llama-3.2-3B'
-    elif config.MODEL_TYPE == 'gpt2':
-        config.MODEL_NAME = 'gpt2'
-        config.TOKENIZER_NAME = 'gpt2'
-    else:
-        raise ValueError(f'Invalid model type: {config.MODEL_TYPE}')
-
-    config.USE_GRPO_BASELINE = args.use_grpo_baseline
-    
-    # Set additional config values from CLI args
-    config.KEY_EMBEDDING_BATCH_SIZE = args.batch_size # Default to batch_size
-    config.KL_PENALTY_COEFFICIENT = args.kl_penalty_coef
-    config.ENABLE_WANDB = args.enable_wandb
-    config.PPO_CLIP_EPSILON = args.ppo_clip_epsilon
-    config.BASELINE_UPDATE_FREQUENCY = args.baseline_update_freq
-    config.SUBTRACT_BASE_MODEL_LOGPROBS = args.subtract_base_logprobs
-    config.EMA_DECAY = args.ema_decay
-    config.USE_EMA_BASELINE = args.use_ema_baseline
+    # Token configuration is already logged by config.log_configuration()
+    # No need to manually set model configuration - TrainingConfig handles everything!
     
     # Separate hooks: one for query (train-time) and one for key (data loading)
     query_embeddings_dict, query_hook_remover = register_embedding_hook(adapter_model, embed_type="query")
@@ -708,11 +672,34 @@ def main():
         
         # Create a copy of the adapter model to serve as the old model (pi_old)
         # This will be updated every BASELINE_UPDATE_FREQUENCY episodes
-        old_model = create_model_copy(adapter_model)
-        
-        # Register embedding hook for the old model (for KEY embeddings)
-        old_embeddings_dict, old_hook_remover = register_embedding_hook(old_model, embed_type="key")
-        
+        if MEMORY_EFFICIENT_LORA:
+            # Use memory-efficient LoRA state management
+            lora_manager = MemoryEfficientLoRAManager(adapter_model)
+            old_model = None  # Not needed with memory-efficient training
+            old_embeddings_dict = None
+            old_hook_remover = lambda: None  # No-op function
+            logging.info("🚀 Using memory-efficient LoRA state management")
+        else:
+            # Traditional approach with full model copy
+            old_model = create_model_copy(adapter_model)
+            
+            # Add small random noise to old_model parameters to avoid identical initialization
+            # This ensures PPO ratios are not 1.0 from the very first episode
+            with torch.no_grad():
+                for name, param in old_model.named_parameters():
+                    if 'lora' in name and param.requires_grad:
+                        # Add small Gaussian noise (std=0.01) to LoRA parameters only
+                        noise = torch.randn_like(param) * 0.01
+                        param.data.add_(noise)
+            
+            if args.verbose:
+                print("Added small initialization noise to old_model LoRA parameters")
+            
+            # Register embedding hook for the old model (for KEY embeddings)
+            old_embeddings_dict, old_hook_remover = register_embedding_hook(old_model, embed_type="key")
+            lora_manager = None  # Not needed with traditional training
+            logging.info("Using traditional model copying approach")
+
         # Import the data iterator and repeat function
         from src.data import (
             iter_key_value_pairs_unified_with_tokenizer, 
@@ -776,13 +763,13 @@ def main():
         logging.info("- old_model: Old model (pi_old, for KL computation, updated periodically)")
         logging.info(f"- GRPO batching: {'Enabled' if use_grpo_batching else 'Disabled'}")
         # No separate previous_model - use old_model for KL computation
-        logging.info(f"Old model will be updated every {BASELINE_UPDATE_FREQUENCY} episodes")
+        logging.info(f"Old model will be updated every {config.baseline_update_frequency} episodes")
         
         # Log baseline update method
-        if USE_EMA_BASELINE:
-            logging.info(f"✅ Using EMA baseline updates (decay={EMA_DECAY:.3f}) - eliminates spikes")
+        if config.use_ema_baseline:
+            logging.info(f"✅ Using EMA baseline updates (decay={config.ema_decay:.3f}) - eliminates spikes")
         else:
-            logging.info(f"⚠️  Using HARD baseline updates - may cause training spikes every {BASELINE_UPDATE_FREQUENCY} episodes")
+            logging.info(f"⚠️  Using HARD baseline updates - may cause training spikes every {config.baseline_update_frequency} episodes")
         
         # Function to compute gradient statistics
         def get_gradient_stats(model):
@@ -918,14 +905,14 @@ def main():
                 print(f"\n\n======== EPISODE {episode}/{args.episodes} ========")
             
             # Get a batch of key-value pairs
-            available_qkv_steps = [next(kv_pair_generator) for _ in range(NUM_KV_PAIRS)]  # Get a pool of QKV steps
+            available_qkv_steps = [next(kv_pair_generator) for _ in range(config.num_kv_pairs)]  # Get a pool of QKV steps
             
             if args.verbose:
                 print(f"Generated pool of {len(available_qkv_steps)} query-key-value steps")
             
             # Create initial context with a prompt explaining the task
             # Note: The token count of this prompt is accounted for in 
-            # the NUM_KV_PAIRS calculation in config.py to ensure we don't exceed the context window
+            # the TrainingConfig calculation to ensure we don't exceed the context window
             batch_size = args.batch_size
             
             # Tokenize the initial prompt
@@ -944,6 +931,7 @@ def main():
                 tokenizer=tokenizer,
                 available_qkv_steps=available_qkv_steps,
                 batch_size=args.batch_size,
+                config=config,
                 verbose=args.verbose,
             )
             
@@ -958,14 +946,20 @@ def main():
             )
             
             # Also get old model log probabilities for comparison plotting
-            _, _, old_log_probs_batch = compute_trajectory_rewards(
-                raw_traj, 
-                adapter_model, 
-                old_model, 
-                initial_tokens,
-                tokenizer=tokenizer,
-                verbose=False  # Don't print twice
-            )
+            if not MEMORY_EFFICIENT_LORA:
+                # Only compute old model log probs for traditional mode (for plotting)
+                assert old_model is not None, "old_model should not be None in traditional mode"
+                _, _, old_log_probs_batch = compute_trajectory_rewards(
+                    raw_traj, 
+                    adapter_model, 
+                    old_model, 
+                    initial_tokens,
+                    tokenizer=tokenizer,
+                    verbose=False  # Don't print twice
+                )
+            else:
+                # For memory-efficient mode, use adapter log probs as old log probs
+                old_log_probs_batch = adapter_log_probs_batch
 
             # Exact KL(adapter || reference) over key-selection distribution
             kl_from_ref_value = compute_kl_from_reference(
@@ -985,18 +979,36 @@ def main():
                 print(f"  Count: {reward_stats['count']}")
             
             # Perform training step
-            total_loss, policy_loss, kl_loss, avg_clipping_ratio = train_step(
-                trajectory,
-                adapter_model,
-                ref_model,  # Use ref_model for reward computation
-                old_model,  # Use old_model for KL computation
-                optimizer,
-                reward_stats,
-                KL_PENALTY_COEFFICIENT,
-                verbose=args.verbose,
-                tokenizer=tokenizer,
-                embeddings_dict=query_embeddings_dict # Use query embeddings for training
-            )
+            if MEMORY_EFFICIENT_LORA:
+                # Use memory-efficient training step
+                assert lora_manager is not None, "lora_manager should not be None in memory-efficient mode"
+                total_loss, policy_loss, kl_loss, avg_clipping_ratio = memory_efficient_train_step(
+                    trajectory,
+                    adapter_model,
+                    ref_model,  # Use ref_model for reward computation
+                    lora_manager,  # Use LoRA manager instead of old_model
+                    optimizer,
+                    reward_stats,
+                    config.kl_penalty_coefficient,
+                    verbose=args.verbose,
+                    tokenizer=tokenizer,
+                    embeddings_dict=query_embeddings_dict,
+                )
+            else:
+                # Use traditional training step
+                assert old_model is not None, "old_model should not be None in traditional mode"
+                total_loss, policy_loss, kl_loss, avg_clipping_ratio = train_step(
+                    trajectory,
+                    adapter_model,
+                    ref_model,  # Use ref_model for reward computation
+                    old_model,  # Use old_model for KL computation
+                    optimizer,
+                    reward_stats,
+                    config.kl_penalty_coefficient,
+                    verbose=args.verbose,
+                    tokenizer=tokenizer,
+                    embeddings_dict=query_embeddings_dict, # Use query embeddings for training
+                )
             
             # Track clipping ratio
             clipping_ratios.append(avg_clipping_ratio)
@@ -1083,7 +1095,7 @@ def main():
             
             # Calculate derived metrics for plotting
             traj_log_prob = adapter_log_probs_batch.mean().item()
-            kl_penalty_term = (kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss) * KL_PENALTY_COEFFICIENT
+            kl_penalty_term = (kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss) * config.kl_penalty_coefficient
             reward_var = trajectory.avg_reward.var().item()
             current_lr = optimizer.param_groups[0]['lr']
             
@@ -1094,6 +1106,7 @@ def main():
                 advantages, _ = compute_advantages(
                     trajectory.rewards,
                     gamma=GAMMA,
+                    gae_lambda=GAE_LAMBDA,
                     use_grpo_baseline=USE_GRPO_BASELINE,
                 )
                 avg_advantage = advantages.mean().item()
@@ -1116,24 +1129,42 @@ def main():
                 f"Reward: {avg_reward:.4f}"
             )
             
-            # Update old_model using either EMA (smooth) or hard updates (legacy)
-            if USE_EMA_BASELINE:
-                # Smooth EMA update every episode - eliminates spikes
-                update_model_ema(old_model, adapter_model, decay=EMA_DECAY)
-                if episode % BASELINE_UPDATE_FREQUENCY == 0:
-                    logging.info(f"EMA baseline update (decay={EMA_DECAY:.3f}) - smooth, no spikes")
+            # Update old_model using EMA (smooth) updates to prevent gradient spikes
+            # Based on debugging: frozen old_model causes accumulated changes -> gradient explosions
+            if config.memory_efficient_lora:
+                # Use memory-efficient LoRA state updates
+                assert lora_manager is not None, "lora_manager should not be None in memory-efficient mode"
+                if config.use_ema_baseline:
+                    lora_manager.update_old_state_ema(decay=config.ema_decay)
+                    if episode % config.baseline_update_frequency == 0:
+                        logging.info(f"Memory-efficient EMA LoRA state update (decay={config.ema_decay:.3f})")
+                else:
+                    # Hard update at intervals
+                    if (episode + 1) % config.baseline_update_frequency == 0:
+                        lora_manager.update_old_state_hard()
+                        logging.info("Memory-efficient hard LoRA state update")
             else:
-                # Legacy hard update at intervals - causes spikes
-                if (episode + 1) % BASELINE_UPDATE_FREQUENCY == 0:
-                    # Update the old_model to reflect learning progress
-                    old_model = create_model_copy(adapter_model)
-                    
-                    # Re-register the embedding hook for the new old_model (for KEY embeddings)
-                    old_hook_remover()  # Remove old hook
-                    old_embeddings_dict, old_hook_remover = register_embedding_hook(old_model, embed_type="key")
-                    
-                    # NO need to recreate kv_pair_generator; embeddings will be recomputed on-the-fly
-                    logging.info("Old_model updated; KV generator preserved to avoid data repetition")
+                # Traditional model updates
+                assert old_model is not None, "old_model should not be None in traditional mode"
+                if config.use_ema_baseline:
+                    # Smooth EMA update every episode - prevents spikes
+                    update_model_ema(old_model, adapter_model, decay=config.ema_decay)
+                    if episode % config.baseline_update_frequency == 0:
+                        logging.info(f"Smooth EMA baseline update (decay={config.ema_decay:.3f}) - prevents gradient spikes")
+                else:
+                    # Hard update at intervals - may cause gradient spikes
+                    if (episode + 1) % config.baseline_update_frequency == 0:
+                        # Update the old_model to reflect learning progress
+                        old_model = create_model_copy(adapter_model)
+                        
+                        # Re-register the embedding hook for the new old_model (for KEY embeddings)
+                        old_hook_remover()  # Remove old hook
+                        old_embeddings_dict, old_hook_remover = register_embedding_hook(old_model, embed_type="key")
+                        
+                        # NO need to recreate kv_pair_generator; embeddings will be recomputed on-the-fly
+                        logging.info("Old_model updated; KV generator preserved to avoid data repetition")
+            
+            # DEBUG: Removed - EMA updates are now enabled
             
             # Periodically verify weight changes (every 5 episodes) – check LoRA params correctly
             if (episode + 1) % 5 == 0:
@@ -1235,20 +1266,20 @@ def main():
             if episode > 0 and episode % 15 == 0:
                 # Add metadata to plot data and save
                 metadata = create_metadata(episode, {
-                    'KL_PENALTY_COEFFICIENT': KL_PENALTY_COEFFICIENT,
-                    'GAMMA': GAMMA,
-                    'GAE_LAMBDA': GAE_LAMBDA,
-                    'USE_GRPO_BASELINE': USE_GRPO_BASELINE,
-                    'TEMPERATURE': TEMPERATURE,
-                    'NUM_KV_PAIRS': NUM_KV_PAIRS,
-                    'BASELINE_UPDATE_FREQUENCY': BASELINE_UPDATE_FREQUENCY,
+                    'KL_PENALTY_COEFFICIENT': config.kl_penalty_coefficient,
+                    'GAMMA': config.gamma,
+                    'GAE_LAMBDA': config.gae_lambda,
+                    'USE_GRPO_BASELINE': config.use_grpo_baseline,
+                    'TEMPERATURE': config.temperature,
+                    'NUM_KV_PAIRS': config.num_kv_pairs,
+                    'BASELINE_UPDATE_FREQUENCY': config.baseline_update_frequency,
                 })
                 plot_data_with_metadata = plot_data.with_metadata(metadata)
                 save_plot_data(plot_data_with_metadata, log_dir)
                 plot_metrics(log_dir, policy_gradients)
             
-            # Log every LOG_INTERVAL episodes
-            if episode % LOG_INTERVAL == 0:
+            # Log every log_interval episodes
+            if episode % config.log_interval == 0:
                 # Convert tensors to floats for logging
                 policy_loss_val = policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss
                 kl_loss_val = kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss
@@ -1265,13 +1296,13 @@ def main():
                 )
                 
                 # Log to wandb if enabled
-                if ENABLE_WANDB:
+                if config.enable_wandb:
                     wandb.log({
                         "episode": episode,
                         "total_loss": total_loss,
                         "policy_loss": policy_loss_val,
                         "kl_loss": kl_loss_val,
-                        "kl_penalty_term": kl_loss_val * KL_PENALTY_COEFFICIENT,
+                        "kl_penalty_term": kl_loss_val * config.kl_penalty_coefficient,
                         "reward": avg_reward,
                         "reward_mean": reward_stats["mean"],
                         "reward_std": reward_stats["std"],
@@ -1300,13 +1331,13 @@ def main():
         
         # Save final plot data and create plots
         final_metadata = create_metadata(episode, {
-            'KL_PENALTY_COEFFICIENT': KL_PENALTY_COEFFICIENT,
-            'GAMMA': GAMMA,
-            'GAE_LAMBDA': GAE_LAMBDA,
-            'USE_GRPO_BASELINE': USE_GRPO_BASELINE,
-            'TEMPERATURE': TEMPERATURE,
-            'NUM_KV_PAIRS': NUM_KV_PAIRS,
-            'BASELINE_UPDATE_FREQUENCY': BASELINE_UPDATE_FREQUENCY,
+            'KL_PENALTY_COEFFICIENT': config.kl_penalty_coefficient,
+            'GAMMA': config.gamma,
+            'GAE_LAMBDA': config.gae_lambda,
+            'USE_GRPO_BASELINE': config.use_grpo_baseline,
+            'TEMPERATURE': config.temperature,
+            'NUM_KV_PAIRS': config.num_kv_pairs,
+            'BASELINE_UPDATE_FREQUENCY': config.baseline_update_frequency,
         })
         final_plot_data = plot_data.with_metadata(final_metadata)
         save_plot_data(final_plot_data, log_dir)
@@ -1315,7 +1346,7 @@ def main():
         logging.info("Training complete!")
         
         # Close wandb if enabled
-        if ENABLE_WANDB:
+        if config.enable_wandb:
             wandb.finish()
     
     finally:

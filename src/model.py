@@ -134,6 +134,65 @@ def load_model_adapter(model, path):
     model.load_state_dict(state_dict)
     return model
 
+def save_lora_state(model):
+    """
+    Extract and return only the LoRA adapter state from a model.
+    
+    Args:
+        model: The model with LoRA adapter
+        
+    Returns:
+        Dict containing only LoRA adapter parameters
+    """
+    lora_state = {}
+    for name, param in model.named_parameters():
+        if 'lora_' in name:  # Only LoRA parameters
+            lora_state[name] = param.data.clone()
+    return lora_state
+
+
+def load_lora_state(model, lora_state):
+    """
+    Load LoRA adapter state into a model.
+    
+    Args:
+        model: The model with LoRA adapter to update
+        lora_state: Dict containing LoRA parameters
+    """
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name in lora_state:
+                param.data.copy_(lora_state[name])
+
+
+def update_lora_ema(target_model: torch.nn.Module, source_model: torch.nn.Module, decay: float = 0.95) -> None:
+    """
+    Update target_model LoRA parameters using exponential moving average from source_model.
+    Memory-efficient: only updates LoRA parameters, not base model weights.
+    
+    Args:
+        target_model: Model to update (old_model/baseline) 
+        source_model: Model to copy from (current adapter_model)
+        decay: EMA decay factor (0.9-0.99 typical, higher = smoother)
+               target = decay * target + (1 - decay) * source
+    """
+    import logging
+    
+    updated_count = 0
+    
+    with torch.no_grad():
+        for (target_name, target_param), (source_name, source_param) in zip(
+            target_model.named_parameters(), source_model.named_parameters()
+        ):
+            # Only update LoRA parameters
+            if 'lora_' in target_name and 'lora_' in source_name:
+                if target_param.dtype.is_floating_point and source_param.dtype.is_floating_point:
+                    target_param.data.mul_(decay).add_(source_param.data, alpha=1 - decay)
+                    updated_count += 1
+    
+    logging.debug(f"LoRA EMA update: {updated_count} LoRA parameters updated")
+
+
 def create_model_copy(model):
     """
     Create a deep copy of the model with adapter parameters.
@@ -146,12 +205,13 @@ def create_model_copy(model):
     """
     return copy.deepcopy(model)
 
+
 def update_model_ema(target_model: torch.nn.Module, source_model: torch.nn.Module, decay: float = 0.95) -> None:
     """
     Update target_model parameters using exponential moving average from source_model.
     
     This provides smooth parameter updates instead of hard replacements, reducing training spikiness.
-    Handles quantized parameters properly by only updating floating-point parameters.
+    Memory-efficient: only updates LoRA parameters, not quantized base model weights.
     
     Args:
         target_model: Model to update (old_model/baseline)
@@ -159,35 +219,8 @@ def update_model_ema(target_model: torch.nn.Module, source_model: torch.nn.Modul
         decay: EMA decay factor (0.9-0.99 typical, higher = smoother)
                target = decay * target + (1 - decay) * source
     """
-    import logging
-    
-    updated_count = 0
-    skipped_count = 0
-    
-    with torch.no_grad():
-        for (target_name, target_param), (source_name, source_param) in zip(
-            target_model.named_parameters(), source_model.named_parameters()
-        ):
-            # Skip quantized parameters - they need special handling
-            is_quantized_param = (
-                hasattr(target_param, 'quant_state') or 
-                hasattr(source_param, 'quant_state') or
-                'Int8Params' in str(type(target_param)) or
-                'Params4bit' in str(type(target_param))
-            )
-            
-            if is_quantized_param:
-                skipped_count += 1
-                continue
-            
-            # Only update floating-point parameters to avoid dtype casting errors
-            if target_param.dtype.is_floating_point and source_param.dtype.is_floating_point:
-                target_param.data.mul_(decay).add_(source_param.data, alpha=1 - decay)
-                updated_count += 1
-            else:
-                skipped_count += 1
-    
-    logging.debug(f"EMA update: {updated_count} parameters updated, {skipped_count} skipped")
+    # Use the memory-efficient LoRA-only EMA update
+    update_lora_ema(target_model, source_model, decay)
 
 
 def setup_model_and_tokenizer():

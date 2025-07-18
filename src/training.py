@@ -337,6 +337,7 @@ def compute_returns(rewards: torch.Tensor, gamma: float = 0.99) -> torch.Tensor:
 def compute_advantages(
     rewards: torch.Tensor,
     gamma: float = 0.99,
+    gae_lambda: float = 0.95,
     use_grpo_baseline: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -345,7 +346,8 @@ def compute_advantages(
     Args:
         rewards: Tensor of rewards [batch_size, num_steps]
         gamma: Discount factor
-        use_grpo_baseline: If True and values is None, use GRPO-style per-timestep batch average
+        gae_lambda: GAE lambda parameter for bias-variance tradeoff
+        use_grpo_baseline: If True, use GRPO-style per-timestep batch average
         
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: (advantages, returns)
@@ -355,7 +357,25 @@ def compute_advantages(
     if use_grpo_baseline:
         # GRPO-style: per-timestep batch mean as baseline
         baseline = returns.mean(dim=0, keepdim=True)
-        advantages = returns - baseline
+        
+        if gae_lambda < 1.0:
+            # Modified GAE without value function:
+            # Use exponentially weighted combination of future returns
+            batch_size, num_steps = rewards.shape
+            advantages = torch.zeros_like(rewards)
+            
+            # Work backwards from the end
+            for t in reversed(range(num_steps)):
+                if t == num_steps - 1:
+                    # Last step: just use the return minus baseline
+                    advantages[:, t] = returns[:, t] - baseline[:, t]
+                else:
+                    # GAE-style: combine current advantage with future
+                    delta = rewards[:, t] + gamma * baseline[:, t + 1] - baseline[:, t]
+                    advantages[:, t] = delta + gamma * gae_lambda * advantages[:, t + 1]
+        else:
+            # Standard Monte Carlo (lambda = 1.0)
+            advantages = returns - baseline
     else:
         # Simpler: subtract per-trajectory mean then normalize
         advantages = returns - returns.mean(dim=1, keepdim=True)
@@ -421,6 +441,7 @@ def compute_policy_loss(
     advantages, _ = compute_advantages(
         trajectory.rewards, 
         gamma=gamma,
+        gae_lambda=GAE_LAMBDA,
         use_grpo_baseline=USE_GRPO_BASELINE
     )
     
@@ -555,34 +576,53 @@ def compute_policy_loss(
 
         step_advantages = advantages[:, t].to(device)
 
-        # Compute probability ratio: pi_theta(a|s) / pi_old(a|s)
-        log_ratio = current_action_log_probs - old_action_log_probs
-        ratio = torch.exp(log_ratio)
+        # Import config dynamically to get the current USE_PPO setting
+        import src.config as config
         
-        # PPO clipped surrogate objective
-        clipped_ratio = torch.clamp(ratio, 1.0 - PPO_CLIP_EPSILON, 1.0 + PPO_CLIP_EPSILON)
+        if config.USE_PPO:
+            # PPO: Use ratio clipping
+            # Compute probability ratio: pi_theta(a|s) / pi_old(a|s)
+            log_ratio = current_action_log_probs - old_action_log_probs
+            ratio = torch.exp(log_ratio)
+            
+            # PPO clipped surrogate objective
+            clipped_ratio = torch.clamp(ratio, 1.0 - PPO_CLIP_EPSILON, 1.0 + PPO_CLIP_EPSILON)
+            
+            # Track clipping ratios for monitoring
+            all_clipping_ratios.extend(ratio.detach().cpu().tolist())
+            
+            # Compute both unclipped and clipped surrogate terms
+            unclipped_surrogate = ratio * step_advantages
+            clipped_surrogate = clipped_ratio * step_advantages
+            
+            # Take the minimum (more conservative update)
+            ppo_surrogate = torch.min(unclipped_surrogate, clipped_surrogate)
+            
+            # Sum over batch (not average) - PPO typically sums over trajectory
+            batch_policy_gradient = ppo_surrogate.sum()  # Sum over batch
+            
+            if verbose and t == 0:  # Print info for first step
+                print(f"PPO ratio mean: {ratio.mean().item():.4f}, std: {ratio.std().item():.4f}")
+                print(f"Clipped ratio range: [{clipped_ratio.min().item():.4f}, {clipped_ratio.max().item():.4f}]")
+                print(f"KL divergence vs ref (masked): {kl_step.item():.4f}")
+        else:
+            # Vanilla Policy Gradient (REINFORCE): No ratio clipping
+            # Direct policy gradient: log π(a|s) * A(s,a)
+            vanilla_policy_gradient = current_action_log_probs * step_advantages
+            batch_policy_gradient = vanilla_policy_gradient.sum()  # Sum over batch
+            
+            # Track "ratios" as 1.0 for monitoring compatibility
+            all_clipping_ratios.extend([1.0] * len(current_action_log_probs))
+            
+            if verbose and t == 0:  # Print info for first step
+                print(f"Vanilla PG: log_prob mean: {current_action_log_probs.mean().item():.4f}")
+                print(f"Advantages mean: {step_advantages.mean().item():.4f}, std: {step_advantages.std().item():.4f}")
+                print(f"KL divergence vs ref (masked): {kl_step.item():.4f}")
         
-        # Track clipping ratios for monitoring
-        all_clipping_ratios.extend(ratio.detach().cpu().tolist())
-        
-        # Compute both unclipped and clipped surrogate terms
-        unclipped_surrogate = ratio * step_advantages
-        clipped_surrogate = clipped_ratio * step_advantages
-        
-        # Take the minimum (more conservative update)
-        ppo_surrogate = torch.min(unclipped_surrogate, clipped_surrogate)
-        
-        # Sum over batch (not average) - PPO typically sums over trajectory
-        batch_policy_gradient = ppo_surrogate.sum()  # Sum over batch
         policy_loss = policy_loss + batch_policy_gradient  # Accumulate across timesteps
         
         # Accumulate KL divergence for this step
         kl_loss = kl_loss + kl_step  # accumulate KL
-        
-        if verbose and t == 0:  # Print info for first step
-            print(f"PPO ratio mean: {ratio.mean().item():.4f}, std: {ratio.std().item():.4f}")
-            print(f"Clipped ratio range: [{clipped_ratio.min().item():.4f}, {clipped_ratio.max().item():.4f}]")
-            print(f"KL divergence vs ref (masked): {kl_step.item():.4f}")
         
         count += 1
     
@@ -602,15 +642,21 @@ def compute_policy_loss(
         total_loss = total_policy_loss + kl_penalty_term
         
         if verbose:
-            print(f"\n=== PPO Loss Components ===")
+            # Import config dynamically for the current USE_PPO setting
+            import src.config as config
+            method_name = "PPO" if config.USE_PPO else "Vanilla PG"
+            print(f"\n=== {method_name} Loss Components ===")
             print(f"Policy gradient sum (before negation): {-total_policy_loss.item():.4f}")
             print(f"Policy loss (after negation): {total_policy_loss.item():.4f}")
             print(f"KL divergence loss: {total_kl_loss.item():.4f}")
             print(f"KL penalty coefficient: {kl_penalty_coef:.4f}")
             print(f"Total loss: {total_loss.item():.4f}")
             print(f"  = {total_policy_loss.item():.4f} + {kl_penalty_term.item():.4f}")
-            print(f"Average clipping ratio: {avg_clipping_ratio:.4f}")
-            print(f"=== End PPO Loss Components ===\n")
+            if config.USE_PPO:
+                print(f"Average clipping ratio: {avg_clipping_ratio:.4f}")
+            else:
+                print(f"Method: Vanilla Policy Gradient (no clipping)")
+            print(f"=== End {method_name} Loss Components ===\n")
             
         return total_loss, total_policy_loss, total_kl_loss, avg_clipping_ratio
     else:

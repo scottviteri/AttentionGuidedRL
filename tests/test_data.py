@@ -20,7 +20,7 @@ from src.data import (
     load_twenty_questions,
     get_twenty_questions_path,
 )
-from src.config import TOKENS_PER_KEY, TOKENS_PER_VALUE, KEY_EMBEDDING_BATCH_SIZE, NUM_KV_PAIRS
+from src.config import TOKENS_PER_KEY, TOKENS_PER_VALUE, NUM_KV_PAIRS
 
 
 def print_separator():

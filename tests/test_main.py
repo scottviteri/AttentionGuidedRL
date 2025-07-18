@@ -20,21 +20,16 @@ from src.config import NUM_KV_PAIRS, TOKENS_PER_KEY, TOKENS_PER_VALUE
 class MockArgs:
     """Mock command-line arguments."""
     def __init__(self):
+        self.learning_rate = 2e-4
+        self.episodes = 50
         self.batch_size = 2
-        self.resume = False
-        self.episodes = 10
         self.log_interval = 5
         self.verbose = False
-        self.learning_rate = 0.001
-        self.training_percentile = 90.0
-        self.run_name = None
-        self.dataset = "wikipedia"  # Default dataset
-        self.use_vector_queries = False  # Default to False for backwards compatibility
-        self.grpo_batching = True  # Added for new frozen dataclass structure
+        self.run_name = "test_run"
+        self.dataset = "wikipedia"
+        self.grpo_batching = True
         self.model_type = 'gpt2'
         self.use_grpo_baseline = True
-        # Additional CLI args with their defaults
-        self.key_embedding_batch_size = 4
         self.kl_penalty_coef = 0.1
         self.enable_wandb = False
         self.ppo_clip_epsilon = 0.2

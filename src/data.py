@@ -30,7 +30,6 @@ from src.config import (
     VALUE_PREFIX,
     DEVICE,
     KV_EVERY_N,
-    KEY_EMBEDDING_BATCH_SIZE,
     KEY_PREFIX,
 )
 
@@ -273,8 +272,8 @@ def compute_embeddings(embedding_fn: Callable[[torch.Tensor], torch.Tensor], bat
         initial_mem_cached = torch.cuda.memory_reserved() if torch.cuda.is_available() else 0
 
         all_embeddings = []
-        for start_idx in range(0, NUM_KV_PAIRS, KEY_EMBEDDING_BATCH_SIZE):
-            end_idx = min(start_idx + KEY_EMBEDDING_BATCH_SIZE, NUM_KV_PAIRS)
+        for start_idx in range(0, NUM_KV_PAIRS, 12): # Use a reasonable default batch size
+            end_idx = min(start_idx + 12, NUM_KV_PAIRS)
             key_batch = torch.stack(all_keys[start_idx:end_idx], dim=0)
             key_batch_flat = key_batch.view(-1, TOKENS_PER_KEY)
             
