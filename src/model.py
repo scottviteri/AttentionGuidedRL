@@ -74,9 +74,6 @@ def apply_lora_adapter(model):
     Returns:
         The model with LoRA adapter applied
     """
-    # Create a deep copy of the model to avoid modifying the original
-    model_copy = copy.deepcopy(model)
-    
     # Configure LoRA
     lora_config = LoraConfig(
         r=CONFIG.lora_rank,
@@ -88,13 +85,14 @@ def apply_lora_adapter(model):
         init_lora_weights="gaussian",  # Use Gaussian initialization for more randomness
     )
     
-    # Apply LoRA adapter to the copy
-    model_copy = get_peft_model(model_copy, lora_config)
+    # Apply LoRA adapter directly to the model (no copying needed!)
+    # PEFT modifies the model in-place by adding LoRA layers
+    peft_model = get_peft_model(model, lora_config)
     
     # Note: LoRA weights are automatically initialized by PEFT's "gaussian" setting
     # No manual initialization needed - PEFT handles this correctly
     
-    return model_copy
+    return peft_model
 
 
 def save_model_adapter(model, path):

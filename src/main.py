@@ -23,7 +23,7 @@ import time # Import time for overall timing
 from src.config import CONFIG, TrainingConfig, create_training_config_from_args, log_training_config, training_config_to_dict
 from src.model import setup_model_and_tokenizer, save_checkpoint, load_checkpoint, create_model_copy, get_checkpoint_path, update_model_ema
 from src.data import KVPair, QKVSelection
-from src.embeddings import register_embedding_hook, compute_similarity, sample_key_value, extract_embeddings
+from src.embeddings import register_embedding_hook, compute_similarity, sample_key_value, extract_embeddings, get_attention_params
 from src.training import (
     RawTrajectory,
     Trajectory,  # for type hints
@@ -168,7 +168,12 @@ def generate_trajectory(
         query_emb = generate_query_vector(adapter_model, tokenizer, current_context)
 
         # 2) Compute similarities
-        similarity_scores = compute_similarity(query_emb, traj.all_key_embeddings, adapter_model)
+        # Get attention parameters from the adapter model
+        num_heads, num_groups, head_dim = get_attention_params(adapter_model)
+        # Create availability mask
+        available_mask = _build_available_mask(available_indices_per_batch, num_keys, device).clamp(min=-1e9)
+        similarity_scores = compute_similarity(query_emb, traj.all_key_embeddings, num_heads, num_groups, head_dim, 
+                                             availability_mask=available_mask)
 
         # 4) Sample an index per batch item, respecting already-used keys
         selected_indices, _ = sample_key_value(similarity_scores, available_indices_per_batch, batch_size)
@@ -182,11 +187,21 @@ def generate_trajectory(
 
         for b, idx in enumerate(selected_indices):
             kv = available_qkv_steps[idx]
-            selected_key_tokens.append(kv.key_tokens[0])
-            selected_value_tokens.append(kv.value_tokens[0])
-            selected_key_embeddings.append(kv.key_embedding[0])
-            selected_key_texts.append(kv.key_text[0])
-            selected_value_texts.append(kv.value_text[0])
+            # Handle both single-batch and multi-batch KVPairs
+            if kv.key_tokens.shape[0] == 1:
+                # Single batch - use index 0
+                selected_key_tokens.append(kv.key_tokens[0])
+                selected_value_tokens.append(kv.value_tokens[0])
+                selected_key_embeddings.append(kv.key_embedding[0])
+                selected_key_texts.append(kv.key_text[0])
+                selected_value_texts.append(kv.value_text[0])
+            else:
+                # Multi-batch - use batch index b
+                selected_key_tokens.append(kv.key_tokens[b])
+                selected_value_tokens.append(kv.value_tokens[b])
+                selected_key_embeddings.append(kv.key_embedding[b])
+                selected_key_texts.append(kv.key_text[b])
+                selected_value_texts.append(kv.value_text[b])
 
         selected_key_tokens = torch.stack(selected_key_tokens, dim=0)
         selected_value_tokens = torch.stack(selected_value_tokens, dim=0)
@@ -200,15 +215,12 @@ def generate_trajectory(
             value_text=selected_value_texts,
         )
 
-        # Use large negative value instead of -inf to keep log-softmax finite
-        available_mask = _build_available_mask(available_indices_per_batch, num_keys, device).clamp(min=-1e9)
-
         qkv_step = QKVSelection(
             data=step_data,
             query_embedding=query_emb,
             similarity_scores=similarity_scores,
             selected_idx=torch.tensor(selected_indices, device=device),
-            available_mask=available_mask,
+            available_mask=available_mask,  # Store the mask for later reference
         )
 
         # 6) Append to immutable trajectory
@@ -550,10 +562,12 @@ def compute_kl_from_reference(
         with torch.no_grad():
             ref_query = generate_query_vector(ref_model, tokenizer, context_tokens, layer_idx=-2)
             key_embs_full = all_key_embs.to(device)
-            ref_sims = compute_similarity(ref_query, key_embs_full, ref_model)  # [B, K]
-
-        if hasattr(step, "available_mask") and step.available_mask is not None:
-            ref_sims = ref_sims + step.available_mask.to(device)
+            # Get attention parameters from the reference model
+            num_heads, num_groups, head_dim = get_attention_params(ref_model)
+            # Apply availability mask inside compute_similarity for proper probability distribution
+            availability_mask = step.available_mask if hasattr(step, "available_mask") else None
+            ref_sims = compute_similarity(ref_query, key_embs_full, num_heads, num_groups, head_dim,
+                                        availability_mask=availability_mask)  # [B, K]
 
         ref_log_probs = ref_sims
 
@@ -602,7 +616,7 @@ def main():
     logging.info("Query mode: Vector queries")
     
     # Log reward computation mode
-    if CONFIG.training_config.subtract_base_model_logprobs:
+    if CONFIG.subtract_base_model_logprobs:
         logging.info("Reward computation: Using adapter - base model (classic baseline subtraction)")
     else:
         logging.info("Reward computation: Using raw adapter log probabilities (GRPO handles baselines)")

@@ -296,8 +296,11 @@ def get_gpt2_attention_params(model) -> Tuple[int, int, int]:
 def compute_similarity(
     query_embeddings: torch.Tensor,  # Shape: [batch, hidden_size]
     key_embeddings: torch.Tensor,  # Shape: [batch, num_keys, hidden_size]
-    model,
-    temperature: float = 1.0
+    num_heads: int,
+    num_groups: int, 
+    head_dim: int,
+    temperature: float = 1.0,
+    availability_mask: Optional[torch.Tensor] = None  # Shape: [batch, num_keys], 0 for available, -inf for unavailable
 ) -> torch.Tensor:  # Shape: [batch, num_keys]
     """
     Compute similarity between query and key embeddings using a fully batched approach
@@ -312,32 +315,82 @@ def compute_similarity(
     Args:
         query_embeddings: Query embeddings [batch, hidden_size]
         key_embeddings: Key embeddings [batch, num_keys, hidden_size]
-        model: The language model (used to get attention parameters)
+        num_heads: Number of attention heads
+        num_groups: Number of key-value groups (for GQA)
+        head_dim: Dimension per attention head
         temperature: Temperature parameter for softmax scaling. Higher temperature makes
                     the distribution more uniform, lower temperature makes it more peaked.
+        availability_mask: Optional mask with 0 for available keys, -inf for unavailable keys.
+                          Applied before softmax to ensure proper probability distributions.
         
     Returns:
-        Similarity scores as probabilities [batch, num_keys]
+        Similarity scores as log probabilities [batch, num_keys]
     """
-    # ---- DEBUG PRINT ----
-    # Print the shapes only once to avoid excessive logging
-    if not hasattr(compute_similarity, "_dbg_printed"):
-        print("[DEBUG] compute_similarity called")
-        print(f"         query_embeddings shape: {query_embeddings.shape}")
-        print(f"         key_embeddings  shape: {key_embeddings.shape}")
-        # We will fill in num_heads etc. after they are computed below
-        compute_similarity._dbg_printed = True
-    
     batch_size = query_embeddings.shape[0]
     num_keys = key_embeddings.shape[1]
     
-    # Get attention parameters
-    num_heads, num_groups, head_dim = get_attention_params(model)
-
-    # Complete the debug print once (num_heads etc.)
-    if getattr(compute_similarity, "_dbg_printed", False) and not getattr(compute_similarity, "_dbg_completed", False):
-        print(f"         num_heads={num_heads}, num_groups={num_groups}, head_dim={head_dim}")
-        compute_similarity._dbg_completed = True
+    # === DIMENSION VALIDATION ===
+    # Validate tensor shapes against GQA requirements
+    expected_query_hidden_size = num_heads * head_dim
+    expected_key_group_dim = num_groups * head_dim
+    
+    # Validate query embeddings shape
+    if query_embeddings.dim() != 2:
+        raise ValueError(
+            f"query_embeddings must be 2D tensor [batch, hidden_size], "
+            f"got {query_embeddings.dim()}D tensor with shape {query_embeddings.shape}"
+        )
+    
+    if query_embeddings.shape[1] != expected_query_hidden_size:
+        raise ValueError(
+            f"query_embeddings hidden_size mismatch: expected {expected_query_hidden_size} "
+            f"(num_heads={num_heads} * head_dim={head_dim}), "
+            f"got {query_embeddings.shape[1]} from shape {query_embeddings.shape}"
+        )
+    
+    # Validate key embeddings shape
+    if key_embeddings.dim() != 3:
+        raise ValueError(
+            f"key_embeddings must be 3D tensor [batch, num_keys, hidden_size], "
+            f"got {key_embeddings.dim()}D tensor with shape {key_embeddings.shape}"
+        )
+    
+    if key_embeddings.shape[0] != batch_size:
+        raise ValueError(
+            f"key_embeddings batch size mismatch: expected {batch_size}, "
+            f"got {key_embeddings.shape[0]} from shape {key_embeddings.shape}"
+        )
+    
+    # Validate key embeddings have sufficient dimensions for GQA
+    key_hidden_size = key_embeddings.shape[2]
+    if key_hidden_size < expected_key_group_dim:
+        raise ValueError(
+            f"key_embeddings hidden_size insufficient for GQA: need at least {expected_key_group_dim} "
+            f"(num_groups={num_groups} * head_dim={head_dim}), "
+            f"got {key_hidden_size} from shape {key_embeddings.shape}. "
+            f"This suggests key embeddings were computed with wrong attention parameters."
+        )
+    
+    # Validate that head-to-group mapping is valid
+    assert num_heads % num_groups == 0, (
+        f"Invalid GQA configuration: num_heads ({num_heads}) must be divisible by "
+        f"num_groups ({num_groups}) for proper head-to-group mapping"
+    )
+    
+    # Assert our key embedding structure assumption
+    # We assume key embeddings have GQA groups in the first num_groups * head_dim dimensions
+    assert key_hidden_size >= expected_key_group_dim, (
+        f"Key embedding assumption violated: expected at least {expected_key_group_dim} dimensions "
+        f"for GQA groups, got {key_hidden_size}"
+    )
+    
+    # Validate availability mask if provided
+    if availability_mask is not None:
+        if availability_mask.shape != (batch_size, num_keys):
+            raise ValueError(
+                f"availability_mask shape mismatch: expected {(batch_size, num_keys)}, "
+                f"got {availability_mask.shape}"
+            )
     
     # Ensure tensors are in float32 for computation (einsum doesn't handle bfloat16 well)
     query_embeddings = query_embeddings.float()
@@ -411,13 +464,19 @@ def compute_similarity(
     # Apply temperature scaling
     scaled_similarities = similarities / temperature
     
-    # Apply softmax per head [batch, num_heads, num_keys]
-    head_probabilities = F.softmax(scaled_similarities, dim=2)
+    # Apply availability mask BEFORE softmax for each head (this is the critical fix!)
+    if availability_mask is not None:
+        # Expand mask to match head dimension: [batch, num_keys] -> [batch, num_heads, num_keys]
+        expanded_mask = availability_mask.unsqueeze(1).expand(-1, num_heads, -1)
+        scaled_similarities = scaled_similarities + expanded_mask
     
-    # Average over heads to get final probabilities [batch, num_keys]
-    head_log_probs = torch.log(head_probabilities + 1e-8)
+    # Apply log_softmax per head [batch, num_heads, num_keys] 
+    head_log_probs = F.log_softmax(scaled_similarities, dim=2)
+    
+    # Average over heads to get final log probabilities [batch, num_keys]
+    # Using logsumexp for numerical stability: log(1/H * sum(exp(log_probs)))
     lse = torch.logsumexp(head_log_probs, dim=1)
-    log_probabilities = lse - torch.log(torch.tensor(num_heads, dtype=torch.float, device=lse.device))
+    log_probabilities = lse - math.log(num_heads)
     
     return log_probabilities
 

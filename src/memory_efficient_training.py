@@ -17,7 +17,7 @@ from src.training import (
     generate_query_vector,
     compute_trajectory_rewards as original_compute_trajectory_rewards
 )
-from src.embeddings import compute_similarity
+from src.embeddings import compute_similarity, get_attention_params
 from src.config import CONFIG
 
 
@@ -205,20 +205,22 @@ def memory_efficient_compute_policy_loss(
         
         # Compute similarities and log probabilities
         key_embs_full = trajectory.all_key_embeddings.to(device)
-        current_similarities = compute_similarity(current_query_embeddings, key_embs_full, adapter_model)
+        # Get attention parameters from the current adapter model
+        num_heads, num_groups, head_dim = get_attention_params(adapter_model)
+        # Apply availability mask inside compute_similarity for proper probability distribution
+        availability_mask = qkv_step.available_mask if hasattr(qkv_step, 'available_mask') else None
+        current_similarities = compute_similarity(current_query_embeddings, key_embs_full, num_heads, num_groups, head_dim,
+                                                availability_mask=availability_mask)
         
-        if hasattr(qkv_step, 'available_mask') and qkv_step.available_mask is not None:
-            masked_similarities = current_similarities + qkv_step.available_mask.to(device)
-        else:
-            masked_similarities = current_similarities
-        
-        current_log_probs_full = masked_similarities
+        current_log_probs_full = current_similarities
         
         # Get old model log probabilities 
         old_query_emb = old_query_embeddings[t]
-        old_similarities = compute_similarity(old_query_emb, key_embs_full, adapter_model)
-        old_masked_similarities = old_similarities + qkv_step.available_mask.to(device)
-        old_log_probs_full = old_masked_similarities
+        # Use the same attention parameters since we're using the same model with different LoRA state
+        # Apply same availability mask inside compute_similarity
+        old_similarities = compute_similarity(old_query_emb, key_embs_full, num_heads, num_groups, head_dim,
+                                            availability_mask=availability_mask)
+        old_log_probs_full = old_similarities
         
         # Extract action log probabilities
         selected_idx = qkv_step.selected_idx

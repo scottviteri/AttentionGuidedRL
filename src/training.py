@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from typing import List, Tuple, Optional, Any, Dict
 
 from src.data import RawTrajectory, Trajectory
-from src.embeddings import extract_embeddings, compute_similarity, register_embedding_hook
+from src.embeddings import extract_embeddings, compute_similarity, register_embedding_hook, get_attention_params
 from src.config import CONFIG, TrainingConfig
 
 
@@ -348,20 +348,21 @@ def compute_advantages(
         baseline = returns.mean(dim=0, keepdim=True)
         
         if gae_lambda < 1.0:
-            # Modified GAE without value function:
-            # Use exponentially weighted combination of future returns
+            # Standard GAE without value function - use rewards for temporal differences
             batch_size, num_steps = rewards.shape
             advantages = torch.zeros_like(rewards)
             
-            # Work backwards from the end
+            # Work backwards computing GAE advantages
             for t in reversed(range(num_steps)):
                 if t == num_steps - 1:
-                    # Last step: just use the return minus baseline
+                    # Last timestep: A_T = R_T - baseline_T
                     advantages[:, t] = returns[:, t] - baseline[:, t]
                 else:
-                    # GAE-style: combine current advantage with future
-                    delta = rewards[:, t] + gamma * baseline[:, t + 1] - baseline[:, t]
-                    advantages[:, t] = delta + gamma * gae_lambda * advantages[:, t + 1]
+                    # GAE recurrence: A_t = δ_t + γλA_{t+1}
+                    # where δ_t = r_t + γV_{t+1} - V_t
+                    # Since we don't have V, use baseline as proxy
+                    delta_t = rewards[:, t] + gamma * baseline[:, t + 1] - baseline[:, t]
+                    advantages[:, t] = delta_t + gamma * gae_lambda * advantages[:, t + 1]
         else:
             # Standard Monte Carlo (lambda = 1.0)
             advantages = returns - baseline
@@ -522,16 +523,15 @@ def compute_policy_loss(
         key_embs_full = trajectory.all_key_embeddings.to(device)  # [B, K, H]
 
         # 3) Compute similarities with gradient through adapter_model parameters
-        current_similarities = compute_similarity(current_query_embeddings, key_embs_full, adapter_model)
+        # Get attention parameters from the current adapter model
+        num_heads, num_groups, head_dim = get_attention_params(adapter_model)
+        # Apply availability mask inside compute_similarity for proper probability distribution
+        availability_mask = qkv_step.available_mask if hasattr(qkv_step, 'available_mask') else None
+        current_similarities = compute_similarity(current_query_embeddings, key_embs_full, num_heads, num_groups, head_dim, 
+                                                availability_mask=availability_mask)
 
-        # 4) Apply the availability mask
-        if hasattr(qkv_step, 'available_mask') and qkv_step.available_mask is not None:
-            masked_similarities = current_similarities + qkv_step.available_mask.to(device)
-        else:
-            masked_similarities = current_similarities
-
-        # Compute current policy log-probabilities (masked)
-        current_log_probs_full = masked_similarities
+        # Compute current policy log-probabilities (already properly masked)
+        current_log_probs_full = current_similarities
 
         selected_idx = qkv_step.selected_idx if hasattr(qkv_step, 'selected_idx') else torch.tensor([0]*batch_size, device=device)
         # Ensure selected_idx is tensor of shape [batch_size]
@@ -544,21 +544,25 @@ def compute_policy_loss(
 
         # Require full key embeddings
         key_embs_full = trajectory.all_key_embeddings.to(device)
-        old_similarities = compute_similarity(old_query_emb, key_embs_full, old_model)
+        # Get attention parameters from the old model
+        old_num_heads, old_num_groups, old_head_dim = get_attention_params(old_model)
+        # Apply same availability mask inside compute_similarity
+        old_similarities = compute_similarity(old_query_emb, key_embs_full, old_num_heads, old_num_groups, old_head_dim,
+                                            availability_mask=availability_mask)
 
-        # Apply same availability mask
-        old_masked_similarities = old_similarities + qkv_step.available_mask.to(device)
-
-        old_log_probs_full = old_masked_similarities
+        old_log_probs_full = old_similarities
 
         old_action_log_probs = old_log_probs_full[torch.arange(batch_size, device=device), selected_idx]
 
         # --- Compute reference-policy log-probabilities for KL divergence ---
         with torch.no_grad():
             ref_query_emb = generate_query_vector(ref_model, tokenizer, context_tokens, layer_idx=-2)
-            ref_similarities = compute_similarity(ref_query_emb, key_embs_full, ref_model)
-            ref_masked_similarities = ref_similarities + qkv_step.available_mask.to(device)
-            ref_log_probs_full = ref_masked_similarities
+            # Get attention parameters from the reference model
+            ref_num_heads, ref_num_groups, ref_head_dim = get_attention_params(ref_model)
+            # Apply same availability mask inside compute_similarity
+            ref_similarities = compute_similarity(ref_query_emb, key_embs_full, ref_num_heads, ref_num_groups, ref_head_dim,
+                                                availability_mask=availability_mask)
+            ref_log_probs_full = ref_similarities
 
         # Compute KL divergence between current and reference policies over available keys (masked)
         kl_step = F.kl_div(current_log_probs_full, ref_log_probs_full, reduction="batchmean", log_target=True)
