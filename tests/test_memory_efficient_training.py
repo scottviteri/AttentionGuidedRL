@@ -168,6 +168,12 @@ class TestMemoryEfficientTraining:
         class MockLoRAModel(torch.nn.Module):
             def __init__(self):
                 super().__init__()
+                # Add config attribute that get_attention_params expects
+                self.config = type('Config', (), {
+                    'n_head': 12,
+                    'n_embd': 768
+                })()
+                
                 self.base_layer = torch.nn.Linear(128, 128)
                 self.base_layer.requires_grad_(False)
                 self.lora_A = torch.nn.Parameter(torch.randn(8, 128))

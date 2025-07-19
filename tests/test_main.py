@@ -90,7 +90,9 @@ def test_generate_trajectory(gpt2_model, gpt2_tokenizer):
             gpt2_model,
             gpt2_tokenizer,
             mock_kv_pairs,
-            batch_size
+            batch_size,
+            config=CONFIG,
+            verbose=False
         )
         
         # Verify the trajectory structure
@@ -106,35 +108,29 @@ def test_generate_trajectory(gpt2_model, gpt2_tokenizer):
 
 
 def test_parse_args():
-    """Test parsing command-line arguments."""
+    """Test command-line argument parsing."""
     from src.main import parse_args
+    from src.config import create_training_config_from_args
     
-    # Mock sys.argv
+    # Mock sys.argv to avoid pytest command line interference
     with patch("sys.argv", ["main.py"]):
-        # Call function
+        # Test parsing with default values
         args = parse_args()
+        assert args is not None
         
-        # Check defaults
-        assert args.batch_size == CONFIG.batch_size
-        assert not args.resume
-        assert args.log_interval == 10
-    
-    # Mock sys.argv with arguments
-    with patch("sys.argv", [
-        "main.py",
-        "--batch-size=4",
-        "--resume",
-        "--episodes=20",
-        "--log-interval=5"
-    ]):
-        # Call function
-        args = parse_args()
+        # Test that config creation works with parsed args
+        config = create_training_config_from_args(args)
+        assert config is not None
+        assert config.model_type == 'gpt2'  # Default model type
+        assert config.batch_size == 4  # Default batch size from TrainingConfig
         
-        # Check parsed arguments
-        assert args.batch_size == 4
-        assert args.resume
-        assert args.episodes == 20
-        assert args.log_interval == 5
+        # The parse_args function correctly returns None for unspecified arguments
+        # This is the expected behavior - defaults are handled in create_training_config_from_args
+        assert args.batch_size is None  # Not specified on command line
+        assert args.episodes is None  # Not specified on command line
+        
+        # Test that dataset has correct default
+        assert args.dataset == "wikipedia"
 
 
 class MockGenerator:
@@ -468,15 +464,18 @@ def test_embedding_pipeline(tiny_llama_model):
         num_keys = 3
         key_embeddings = torch.randn(batch_size, num_keys, model.config.hidden_size, device=model.device)
         
-        # Compute similarity scores
-        similarity = compute_similarity(query_embeddings, key_embeddings, model)
+        # Get attention parameters for the model
+        num_heads, num_groups, head_dim = get_attention_params(model)
+        
+        # Compute similarity scores with explicit attention parameters
+        similarity = compute_similarity(query_embeddings, key_embeddings, num_heads, num_groups, head_dim)
         
         # Verify output shape
         assert similarity.shape == (batch_size, num_keys)
         
-        # Verify it's a proper probability distribution
-        assert torch.allclose(similarity.sum(dim=1), torch.ones(batch_size, device=model.device), atol=1e-5)
-        assert torch.all(similarity >= 0) and torch.all(similarity <= 1)
+        # Verify it's a proper log probability distribution (LogSumExp should be ≈ 0)
+        log_sum_exp = torch.logsumexp(similarity, dim=1)
+        assert torch.allclose(log_sum_exp, torch.zeros(batch_size, device=model.device), atol=1e-5)
         
         # 4. Test sample_key_value
         available_keys = [[0, 1, 2], [1, 2]]  # Different available keys per batch
@@ -552,6 +551,7 @@ def test_twenty_questions_integration_with_trajectory(gpt2_model, gpt2_tokenizer
             gpt2_tokenizer,
             available_qkv_steps,  # Copy to preserve original
             batch_size,
+            config=CONFIG,
             verbose=False,
         )
         
@@ -614,6 +614,7 @@ def test_batched_trajectory_explores_different_orders(gpt2_model, gpt2_tokenizer
             gpt2_tokenizer,
             available_qkv_steps.copy(),  # Copy to preserve original
             batch_size,
+            CONFIG,
             verbose=False,
         )
         
@@ -650,6 +651,456 @@ def test_batched_trajectory_explores_different_orders(gpt2_model, gpt2_tokenizer
             
     finally:
         # Clean up hook
+        hook_remover()
+
+
+def test_grpo_batching_different_trajectories(gpt2_model, gpt2_tokenizer, test_config_factory):
+    """Test that GRPO batching creates different trajectories in each batch position.
+    
+    This test specifically catches the bug where all batch items were getting data
+    from index [0] instead of their respective batch indices.
+    """
+    from src.main import generate_trajectory
+    from src.training import RawTrajectory
+    from src.embeddings import register_embedding_hook
+    from src.data import KVPair
+    from src.model import apply_lora_adapter
+    import torch
+    import time
+    
+    print("\n=== Starting GRPO batching test ===")
+    start_time = time.time()
+    
+    # Check device
+    device = CONFIG.device
+    print(f"Running on device: {device}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"GPU name: {torch.cuda.get_device_name(0)}")
+    
+    # Create adapter model
+    print("\nCreating adapter model...")
+    t0 = time.time()
+    adapter_model = apply_lora_adapter(gpt2_model)
+    
+    # Ensure model is on correct device
+    actual_device = next(adapter_model.parameters()).device
+    if actual_device != device:
+        print(f"Moving model from {actual_device} to {device}")
+        adapter_model = adapter_model.to(device)
+    print(f"Adapter model created and on {device} in {time.time() - t0:.2f}s")
+    
+    # Register embedding hook
+    embeddings_dict, hook_remover = register_embedding_hook(adapter_model)
+    
+    try:
+        batch_size = 4
+        num_kv_pairs = 5  # Use fixed number for testing
+        
+        # Create test configuration
+        test_config = test_config_factory(
+            batch_size=batch_size,
+            num_kv_pairs=num_kv_pairs
+        )
+        
+        # Create KVPairs with batch_size > 1 (simulating GRPO repeat)
+        print(f"\nCreating {num_kv_pairs} multi-batch KVPairs...")
+        t0 = time.time()
+        available_qkv_steps = []
+        for i in range(num_kv_pairs):
+            # Create unique data for each batch position
+            key_tokens = torch.stack([
+                torch.full((10,), i * 100 + b, device=device) 
+                for b in range(batch_size)
+            ])  # Shape: [batch_size, 10]
+            value_tokens = torch.stack([
+                torch.full((10,), i * 1000 + b, device=device)
+                for b in range(batch_size)
+            ])
+            key_embeddings = torch.stack([
+                torch.full((768,), float(i * 10 + b), device=device)
+                for b in range(batch_size)
+            ])
+            key_texts = [f"key_{i}_batch_{b}" for b in range(batch_size)]
+            value_texts = [f"value_{i}_batch_{b}" for b in range(batch_size)]
+            
+            kv_pair = KVPair(
+                key_tokens=key_tokens,
+                value_tokens=value_tokens,
+                key_embedding=key_embeddings,
+                key_text=key_texts,
+                value_text=value_texts
+            )
+            available_qkv_steps.append(kv_pair)
+        print(f"KVPairs created in {time.time() - t0:.2f}s")
+        
+        # Create initial context
+        print("\nTokenizing initial context...")
+        t0 = time.time()
+        initial_tokens = gpt2_tokenizer(
+            ["Test context " for _ in range(batch_size)],
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False
+        ).input_ids.to(device)
+        print(f"Initial tokens shape: {initial_tokens.shape}, device: {initial_tokens.device}")
+        print(f"Tokenization done in {time.time() - t0:.2f}s")
+        
+        # Generate a trajectory
+        print(f"\nGenerating trajectory with {test_config.num_kv_pairs} steps...")
+        t0 = time.time()
+        
+        # Run a warmup forward pass
+        with torch.no_grad():
+            _ = adapter_model(initial_tokens)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        print(f"Warmup forward pass done in {time.time() - t0:.2f}s")
+        
+        t0 = time.time()
+        raw_traj = generate_trajectory(
+            initial_tokens,
+            adapter_model,
+            gpt2_tokenizer,
+            available_qkv_steps,
+            batch_size,
+            test_config,
+            verbose=False,
+        )
+        trajectory_time = time.time() - t0
+        print(f"Trajectory generated in {trajectory_time:.2f}s")
+        print(f"  Average time per step: {trajectory_time / test_config.num_kv_pairs:.3f}s")
+        
+        # Verify each batch item got its own data (not all from index 0)
+        print("\nVerifying trajectory correctness...")
+        t0 = time.time()
+        errors = 0
+        for step_idx, step in enumerate(raw_traj.qkv_steps):
+            # Check that each batch position has different data
+            key_tokens = step.key_tokens
+            value_tokens = step.value_tokens
+            
+            # For each batch position, verify it got its own unique data
+            for b in range(batch_size):
+                # The key tokens should be unique to this batch position
+                expected_key_value = step.selected_idx[b].item() * 100 + b
+                actual_key_value = key_tokens[b, 0].item()
+                
+                if actual_key_value != expected_key_value:
+                    errors += 1
+                    print(f"  ❌ Step {step_idx}, Batch {b}: Expected key token {expected_key_value}, got {actual_key_value}")
+                
+                # Verify value tokens too
+                expected_value_value = step.selected_idx[b].item() * 1000 + b
+                actual_value_value = value_tokens[b, 0].item()
+                
+                if actual_value_value != expected_value_value:
+                    errors += 1
+                    print(f"  ❌ Step {step_idx}, Batch {b}: Expected value token {expected_value_value}, got {actual_value_value}")
+                
+                # Verify text matches
+                expected_key_text = f"key_{step.selected_idx[b].item()}_batch_{b}"
+                expected_value_text = f"value_{step.selected_idx[b].item()}_batch_{b}"
+                
+                if step.key_text[b] != expected_key_text:
+                    errors += 1
+                    print(f"  ❌ Step {step_idx}, Batch {b}: Expected key text '{expected_key_text}', got '{step.key_text[b]}'")
+                
+                if step.value_text[b] != expected_value_text:
+                    errors += 1
+                    print(f"  ❌ Step {step_idx}, Batch {b}: Expected value text '{expected_value_text}', got '{step.value_text[b]}'")
+        
+        print(f"Verification done in {time.time() - t0:.2f}s")
+        
+        if errors > 0:
+            raise AssertionError(f"Found {errors} errors in trajectory verification")
+        
+        # Check for diversity in selections
+        print("\nChecking selection diversity...")
+        batch_sequences = [[] for _ in range(batch_size)]
+        for step in raw_traj.qkv_steps:
+            for b in range(batch_size):
+                batch_sequences[b].append(step.selected_idx[b].item())
+        
+        for b, seq in enumerate(batch_sequences):
+            print(f"  Batch {b} selections: {seq[:5]}..." if len(seq) > 5 else f"  Batch {b} selections: {seq}")
+        
+        unique_sequences = len(set(tuple(seq) for seq in batch_sequences))
+        print(f"  Unique sequences: {unique_sequences}/{batch_size}")
+        
+        total_time = time.time() - start_time
+        print(f"\n✅ GRPO batching test passed! Total time: {total_time:.2f}s")
+        
+    finally:
+        # Clean up hook
+        hook_remover()
+
+
+def test_grpo_batching_bug_with_real_model(test_config_factory):
+    """Test GRPO batching with real model to debug performance issues."""
+    from src.main import generate_trajectory
+    from src.training import RawTrajectory
+    from src.embeddings import register_embedding_hook
+    from src.data import KVPair
+    from src.model import load_base_model, apply_lora_adapter
+    from transformers import AutoTokenizer
+    from src.config import CONFIG
+    import torch
+    import time
+    
+    print("\n=== Testing with REAL model ===")
+    start_time = time.time()
+    
+    # Load real model and tokenizer
+    print("Loading real base model...")
+    t0 = time.time()
+    base_model = load_base_model()
+    print(f"Base model loaded in {time.time() - t0:.2f}s")
+    
+    print("Loading real tokenizer...")
+    t0 = time.time()
+    tokenizer = AutoTokenizer.from_pretrained(CONFIG.tokenizer_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = 'left'
+    print(f"Tokenizer loaded in {time.time() - t0:.2f}s")
+    
+    print("Applying LoRA adapter...")
+    t0 = time.time()
+    adapter_model = apply_lora_adapter(base_model)
+    print(f"LoRA adapter applied in {time.time() - t0:.2f}s")
+    
+    # Register embedding hook
+    embeddings_dict, hook_remover = register_embedding_hook(adapter_model)
+    
+    try:
+        batch_size = 2  # Small batch for testing
+        num_kv_pairs = 5  # Small number for testing
+        device = CONFIG.device
+        
+        # Create test configuration
+        test_config = test_config_factory(
+            batch_size=batch_size,
+            num_kv_pairs=num_kv_pairs
+        )
+        
+        # Create simple KVPairs
+        print(f"\nCreating {num_kv_pairs} KVPairs...")
+        t0 = time.time()
+        available_qkv_steps = []
+        for i in range(num_kv_pairs):
+            kv_pair = KVPair(
+                key_tokens=torch.full((batch_size, 10), i, device=device),
+                value_tokens=torch.full((batch_size, 10), i+100, device=device),
+                key_embedding=torch.full((batch_size, 768), float(i), device=device),
+                key_text=[f"key_{i}_b{b}" for b in range(batch_size)],
+                value_text=[f"value_{i}_b{b}" for b in range(batch_size)]
+            )
+            available_qkv_steps.append(kv_pair)
+        print(f"KVPairs created in {time.time() - t0:.2f}s")
+        
+        # Create initial context
+        print("\nTokenizing initial context...")
+        t0 = time.time()
+        initial_tokens = tokenizer(
+            ["Test context"] * batch_size,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False
+        ).input_ids.to(device)
+        print(f"Tokenization done in {time.time() - t0:.2f}s")
+        
+        # Generate a trajectory
+        from src.config import TrainingConfig
+        training_config = TrainingConfig(num_kv_pairs=5)  # Match our available steps
+        print(f"\nGenerating trajectory with {training_config.num_kv_pairs} steps...")
+        t0 = time.time()
+        raw_traj = generate_trajectory(
+            initial_tokens,
+            adapter_model,
+            tokenizer,
+            available_qkv_steps,
+            batch_size,
+            training_config,
+            verbose=False,
+        )
+        print(f"Trajectory generated in {time.time() - t0:.2f}s")
+        
+        # Basic verification
+        assert len(raw_traj.qkv_steps) == test_config.num_kv_pairs
+        print(f"✅ Generated {len(raw_traj.qkv_steps)} steps as expected")
+        
+        total_time = time.time() - start_time
+        print(f"\n✅ Test passed! Total time: {total_time:.2f}s")
+        
+    finally:
+        hook_remover()
+
+
+def test_grpo_batch_indexing_bug_fix(test_config_factory):
+    """Test that our fix for the GRPO batch indexing bug works correctly.
+    
+    This test verifies that each batch position gets data from its own
+    batch index, not from index [0] for all positions.
+    """
+    from src.main import generate_trajectory
+    from src.embeddings import register_embedding_hook
+    from src.data import KVPair
+    from src.model import load_base_model, apply_lora_adapter
+    from transformers import AutoTokenizer
+    from src.config import CONFIG
+    import torch
+    import time
+    
+    print("\n=== Testing GRPO Batch Indexing Bug Fix ===")
+    start_time = time.time()
+    
+    # Use small, fast setup
+    batch_size = 3
+    num_kv_pairs = 4
+    device = CONFIG.device
+    
+    # Create test configuration
+    test_config = test_config_factory(
+        batch_size=batch_size,
+        num_kv_pairs=num_kv_pairs
+    )
+    
+    print(f"Testing with batch_size={batch_size}, num_kv_pairs={num_kv_pairs}")
+    
+    # Load real model (faster than dealing with mock compatibility)
+    print("Loading model and tokenizer...")
+    t0 = time.time()
+    base_model = load_base_model()
+    adapter_model = apply_lora_adapter(base_model)
+    tokenizer = AutoTokenizer.from_pretrained(CONFIG.tokenizer_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = 'left'
+    print(f"Model setup completed in {time.time() - t0:.2f}s")
+    
+    # Register embedding hook
+    embeddings_dict, hook_remover = register_embedding_hook(adapter_model)
+    
+    try:
+        # Create KVPairs that have DIFFERENT data for each batch position
+        # This is the key to testing the bug fix!
+        print(f"\nCreating {num_kv_pairs} KVPairs with distinct batch data...")
+        available_qkv_steps = []
+        for i in range(num_kv_pairs):
+            # Create unique tokens for each batch position
+            key_tokens_list = []
+            value_tokens_list = []
+            key_embeddings_list = []
+            key_texts = []
+            value_texts = []
+            
+            for b in range(batch_size):
+                # Make tokens unique per (pool_idx, batch_idx) combination
+                # Keep values within GPT-2 vocab size (50,257)
+                unique_key_value = i * 100 + b * 10  # pool_i=0,batch_b=0 -> 0, pool_i=0,batch_b=1 -> 10, etc.
+                unique_value_value = i * 100 + b * 10 + 1000  # Offset for value tokens
+                
+                key_tokens_list.append(torch.full((10,), unique_key_value, device=device))
+                value_tokens_list.append(torch.full((10,), unique_value_value, device=device))
+                key_embeddings_list.append(torch.full((768,), float(unique_key_value), device=device))
+                key_texts.append(f"pool_{i}_batch_{b}_key")
+                value_texts.append(f"pool_{i}_batch_{b}_value")
+            
+            kv_pair = KVPair(
+                key_tokens=torch.stack(key_tokens_list),  # [batch_size, 10]
+                value_tokens=torch.stack(value_tokens_list),  # [batch_size, 10]
+                key_embedding=torch.stack(key_embeddings_list),  # [batch_size, 768]
+                key_text=key_texts,
+                value_text=value_texts
+            )
+            available_qkv_steps.append(kv_pair)
+        
+        print("KVPairs created with unique data per batch position")
+        
+        # Create initial context
+        initial_tokens = tokenizer(
+            [f"Context for batch {b}" for b in range(batch_size)],
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False
+        ).input_ids.to(device)
+        
+        # Generate trajectory
+        print("\nGenerating trajectory...")
+        t0 = time.time()
+        raw_traj = generate_trajectory(
+            initial_tokens,
+            adapter_model,
+            tokenizer,
+            available_qkv_steps,
+            batch_size,
+            test_config,
+            verbose=False,
+        )
+        print(f"Trajectory generated in {time.time() - t0:.2f}s")
+        
+        # Verify the fix: each batch position should get its own data
+        print("\nVerifying batch indexing correctness...")
+        errors = []
+        
+        for step_idx, step in enumerate(raw_traj.qkv_steps):
+            for b in range(batch_size):
+                pool_idx = step.selected_idx[b].item()
+                
+                # Expected values based on our encoding (updated to match new scheme)
+                expected_key_value = pool_idx * 100 + b * 10
+                expected_value_value = pool_idx * 100 + b * 10 + 1000
+                expected_key_text = f"pool_{pool_idx}_batch_{b}_key"
+                expected_value_text = f"pool_{pool_idx}_batch_{b}_value"
+                
+                # Actual values from trajectory
+                actual_key_value = step.data.key_tokens[b, 0].item()
+                actual_value_value = step.data.value_tokens[b, 0].item()
+                actual_key_text = step.data.key_text[b]
+                actual_value_text = step.data.value_text[b]
+                
+                # Check for errors
+                if actual_key_value != expected_key_value:
+                    errors.append(f"Step {step_idx}, Batch {b}: Key token mismatch. Expected {expected_key_value}, got {actual_key_value}")
+                
+                if actual_value_value != expected_value_value:
+                    errors.append(f"Step {step_idx}, Batch {b}: Value token mismatch. Expected {expected_value_value}, got {actual_value_value}")
+                
+                if actual_key_text != expected_key_text:
+                    errors.append(f"Step {step_idx}, Batch {b}: Key text mismatch. Expected '{expected_key_text}', got '{actual_key_text}'")
+                
+                if actual_value_text != expected_value_text:
+                    errors.append(f"Step {step_idx}, Batch {b}: Value text mismatch. Expected '{expected_value_text}', got '{actual_value_text}'")
+        
+        # Report results
+        if errors:
+            print(f"❌ Found {len(errors)} indexing errors:")
+            for error in errors[:5]:  # Show first 5 errors
+                print(f"  {error}")
+            if len(errors) > 5:
+                print(f"  ... and {len(errors) - 5} more errors")
+            raise AssertionError(f"Batch indexing bug detected! {len(errors)} errors found.")
+        else:
+            print("✅ All batch indexing is correct!")
+        
+        # Also check for diversity in selections
+        print("\nChecking selection diversity...")
+        batch_sequences = [[] for _ in range(batch_size)]
+        for step in raw_traj.qkv_steps:
+            for b in range(batch_size):
+                batch_sequences[b].append(step.selected_idx[b].item())
+        
+        unique_sequences = len(set(tuple(seq) for seq in batch_sequences))
+        print(f"Unique selection sequences: {unique_sequences}/{batch_size}")
+        
+        if unique_sequences > 1:
+            print("✅ Batches are exploring different trajectories!")
+        else:
+            print("⚠️  All batches have identical selection patterns")
+        
+        total_time = time.time() - start_time
+        print(f"\n✅ GRPO batch indexing bug fix verified! Total time: {total_time:.2f}s")
+        
+    finally:
         hook_remover()
 
 

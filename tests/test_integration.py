@@ -27,9 +27,13 @@ from src.config import CONFIG
 class TestDataPipelineIntegration:
     """Test the complete data pipeline integration."""
     
-    def test_wikipedia_to_kvpair_pipeline(self, gpt2_model, gpt2_tokenizer):
+    def test_wikipedia_to_kvpair_pipeline(self, gpt2_model, gpt2_tokenizer, test_config_factory):
         """Test the complete Wikipedia data pipeline."""
         from src.data import wikipedia_kv_stream
+        
+        # Create and set test configuration
+        test_config = test_config_factory()
+        CONFIG.set_config(test_config)
         
         # Mock embedding function
         def mock_embedding_fn(tokens):
@@ -48,31 +52,23 @@ class TestDataPipelineIntegration:
             return iter(mock_articles)
         
         with patch('src.data.wikipedia_articles', mock_wikipedia_articles):
-            try:
-                # Test that we can create the stream
-                kv_stream = wikipedia_kv_stream(
-                    batch_size=1,
-                    tokenizer=gpt2_tokenizer,
-                    embedding_fn=mock_embedding_fn
-                )
-                
-                # Get first KV pair
-                first_kv_pair = next(kv_stream)
-                
-                # Verify it's a proper KVPair
-                assert isinstance(first_kv_pair, KVPair)
-                assert first_kv_pair.key_tokens.shape == (1, CONFIG.tokens_per_key)
-                assert first_kv_pair.value_tokens.shape == (1, CONFIG.tokens_per_value)
-                assert first_kv_pair.key_embedding.shape == (1, gpt2_model.config.n_embd)
-                assert len(first_kv_pair.key_text) == 1
-                assert len(first_kv_pair.value_text) == 1
-                
-            except Exception as e:
-                # If we hit tensor processing issues, skip but don't fail
-                if "tensor" in str(e).lower() or "device" in str(e).lower():
-                    pytest.skip(f"Skipping due to tensor processing: {e}")
-                else:
-                    raise
+            # Create KV stream (this takes a while due to processing)
+            kv_stream = wikipedia_kv_stream(
+                batch_size=1,
+                tokenizer=gpt2_tokenizer,
+                embedding_fn=mock_embedding_fn
+            )
+            
+            # Get first KV pair
+            first_kv_pair = next(kv_stream)
+            
+            # Verify structure using CONFIG values
+            assert isinstance(first_kv_pair, KVPair)
+            assert first_kv_pair.key_tokens.shape == (1, CONFIG.tokens_per_key)
+            assert first_kv_pair.value_tokens.shape == (1, CONFIG.tokens_per_value)
+            assert first_kv_pair.key_embedding.shape == (1, gpt2_model.config.n_embd)
+            assert len(first_kv_pair.key_text) == 1
+            assert len(first_kv_pair.value_text) == 1
     
     def test_twenty_questions_integration(self, gpt2_tokenizer):
         """Test twenty questions dataset integration."""
@@ -143,11 +139,19 @@ class TestEmbeddingIntegration:
                 
                 # Test similarity computation
                 key_embeddings_3d = key_embeddings.unsqueeze(1)  # [batch, 1, hidden]
-                similarities = compute_similarity(query_embeddings, key_embeddings_3d, gpt2_model)
+                
+                # Get attention parameters for the model
+                from src.embeddings import get_attention_params
+                num_heads, num_groups, head_dim = get_attention_params(gpt2_model)
+                
+                similarities = compute_similarity(query_embeddings, key_embeddings_3d, num_heads, num_groups, head_dim)
                 
                 # Verify similarity output
                 assert similarities.shape == (2, 1)
-                assert torch.allclose(similarities.sum(dim=1), torch.ones(2, device=similarities.device), atol=1e-5)
+                
+                # Verify it's a proper log probability distribution (LogSumExp should be ≈ 0)
+                log_sum_exp = torch.logsumexp(similarities, dim=1)
+                assert torch.allclose(log_sum_exp, torch.zeros(2, device=similarities.device), atol=1e-5)
                 
             finally:
                 query_hook_remover()
@@ -157,12 +161,16 @@ class TestEmbeddingIntegration:
 class TestTrajectoryIntegration:
     """Test trajectory generation and training integration."""
     
-    def test_trajectory_generation_flow(self, gpt2_model, gpt2_tokenizer):
-        """Test generating a complete trajectory."""
-        with patch("src.config.CONFIG.model_type", 'gpt2'):
-            # Apply LoRA for proper adapter model
-            with patch('src.model.MODEL_TYPE', 'gpt2'):
-                adapter_model = apply_lora_adapter(gpt2_model)
+    def test_trajectory_generation_flow(self, gpt2_model, gpt2_tokenizer, test_config_factory):
+        """Test trajectory generation with real models."""
+        # Note: MODEL_TYPE was replaced with CONFIG.model_type
+        with patch('src.config.CONFIG.model_type', 'gpt2'):
+            # Create adapter model
+            adapter_model = apply_lora_adapter(gpt2_model)
+            
+            # Create and set test configuration
+            test_config = test_config_factory()
+            CONFIG.set_config(test_config)
             
             # Create test KV pairs
             device = next(adapter_model.parameters()).device
@@ -187,6 +195,7 @@ class TestTrajectoryIntegration:
                 tokenizer=gpt2_tokenizer,
                 available_qkv_steps=available_qkv_steps,
                 batch_size=1,
+                config=test_config,
                 verbose=False
             )
             
@@ -215,69 +224,72 @@ class TestTrajectoryIntegration:
 class TestTrainingIntegration:
     """Test the complete training pipeline integration."""
     
-    def test_complete_training_step_flow(self, gpt2_model, gpt2_tokenizer):
+    def test_complete_training_step_flow(self, gpt2_model, gpt2_tokenizer, test_config_factory):
         """Test a complete training step with real models."""
         with patch("src.config.CONFIG.model_type", 'gpt2'):
-            with patch('src.model.MODEL_TYPE', 'gpt2'):
-                # Create models
-                adapter_model = apply_lora_adapter(gpt2_model)
-                ref_model = gpt2_model
-                old_model = apply_lora_adapter(gpt2_model)  # Separate old model
+            # Create models
+            adapter_model = apply_lora_adapter(gpt2_model)
+            ref_model = gpt2_model
+            old_model = apply_lora_adapter(gpt2_model)  # Separate old model
+            
+            # Create and set test configuration
+            test_config = test_config_factory()
+            CONFIG.set_config(test_config)
+            
+            # Create optimizer
+            optimizer = torch.optim.Adam(adapter_model.parameters(), lr=1e-4)
+            
+            # Create a simple trajectory
+            device = next(adapter_model.parameters()).device
+            
+            # Build trajectory components
+            qkv_data = KVPair(
+                key_tokens=torch.randint(0, 1000, (1, CONFIG.tokens_per_key), device=device),
+                value_tokens=torch.randint(0, 1000, (1, CONFIG.tokens_per_value), device=device),
+                key_embedding=torch.randn(1, gpt2_model.config.n_embd, device=device),
+                key_text=["test key"],
+                value_text=["test value"]
+            )
                 
-                # Create optimizer
-                optimizer = torch.optim.Adam(adapter_model.parameters(), lr=1e-4)
+            qkv_step = QKVSelection(
+                data=qkv_data,
+                query_embedding=torch.randn(1, gpt2_model.config.n_embd, device=device),
+                similarity_scores=torch.randn(1, 5, device=device),
+                selected_idx=torch.tensor([0], device=device),
+                available_mask=torch.zeros(1, 5, device=device)
+            )
                 
-                # Create a simple trajectory
-                device = next(adapter_model.parameters()).device
+            # Create raw trajectory
+            all_key_embeddings = torch.randn(1, 5, gpt2_model.config.n_embd, device=device)
+            raw_traj = RawTrajectory(qkv_steps=[qkv_step], all_key_embeddings=all_key_embeddings)
                 
-                # Build trajectory components
-                qkv_data = KVPair(
-                    key_tokens=torch.randint(0, 1000, (1, CONFIG.tokens_per_key), device=device),
-                    value_tokens=torch.randint(0, 1000, (1, CONFIG.tokens_per_value), device=device),
-                    key_embedding=torch.randn(1, gpt2_model.config.n_embd, device=device),
-                    key_text=["test key"],
-                    value_text=["test value"]
-                )
+            # Build complete trajectory with rewards
+            rewards = torch.tensor([[0.5]], device=device)
+            avg_reward = rewards.mean(dim=1)
+            trajectory = build_trajectory_from_raw(raw_traj, rewards, avg_reward)
                 
-                qkv_step = QKVSelection(
-                    data=qkv_data,
-                    query_embedding=torch.randn(1, gpt2_model.config.n_embd, device=device),
-                    similarity_scores=torch.randn(1, 5, device=device),
-                    selected_idx=torch.tensor([0], device=device),
-                    available_mask=torch.zeros(1, 5, device=device)
-                )
+            # Reward stats
+            reward_stats = {"mean": 0.0, "std": 1.0, "count": 1}
                 
-                # Create raw trajectory
-                all_key_embeddings = torch.randn(1, 5, gpt2_model.config.n_embd, device=device)
-                raw_traj = RawTrajectory(qkv_steps=[qkv_step], all_key_embeddings=all_key_embeddings)
+            # Perform training step
+            total_loss, policy_loss, kl_loss, avg_clipping_ratio = train_step(
+                trajectory=trajectory,
+                adapter_model=adapter_model,
+                ref_model=ref_model,
+                old_model=old_model,
+                optimizer=optimizer,
+                reward_stats=reward_stats,
+                kl_penalty_coef=0.01,
+                verbose=False,
+                tokenizer=gpt2_tokenizer
+            )
                 
-                # Build complete trajectory with rewards
-                rewards = torch.tensor([[0.5]], device=device)
-                avg_reward = rewards.mean(dim=1)
-                trajectory = build_trajectory_from_raw(raw_traj, rewards, avg_reward)
-                
-                # Reward stats
-                reward_stats = {"mean": 0.0, "std": 1.0, "count": 1}
-                
-                # Perform training step
-                total_loss, policy_loss, kl_loss, avg_clipping_ratio = train_step(
-                    trajectory=trajectory,
-                    adapter_model=adapter_model,
-                    ref_model=ref_model,
-                    old_model=old_model,
-                    optimizer=optimizer,
-                    reward_stats=reward_stats,
-                    kl_penalty_coef=0.01,
-                    verbose=False,
-                    tokenizer=gpt2_tokenizer
-                )
-                
-                # Verify training step results
-                assert isinstance(total_loss, float)
-                assert isinstance(policy_loss, float)
-                assert isinstance(kl_loss, float)
-                assert isinstance(avg_clipping_ratio, float)
-                assert not torch.isnan(torch.tensor(total_loss))
+            # Verify training step results
+            assert isinstance(total_loss, float)
+            assert isinstance(policy_loss, float)
+            assert isinstance(kl_loss, float)
+            assert isinstance(avg_clipping_ratio, float)
+            assert not torch.isnan(torch.tensor(total_loss))
 
 
 class TestCheckpointIntegration:
@@ -289,8 +301,8 @@ class TestCheckpointIntegration:
             checkpoint_dir = Path(tmp_dir) / "checkpoints"
             checkpoint_dir.mkdir()
             
-            with patch('src.model.CHECKPOINT_DIR', str(checkpoint_dir)):
-                with patch('src.model.MODEL_TYPE', 'gpt2'):
+            with patch('src.config.CONFIG.checkpoint_dir', str(checkpoint_dir)):
+                with patch('src.config.CONFIG.model_type', 'gpt2'):
                     # Create adapter model
                     adapter_model = apply_lora_adapter(gpt2_model)
                     
@@ -327,81 +339,85 @@ class TestCheckpointIntegration:
 class TestEndToEndIntegration:
     """Complete end-to-end integration tests."""
     
-    def test_minimal_training_pipeline(self, gpt2_model, gpt2_tokenizer):
+    def test_minimal_training_pipeline(self, gpt2_model, gpt2_tokenizer, test_config_factory):
         """Test a minimal but complete training pipeline."""
         with patch("src.config.CONFIG.model_type", 'gpt2'):
-            with patch('src.model.MODEL_TYPE', 'gpt2'):
-                # Setup models
-                adapter_model = apply_lora_adapter(gpt2_model)
-                ref_model = gpt2_model
-                old_model = apply_lora_adapter(gpt2_model)
+            # Setup models
+            adapter_model = apply_lora_adapter(gpt2_model)
+            ref_model = gpt2_model
+            old_model = apply_lora_adapter(gpt2_model)
+            
+            # Create and set test configuration
+            test_config = test_config_factory()
+            CONFIG.set_config(test_config)
+            
+            # Register embedding hooks
+            query_dict, query_hook_remover = register_embedding_hook(adapter_model, embed_type="query")
+            key_dict, key_hook_remover = register_embedding_hook(adapter_model, embed_type="key")
+            
+            try:
+                # Mock data pipeline
+                def mock_embedding_fn(tokens):
+                    return torch.randn(tokens.shape[0], gpt2_model.config.n_embd)
                 
-                # Register embedding hooks
-                query_dict, query_hook_remover = register_embedding_hook(adapter_model, embed_type="query")
-                key_dict, key_hook_remover = register_embedding_hook(adapter_model, embed_type="key")
+                # Create mock KV stream
+                mock_kv_pairs = []
+                device = next(adapter_model.parameters()).device
                 
-                try:
-                    # Mock data pipeline
-                    def mock_embedding_fn(tokens):
-                        return torch.randn(tokens.shape[0], gpt2_model.config.n_embd)
-                    
-                    # Create mock KV stream
-                    mock_kv_pairs = []
-                    device = next(adapter_model.parameters()).device
-                    
-                    for i in range(CONFIG.num_kv_pairs):
-                        kv_pair = KVPair(
-                            key_tokens=torch.randint(0, 1000, (1, CONFIG.tokens_per_key), device=device),
-                            value_tokens=torch.randint(0, 1000, (1, CONFIG.tokens_per_value), device=device),
-                            key_embedding=torch.randn(1, gpt2_model.config.n_embd, device=device),
-                            key_text=[f"mock key {i}"],
-                            value_text=[f"mock value {i}"]
-                        )
-                        mock_kv_pairs.append(kv_pair)
-                    
-                    # Generate trajectory
-                    context_tokens = torch.zeros((1, 3), dtype=torch.long, device=device)
-                    
-                    raw_trajectory = generate_trajectory(
-                        context_tokens=context_tokens,
-                        adapter_model=adapter_model,
-                        tokenizer=gpt2_tokenizer,
-                        available_qkv_steps=mock_kv_pairs,
-                        batch_size=1
+                for i in range(CONFIG.num_kv_pairs):
+                    kv_pair = KVPair(
+                        key_tokens=torch.randint(0, 1000, (1, CONFIG.tokens_per_key), device=device),
+                        value_tokens=torch.randint(0, 1000, (1, CONFIG.tokens_per_value), device=device),
+                        key_embedding=torch.randn(1, gpt2_model.config.n_embd, device=device),
+                        key_text=[f"mock key {i}"],
+                        value_text=[f"mock value {i}"]
                     )
-                    
-                    # Compute rewards
-                    trajectory, _, _ = compute_trajectory_rewards(
-                        raw_trajectory,
-                        adapter_model,
-                        ref_model,
-                        context_tokens,
-                        tokenizer=gpt2_tokenizer
-                    )
-                    
-                    # Training step
-                    optimizer = torch.optim.Adam(adapter_model.parameters(), lr=1e-4)
-                    reward_stats = {"mean": 0.0, "std": 1.0, "count": 1}
-                    
-                    total_loss, policy_loss, kl_loss, clipping_ratio = train_step(
-                        trajectory=trajectory,
-                        adapter_model=adapter_model,
-                        ref_model=ref_model,
-                        old_model=old_model,
-                        optimizer=optimizer,
-                        reward_stats=reward_stats,
-                        kl_penalty_coef=0.01,
-                        tokenizer=gpt2_tokenizer
-                    )
-                    
-                    # Verify pipeline completed successfully
-                    assert isinstance(total_loss, float)
-                    assert not torch.isnan(torch.tensor(total_loss))
-                    print(f"✅ End-to-end pipeline completed: loss={total_loss:.4f}")
-                    
-                finally:
-                    query_hook_remover()
-                    key_hook_remover()
+                    mock_kv_pairs.append(kv_pair)
+                
+                # Generate trajectory
+                context_tokens = torch.zeros((1, 3), dtype=torch.long, device=device)
+                
+                raw_trajectory = generate_trajectory(
+                    context_tokens=context_tokens,
+                    adapter_model=adapter_model,
+                    tokenizer=gpt2_tokenizer,
+                    available_qkv_steps=mock_kv_pairs,
+                    batch_size=1,
+                    config=test_config
+                )
+                
+                # Compute rewards
+                trajectory, _, _ = compute_trajectory_rewards(
+                    raw_trajectory,
+                    adapter_model,
+                    ref_model,
+                    context_tokens,
+                    tokenizer=gpt2_tokenizer
+                )
+                
+                # Training step
+                optimizer = torch.optim.Adam(adapter_model.parameters(), lr=1e-4)
+                reward_stats = {"mean": 0.0, "std": 1.0, "count": 1}
+                
+                total_loss, policy_loss, kl_loss, clipping_ratio = train_step(
+                    trajectory=trajectory,
+                    adapter_model=adapter_model,
+                    ref_model=ref_model,
+                    old_model=old_model,
+                    optimizer=optimizer,
+                    reward_stats=reward_stats,
+                    kl_penalty_coef=0.01,
+                    tokenizer=gpt2_tokenizer
+                )
+                
+                # Verify pipeline completed successfully
+                assert isinstance(total_loss, float)
+                assert not torch.isnan(torch.tensor(total_loss))
+                print(f"✅ End-to-end pipeline completed: loss={total_loss:.4f}")
+                
+            finally:
+                query_hook_remover()
+                key_hook_remover()
 
 
 if __name__ == "__main__":
