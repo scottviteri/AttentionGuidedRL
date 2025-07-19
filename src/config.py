@@ -21,6 +21,22 @@ class TrainingConfig:
     This eliminates the confusing pattern of importing constants and reassigning them.
     Instead: Create one immutable config object with final resolved values.
     """
+    
+    def __post_init__(self):
+        """Validate configuration parameters after initialization."""
+        # Validate temperature is positive
+        if self.temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {self.temperature}")
+        
+        # Validate other critical parameters
+        if self.learning_rate <= 0:
+            raise ValueError(f"learning_rate must be positive, got {self.learning_rate}")
+        
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {self.batch_size}")
+        
+        if self.num_episodes <= 0:
+            raise ValueError(f"num_episodes must be positive, got {self.num_episodes}")
     # Core model configuration
     model_name: str = 'gpt2'
     model_type: str = 'gpt2'
