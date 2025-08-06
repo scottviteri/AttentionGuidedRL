@@ -52,6 +52,16 @@ class PlotData:
     advantage_distributions: List[Dict[str, float]] = field(default_factory=list)
     similarity_score_stats: List[Dict[str, float]] = field(default_factory=list)
     
+    # Chain rule specific metrics
+    policy_term_values: List[float] = field(default_factory=list)
+    reward_term_values: List[float] = field(default_factory=list)
+    total_returns_mean: List[float] = field(default_factory=list)
+    total_returns_std: List[float] = field(default_factory=list)
+    policy_term_variance: List[float] = field(default_factory=list)
+    reward_term_variance: List[float] = field(default_factory=list)
+    reward_gradient_norm: List[float] = field(default_factory=list)
+    policy_reward_ratio: List[float] = field(default_factory=list)
+    
     # Metadata
     metadata: Dict[str, Any] = field(default_factory=dict)
     
@@ -80,6 +90,15 @@ class PlotData:
         advantage_distribution: Dict[str, float],
         similarity_score_stats: Dict[str, float],
         policy_gradient: float,
+        # New chain rule metrics
+        policy_term_value: float = 0.0,
+        reward_term_value: float = 0.0,
+        total_returns_mean_val: float = 0.0,
+        total_returns_std_val: float = 0.0,
+        policy_term_variance_val: float = 0.0,
+        reward_term_variance_val: float = 0.0,
+        reward_gradient_norm_val: float = 0.0,
+        policy_reward_ratio_val: float = 0.0,
         trajectory_sample: Optional[Dict[str, Any]] = None
     ) -> 'PlotData':
         """
@@ -111,6 +130,16 @@ class PlotData:
         new_policy_gradients = self.policy_gradients + [policy_gradient]
         new_advantage_distributions = self.advantage_distributions + [advantage_distribution]
         new_similarity_score_stats = self.similarity_score_stats + [similarity_score_stats]
+        
+        # Add new chain rule metrics
+        new_policy_term_values = self.policy_term_values + [policy_term_value]
+        new_reward_term_values = self.reward_term_values + [reward_term_value]
+        new_total_returns_mean = self.total_returns_mean + [total_returns_mean_val]
+        new_total_returns_std = self.total_returns_std + [total_returns_std_val]
+        new_policy_term_variance = self.policy_term_variance + [policy_term_variance_val]
+        new_reward_term_variance = self.reward_term_variance + [reward_term_variance_val]
+        new_reward_gradient_norm = self.reward_gradient_norm + [reward_gradient_norm_val]
+        new_policy_reward_ratio = self.policy_reward_ratio + [policy_reward_ratio_val]
         
         # Handle trajectory samples (optional)
         new_trajectory_samples = self.trajectory_samples.copy()
@@ -153,6 +182,15 @@ class PlotData:
             lora_layer_gradients=new_lora_layer_gradients,
             advantage_distributions=new_advantage_distributions,
             similarity_score_stats=new_similarity_score_stats,
+            # New chain rule metrics
+            policy_term_values=new_policy_term_values,
+            reward_term_values=new_reward_term_values,
+            total_returns_mean=new_total_returns_mean,
+            total_returns_std=new_total_returns_std,
+            policy_term_variance=new_policy_term_variance,
+            reward_term_variance=new_reward_term_variance,
+            reward_gradient_norm=new_reward_gradient_norm,
+            policy_reward_ratio=new_policy_reward_ratio,
             metadata=self.metadata  # Metadata is updated separately
         )
     

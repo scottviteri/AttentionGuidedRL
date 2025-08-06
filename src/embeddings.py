@@ -154,17 +154,21 @@ def extract_embeddings(
     model: torch.nn.Module,
     tokenized_input: torch.Tensor,  # Shape: [batch, seq_len]
     embeddings_dict: Dict,
-    requires_grad: bool = False
+    requires_grad: bool = False,
+    extract_last_token: bool = False
 ) -> torch.Tensor:  # Shape: [batch, head_dim*num_heads]
     """
-    Extract embeddings from the model's last attention layer and average over the sequence length 
-    to produce a single embedding vector per sentence.
+    Extract embeddings from the model's last attention layer.
+    
+    For key embeddings: averages over the sequence length to produce a single embedding vector.
+    For query embeddings: extracts the last token (Query token) embedding for focused learning.
     
     Args:
         model: The language model
         tokenized_input: Tokenized input tensor with shape [batch, seq_len]
         embeddings_dict: Dictionary to store the embeddings from the hook
         requires_grad: If True, compute with gradients enabled (for query embeddings during training)
+        extract_last_token: If True, extract only the last token embedding (for query vectors)
         
     Returns:
         Extracted embeddings with shape [batch, head_dim*num_heads]
@@ -194,10 +198,15 @@ def extract_embeddings(
             "Make sure to register the hook with the correct embed_type before calling extract_embeddings."
         )
     
-    # Average over the sequence length
-    avg_embeddings = torch.mean(full_embeddings, dim=1)  # [batch_size, hidden_size]
+    if extract_last_token:
+        # For query embeddings: extract only the last token (Query token)
+        # This focuses learning on the Query token specifically
+        extracted_embeddings = full_embeddings[:, -1, :]  # [batch_size, hidden_size]
+    else:
+        # For key embeddings: average over the sequence length (existing behavior)
+        extracted_embeddings = torch.mean(full_embeddings, dim=1)  # [batch_size, hidden_size]
     
-    return avg_embeddings
+    return extracted_embeddings
 
 
 def get_query_dimension(model) -> int:

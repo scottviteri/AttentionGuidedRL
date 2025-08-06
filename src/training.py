@@ -109,9 +109,9 @@ def generate_query_vector(
         input_tokens = torch.cat([context_tokens, query_vec_token_ids], dim=1)
         
         # Use extract_embeddings which handles the forward pass and extraction
-        # This will give us the query embeddings from the attention layer
+        # Extract only the Query token embedding (last token) for focused learning
         # Set requires_grad=True for query embeddings during training
-        query_vectors = extract_embeddings(model, input_tokens, embeddings_dict, requires_grad=True)
+        query_vectors = extract_embeddings(model, input_tokens, embeddings_dict, requires_grad=True, extract_last_token=True)
         
         return query_vectors
         

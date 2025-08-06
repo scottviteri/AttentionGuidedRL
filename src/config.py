@@ -49,20 +49,12 @@ class TrainingConfig:
     batch_size: int = 4
     
     # RL-specific parameters
-    kl_penalty_coefficient: float = 0.1
-    ppo_clip_epsilon: float = 0.2
     gamma: float = 0.99
-    gae_lambda: float = 0.95
     temperature: float = 1.0
     
     # Training behavior
     use_grpo_baseline: bool = True
-    use_ema_baseline: bool = True
-    ema_decay: float = 0.99
-    baseline_update_frequency: int = 50
     subtract_base_model_logprobs: bool = False
-    use_ppo: bool = True  # vs vanilla policy gradient
-    memory_efficient_lora: bool = True  # Default to true per user request
     grpo_batching: bool = True  # GRPO-style batching
     
     # Training infrastructure
@@ -163,20 +155,12 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
         batch_size=getattr(args, 'batch_size', None) or base_config.batch_size,
         
         # RL parameters (CLI overrides or defaults)
-        kl_penalty_coefficient=getattr(args, 'kl_penalty_coef', None) or base_config.kl_penalty_coefficient,
-        ppo_clip_epsilon=getattr(args, 'ppo_clip_epsilon', None) or base_config.ppo_clip_epsilon,
         gamma=base_config.gamma,
-        gae_lambda=base_config.gae_lambda,
         temperature=base_config.temperature,
         
         # Training behavior (CLI overrides or defaults)
         use_grpo_baseline=getattr(args, 'use_grpo_baseline', False) or base_config.use_grpo_baseline,
-        use_ema_baseline=getattr(args, 'use_ema_baseline', False) or base_config.use_ema_baseline,
-        ema_decay=getattr(args, 'ema_decay', None) or base_config.ema_decay,
-        baseline_update_frequency=getattr(args, 'baseline_update_freq', None) or base_config.baseline_update_frequency,
         subtract_base_model_logprobs=getattr(args, 'subtract_base_logprobs', False) or base_config.subtract_base_model_logprobs,
-        use_ppo=not getattr(args, 'vanilla_pg', False),  # PPO unless --vanilla-pg
-        memory_efficient_lora=getattr(args, 'memory_efficient', False) or base_config.memory_efficient_lora,
         grpo_batching=getattr(args, 'grpo_batching', False) or base_config.grpo_batching,
         
         # Infrastructure
@@ -214,18 +198,10 @@ def training_config_to_dict(config: TrainingConfig) -> Dict[str, Any]:
         'learning_rate': config.learning_rate,
         'num_episodes': config.num_episodes,
         'batch_size': config.batch_size,
-        'kl_penalty_coefficient': config.kl_penalty_coefficient,
-        'ppo_clip_epsilon': config.ppo_clip_epsilon,
         'gamma': config.gamma,
-        'gae_lambda': config.gae_lambda,
         'temperature': config.temperature,
         'use_grpo_baseline': config.use_grpo_baseline,
-        'use_ema_baseline': config.use_ema_baseline,
-        'ema_decay': config.ema_decay,
-        'baseline_update_frequency': config.baseline_update_frequency,
         'subtract_base_model_logprobs': config.subtract_base_model_logprobs,
-        'use_ppo': config.use_ppo,
-        'memory_efficient_lora': config.memory_efficient_lora,
         'grpo_batching': config.grpo_batching,
         'enable_wandb': config.enable_wandb,
         'num_kv_pairs': config.num_kv_pairs,
@@ -242,18 +218,12 @@ def log_training_config(config: TrainingConfig, logger) -> None:
     
     logger.info(f"Training: {config.num_episodes} episodes, batch_size={config.batch_size}, lr={config.learning_rate}")
     
-    logger.info(f"RL: kl_penalty={config.kl_penalty_coefficient}, ppo_clip={config.ppo_clip_epsilon}")
-    logger.info(f"    gamma={config.gamma}, gae_lambda={config.gae_lambda}, temperature={config.temperature}")
+    logger.info(f"RL: gamma={config.gamma}, temperature={config.temperature}")
     
-    if config.use_ema_baseline:
-        logger.info(f"Baseline: EMA updates (decay={config.ema_decay:.3f}) - smooth")
+    if config.use_grpo_baseline:
+        logger.info(f"Baseline: GRPO batch average baseline")
     else:
-        logger.info(f"Baseline: Hard updates every {config.baseline_update_frequency} episodes - may spike")
-        
-    if config.memory_efficient_lora:
-        logger.info("Memory: Memory-efficient LoRA state management (60-90% reduction)")
-    else:
-        logger.info("Memory: Traditional model copying approach")
+        logger.info(f"Baseline: Per-trajectory mean baseline")
         
     logger.info(f"Context: {config.num_kv_pairs} KV pairs, {config.tokens_per_round} tokens/round")
     logger.info(f"         {config.max_context_length} max context, {config.initial_prompt_tokens} prompt tokens")

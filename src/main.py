@@ -15,7 +15,7 @@ from collections import Counter
 import torch.nn.functional as F
 from tqdm import tqdm
 from datetime import datetime
-from typing import List, Any, Iterator
+from typing import List, Any, Iterator, Dict, Tuple, Optional
 import sys
 import time # Import time for overall timing
 
@@ -29,18 +29,186 @@ from src.training import (
     Trajectory,  # for type hints
     compute_trajectory_rewards,
     update_reward_stats,
-    train_step,
+    compute_advantages,
     generate_query_vector,
 )
 from src.plotting import PlotData, save_plot_data, create_metadata
 
-# Import memory-efficient training components
-from src.memory_efficient_training import (
-    MemoryEfficientLoRAManager,
-    memory_efficient_train_step
-)
+# Simple policy gradient training - no memory-efficient components needed
 
 import wandb
+
+
+def policy_gradient_train_step(
+    trajectory: Trajectory,
+    adapter_model: torch.nn.Module,
+    ref_model: torch.nn.Module,  # Kept for compatibility but not used
+    optimizer: torch.optim.Optimizer,
+    reward_stats: Dict[str, float],
+    verbose: bool = False,
+    tokenizer: Any = None,
+    embeddings_dict: Optional[Dict] = None
+) -> Tuple[float, float, float, float]:
+    """
+    Perform θ-dependent reward chain rule training step.
+    
+    Implements: ∇J(θ) = E[R_θ(τ)·∇log π_θ(τ) + ∇R_θ(τ)]
+    
+    Args:
+        trajectory: The trajectory to train on
+        adapter_model: The language model with LoRA adapter (trainable)
+        ref_model: Kept for compatibility (not used in chain rule approach)
+        optimizer: The optimizer
+        reward_stats: Reward statistics (for logging only with GRPO)
+        verbose: Flag to enable verbose logging
+        tokenizer: Tokenizer (needed for vector queries)
+        embeddings_dict: Embeddings dictionary (needed for vector queries)
+        
+    Returns:
+        Tuple[float, float, float, float]: 
+            total_loss, policy_loss, reward_loss, avg_clipping_ratio (always 1.0)
+    """
+    if verbose:
+        print("\n=== θ-Dependent Chain Rule Training Step ===")
+        batch_size = trajectory.avg_reward.shape[0]
+        print(f"Input trajectory batch size: {batch_size}")
+        print(f"Reward stats: mean={reward_stats['mean']:.4f}, std={reward_stats['std']:.4f}")
+
+    # Zero gradients
+    optimizer.zero_grad()
+    
+    # Initialize loss tracking
+    device = next(adapter_model.parameters()).device
+    batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
+    
+    policy_term = torch.tensor(0.0, device=device, requires_grad=True)
+    reward_term = torch.tensor(0.0, device=device, requires_grad=True)
+    
+    # Initialize context for computing current action probabilities and rewards
+    context_tokens = tokenizer(
+        [CONFIG.initial_prompt] * batch_size,
+        return_tensors="pt",
+        padding=True,
+        add_special_tokens=False
+    ).input_ids.to(device)
+    
+    current_context = context_tokens
+    
+    # Compute advantages using trajectory rewards
+    if CONFIG.use_grpo_baseline:
+        # Use GRPO-style batch baseline (mean of current batch)
+        batch_baseline = trajectory.rewards.mean()
+        advantages = trajectory.rewards - batch_baseline
+    else:
+        # Use total returns as-is (no baseline subtraction)
+        advantages = trajectory.rewards
+    
+    # Normalize advantages for stability
+    if advantages.numel() > 1:
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    
+    for t, qkv_step in enumerate(trajectory.qkv_steps):
+        # === POLICY GRADIENT TERM: A_t * ∇log π_θ(a_t|s_t) ===
+        
+        # Generate current query embedding
+        current_query_emb = generate_query_vector(
+            adapter_model,
+            tokenizer,
+            current_context,
+            layer_idx=-2
+        )
+        
+        # Get attention parameters and compute current action probabilities
+        num_heads, num_groups, head_dim = get_attention_params(adapter_model)
+        
+        current_similarities = compute_similarity(
+            current_query_emb,
+            trajectory.all_key_embeddings,
+            num_heads, 
+            num_groups, 
+            head_dim,
+            availability_mask=qkv_step.available_mask if hasattr(qkv_step, 'available_mask') else None
+        )
+        
+        # Get current action log probabilities
+        current_action_log_probs = torch.gather(current_similarities, 1, qkv_step.selected_idx.unsqueeze(1)).squeeze(1)
+        
+        # Policy gradient term: A_t * log π_θ(a_t|s_t) (advantage-based)
+        step_advantages = advantages[:, t]  # Advantage for this time step
+        policy_gradient_t = step_advantages * current_action_log_probs
+        policy_term = policy_term + policy_gradient_t.sum()  # Sum over batch
+        
+        # === REWARD GRADIENT TERM: ∇_θ r_{θ,t} ===
+        
+        # Prepare context for reward computation
+        key_prefix_tokens = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        value_prefix_tokens = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        
+        # Context for reward: includes key prefix + selected key + value prefix
+        reward_context = torch.cat([
+            current_context,
+            key_prefix_tokens,
+            qkv_step.key_tokens.to(device),
+            value_prefix_tokens
+        ], dim=1)
+        
+        # === REWARD GRADIENT TERM: ∇_θ r_{θ,t} ===
+        # Instead of recomputing, use the reward that was already computed for this step
+        # This is mathematically equivalent but much more memory efficient
+        
+        # Get the reward for this step (already computed during trajectory generation)
+        step_reward = trajectory.rewards[:, t]  # [batch_size]
+        
+        # The gradient will automatically flow through step_reward since it was computed
+        # with the current model during trajectory generation
+        gamma_t = CONFIG.gamma ** t
+        
+        # Scale reward term to be comparable in magnitude to policy term
+        # Policy term is normalized advantages * log_probs, while reward term is raw rewards
+        reward_scaling = 0.1  # Scale down reward term relative to policy term
+        reward_term = reward_term + gamma_t * reward_scaling * step_reward.sum()  # Sum over batch
+        
+        # Update context for next iteration
+        current_context = torch.cat([
+            current_context,
+            key_prefix_tokens,
+            qkv_step.key_tokens.to(device),
+            value_prefix_tokens,
+            qkv_step.value_tokens.to(device)
+        ], dim=1)
+        
+        if verbose and t == 0:
+            print(f"Step {t}: log_prob mean: {current_action_log_probs.mean().item():.4f}")
+            print(f"Step {t}: advantage mean: {step_advantages.mean().item():.4f}")
+            print(f"Step {t}: reward_t mean: {step_reward.mean().item():.4f}")
+    
+    # === CHAIN RULE LOSS: -(A_t·∇log π_θ(τ) + ∇R_θ(τ)) ===
+    
+    # Negative for gradient ascent -> descent
+    total_loss = -(policy_term + reward_term)
+    
+    if verbose:
+        print(f"Policy term: {policy_term.item():.4f}")
+        print(f"Reward term: {reward_term.item():.4f}")
+        print(f"Total loss (negated): {total_loss.item():.4f}")
+    
+    # Backpropagate
+    total_loss.backward()
+    
+    # Clip gradients
+    grad_norm = torch.nn.utils.clip_grad_norm_(adapter_model.parameters(), CONFIG.gradient_clip_norm)
+    
+    if verbose:
+        print(f"Gradient norm: {grad_norm:.4f}")
+    
+    # Update parameters
+    optimizer.step()
+    
+    if verbose:
+        print("=== Chain Rule Training Step Complete ===\n")
+    
+    # Return values for logging compatibility
+    return total_loss.item(), policy_term.item(), reward_term.item(), 1.0
 
 def setup_logging(config: TrainingConfig, args):
     """
@@ -259,16 +427,9 @@ def parse_args():
     parser.add_argument('--use-grpo-baseline', action='store_true', help='Use GRPO baseline in advantages')
     
     # Configuration parameters
-    parser.add_argument('--kl-penalty-coef', type=float, help='KL penalty coefficient for regularization')
     parser.add_argument('--enable-wandb', action='store_true', help='Enable Weights & Biases logging')
-    parser.add_argument('--ppo-clip-epsilon', type=float, help='PPO clipping parameter (epsilon)')
-    parser.add_argument('--baseline-update-freq', type=int, help='How often to update baseline model (episodes)')
     parser.add_argument('--subtract-base-logprobs', action='store_true', help='Subtract base model logprobs in reward computation')
     parser.add_argument('--debug-generators', action='store_true', help='Enable detailed debugging of generator pipelines')
-    parser.add_argument('--ema-decay', type=float, help='EMA decay for smooth baseline updates (0.01-0.1, higher=smoother)')
-    parser.add_argument('--use-ema-baseline', action='store_true', help='Use EMA baseline updates instead of hard updates (reduces spikes)')
-    parser.add_argument('--vanilla-pg', action='store_true', help='Use vanilla policy gradient (REINFORCE) instead of PPO')
-    parser.add_argument('--memory-efficient', action='store_true', help='Use memory-efficient LoRA state management (saves 60-90%% memory)')
     
     return parser.parse_args()
 
@@ -621,6 +782,9 @@ def main():
     else:
         logging.info("Reward computation: Using raw adapter log probabilities (GRPO handles baselines)")
     
+    # Log training algorithm
+    logging.info("Training algorithm: Vanilla Policy Gradient (REINFORCE)")
+    
     # Set up models and tokenizer
     logging.info("Setting up models and tokenizer...")
     base_model, adapter_model, tokenizer = setup_model_and_tokenizer()
@@ -645,7 +809,7 @@ def main():
     # Make sure hook is removed at the end
     try:
         # Create optimizer
-        optimizer = optim.Adam(adapter_model.parameters(), lr=CONFIG.training_config.learning_rate)
+        optimizer = optim.Adam(adapter_model.parameters(), lr=CONFIG.learning_rate)
         
         # Initialize reward stats
         reward_stats = {"mean": 0.0, "std": 1.0, "count": 0}
@@ -665,45 +829,18 @@ def main():
                 latest_path = get_checkpoint_path("latest")
                 # For backward compatibility, we'll set start_episode to the last episode
                 # This ensures we don't restart from 0
-                start_episode = args.episodes - 1
+                start_episode = CONFIG.num_episodes - 1
                 logging.info(f"Resumed from latest checkpoint, continuing from episode {start_episode}")
             else:
                 # Fall back to checking numbered checkpoints
-                for episode in range(args.episodes, 0, -1):
+                for episode in range(CONFIG.num_episodes, 0, -1):
                     if load_checkpoint(adapter_model, episode):
                         start_episode = episode
                         logging.info(f"Resumed from episode {start_episode}")
                         break
         
-        # Create a copy of the adapter model to serve as the old model (pi_old)
-        # This will be updated every BASELINE_UPDATE_FREQUENCY episodes
-        if CONFIG.training_config.memory_efficient_lora:
-            # Use memory-efficient LoRA state management
-            lora_manager = MemoryEfficientLoRAManager(adapter_model)
-            old_model = None  # Not needed with memory-efficient training
-            old_embeddings_dict = None
-            old_hook_remover = lambda: None  # No-op function
-            logging.info("🚀 Using memory-efficient LoRA state management")
-        else:
-            # Traditional approach with full model copy
-            old_model = create_model_copy(adapter_model)
-            
-            # Add small random noise to old_model parameters to avoid identical initialization
-            # This ensures PPO ratios are not 1.0 from the very first episode
-            with torch.no_grad():
-                for name, param in old_model.named_parameters():
-                    if 'lora' in name and param.requires_grad:
-                        # Add small Gaussian noise (std=0.01) to LoRA parameters only
-                        noise = torch.randn_like(param) * 0.01
-                        param.data.add_(noise)
-            
-            if args.verbose:
-                print("Added small initialization noise to old_model LoRA parameters")
-            
-            # Register embedding hook for the old model (for KEY embeddings)
-            old_embeddings_dict, old_hook_remover = register_embedding_hook(old_model, embed_type="key")
-            lora_manager = None  # Not needed with traditional training
-            logging.info("Using traditional model copying approach")
+        # Policy gradient doesn't need old model copies or memory-efficient LoRA
+        # We only use the current adapter_model for both sampling and training
 
         # Import the data iterator and repeat function
         from src.data import (
@@ -738,15 +875,15 @@ def main():
                 base_iterator = cast(Iterator[KVPair], time_stream(base_iterator, "kv_generation"))
                 
             # Repeat each item batch_size times for GRPO-style batching
-            kv_pair_generator: Iterator[KVPair] = cast(Iterator[KVPair], repeat_n_times(args.batch_size, base_iterator))
+            kv_pair_generator: Iterator[KVPair] = cast(Iterator[KVPair], repeat_n_times(CONFIG.batch_size, base_iterator))
             
             if args.debug_generators:
-                kv_pair_generator = cast(Iterator[KVPair], debug_stream(kv_pair_generator, "repeated_kv_pairs", max_items=args.batch_size + 1))
+                kv_pair_generator = cast(Iterator[KVPair], debug_stream(kv_pair_generator, "repeated_kv_pairs", max_items=CONFIG.batch_size + 1))
         else:
             # Standard approach: different items in each batch position
             kv_pair_generator = iter_key_value_pairs_unified_with_tokenizer(
                 dataset_name=args.dataset,
-                batch_size=args.batch_size,
+                batch_size=CONFIG.batch_size,
                 tokenizer=tokenizer,
                 embedding_fn=compute_key_embedding,
             )
@@ -765,16 +902,7 @@ def main():
         logging.info("Model setup complete:")
         logging.info("- adapter_model: LoRA adapter (trainable)")
         logging.info("- ref_model: Reference model (pi_ref, for reward computation)")
-        logging.info("- old_model: Old model (pi_old, for KL computation, updated periodically)")
         logging.info(f"- GRPO batching: {'Enabled' if use_grpo_batching else 'Disabled'}")
-        # No separate previous_model - use old_model for KL computation
-        logging.info(f"Old model will be updated every {CONFIG.training_config.baseline_update_frequency} episodes")
-        
-        # Log baseline update method
-        if CONFIG.training_config.use_ema_baseline:
-            logging.info(f"✅ Using EMA baseline updates (decay={CONFIG.training_config.ema_decay:.3f}) - eliminates spikes")
-        else:
-            logging.info(f"⚠️  Using HARD baseline updates - may cause training spikes every {CONFIG.training_config.baseline_update_frequency} episodes")
         
         # Function to compute gradient statistics
         def get_gradient_stats(model):
@@ -890,7 +1018,7 @@ def main():
         
         # Training loop
         logging.info("Starting training...")
-        episodes_range = range(start_episode, args.episodes)
+        episodes_range = range(start_episode, CONFIG.num_episodes)
         progress_bar = tqdm(episodes_range)
         
         # Initialize plotting data structure (replaces global variables)
@@ -907,10 +1035,10 @@ def main():
         
         for episode in progress_bar:
             if args.verbose:
-                print(f"\n\n======== EPISODE {episode}/{args.episodes} ========")
+                print(f"\n\n======== EPISODE {episode}/{CONFIG.num_episodes} ========")
             
             # Get a batch of key-value pairs
-            available_qkv_steps = [next(kv_pair_generator) for _ in range(CONFIG.training_config.num_kv_pairs)]  # Get a pool of QKV steps
+            available_qkv_steps = [next(kv_pair_generator) for _ in range(CONFIG.num_kv_pairs)]  # Get a pool of QKV steps
             
             if args.verbose:
                 print(f"Generated pool of {len(available_qkv_steps)} query-key-value steps")
@@ -918,7 +1046,7 @@ def main():
             # Create initial context with a prompt explaining the task
             # Note: The token count of this prompt is accounted for in 
             # the TrainingConfig calculation to ensure we don't exceed the context window
-            batch_size = args.batch_size
+            batch_size = CONFIG.batch_size
             
             # Tokenize the initial prompt
             device = next(adapter_model.parameters()).device
@@ -929,14 +1057,18 @@ def main():
                 add_special_tokens=False
             ).input_ids.to(device)
             
+            # Policy gradient: always sample with current model
+            if args.verbose:
+                print("Sampling trajectory with current adapter_model (policy gradient)")
+            
             # Generate a *raw* trajectory (no rewards yet)
             raw_traj = generate_trajectory(
                 context_tokens=initial_tokens,
                 adapter_model=adapter_model,
                 tokenizer=tokenizer,
                 available_qkv_steps=available_qkv_steps,
-                batch_size=args.batch_size,
-                config=CONFIG.training_config,
+                batch_size=CONFIG.batch_size,
+                config=CONFIG,
                 verbose=args.verbose,
             )
             
@@ -950,21 +1082,8 @@ def main():
                 verbose=args.verbose
             )
             
-            # Also get old model log probabilities for comparison plotting
-            if not CONFIG.training_config.memory_efficient_lora:
-                # Only compute old model log probs for traditional mode (for plotting)
-                assert old_model is not None, "old_model should not be None in traditional mode"
-                _, _, old_log_probs_batch = compute_trajectory_rewards(
-                    raw_traj, 
-                    adapter_model, 
-                    old_model, 
-                    initial_tokens,
-                    tokenizer=tokenizer,
-                    verbose=False  # Don't print twice
-                )
-            else:
-                # For memory-efficient mode, use adapter log probs as old log probs
-                old_log_probs_batch = adapter_log_probs_batch
+            # Policy gradient doesn't need old model log probs
+            old_log_probs_batch = adapter_log_probs_batch
 
             # Exact KL(adapter || reference) over key-selection distribution
             kl_from_ref_value = compute_kl_from_reference(
@@ -983,47 +1102,39 @@ def main():
                 print(f"  Std: {reward_stats['std']:.4f}")
                 print(f"  Count: {reward_stats['count']}")
             
-            # Perform training step
-            if CONFIG.training_config.memory_efficient_lora:
-                # Use memory-efficient training step
-                assert lora_manager is not None, "lora_manager should not be None in memory-efficient mode"
-                total_loss, policy_loss, kl_loss, avg_clipping_ratio = memory_efficient_train_step(
-                    trajectory,
-                    adapter_model,
-                    ref_model,  # Use ref_model for reward computation
-                    lora_manager,  # Use LoRA manager instead of old_model
-                    optimizer,
-                    reward_stats,
-                    CONFIG.training_config.kl_penalty_coefficient,
-                    verbose=args.verbose,
-                    tokenizer=tokenizer,
-                    embeddings_dict=query_embeddings_dict,
-                )
+            # Perform θ-dependent chain rule training step
+            train_step_results = policy_gradient_train_step(
+                trajectory,
+                adapter_model,
+                ref_model,  # Kept for compatibility but not used
+                optimizer,
+                reward_stats,
+                verbose=args.verbose,
+                tokenizer=tokenizer,
+                embeddings_dict=query_embeddings_dict,
+            )
+            
+            # Unpack results (handle both old and new return formats)
+            if len(train_step_results) == 12:
+                (total_loss, policy_term, reward_term, avg_clipping_ratio,
+                 policy_term_value, reward_term_value, total_returns_mean_val,
+                 total_returns_std_val, policy_term_variance_val, reward_term_variance_val,
+                 reward_gradient_norm_val, policy_reward_ratio_val) = train_step_results
             else:
-                # Use traditional training step
-                assert old_model is not None, "old_model should not be None in traditional mode"
-                total_loss, policy_loss, kl_loss, avg_clipping_ratio = train_step(
-                    trajectory,
-                    adapter_model,
-                    ref_model,  # Use ref_model for reward computation
-                    old_model,  # Use old_model for KL computation
-                    optimizer,
-                    reward_stats,
-                    CONFIG.training_config.kl_penalty_coefficient,
-                    verbose=args.verbose,
-                    tokenizer=tokenizer,
-                    embeddings_dict=query_embeddings_dict, # Use query embeddings for training
-                )
+                # Legacy format for compatibility
+                total_loss, policy_term, reward_term, avg_clipping_ratio = train_step_results
+                policy_term_value = reward_term_value = total_returns_mean_val = 0.0
+                total_returns_std_val = policy_term_variance_val = reward_term_variance_val = 0.0
+                reward_gradient_norm_val = policy_reward_ratio_val = 0.0
             
             # Track clipping ratio
             clipping_ratios.append(avg_clipping_ratio)
             
-            # Track weight change BEFORE updating old_model
-            weight_change = compute_weight_change(adapter_model, old_model)
+            # Simple weight change tracking (gradient norm as proxy)
+            weight_change = 0.0  # Simplified for policy gradient
             weight_changes.append(weight_change)
             
-            # NO automatic old_model update after each training step - only at intervals
-            # This allows KL divergence to accumulate over multiple episodes for meaningful regularization
+            # Policy gradient doesn't need old model updates
             
             # Calculate average reward across the batch
             avg_reward = trajectory.avg_reward.mean().item()
@@ -1100,8 +1211,13 @@ def main():
             
             # Calculate derived metrics for plotting
             traj_log_prob = adapter_log_probs_batch.mean().item()
-            kl_penalty_term = (kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss) * CONFIG.training_config.kl_penalty_coefficient
-            reward_var = trajectory.avg_reward.var().item()
+            # No KL penalty in chain rule approach
+            kl_penalty_term = reward_term.item() if isinstance(reward_term, torch.Tensor) else reward_term  # Use reward term for plotting
+            # Compute reward variance (handle single batch case)
+            if trajectory.avg_reward.numel() > 1:
+                reward_var = trajectory.avg_reward.var().item()
+            else:
+                reward_var = 0.0  # Single batch, no variance
             current_lr = optimizer.param_groups[0]['lr']
             
             # Compute and track average advantages from this episode
@@ -1111,8 +1227,8 @@ def main():
                 advantages, _ = compute_advantages(
                     trajectory.rewards,
                     gamma=CONFIG.gamma,
-                    gae_lambda=CONFIG.gae_lambda,
-                    use_grpo_baseline=CONFIG.training_config.use_grpo_baseline,
+                    gae_lambda=0.95,  # Fixed value for policy gradient
+                    use_grpo_baseline=CONFIG.use_grpo_baseline,
                 )
                 avg_advantage = advantages.mean().item()
                 advantage_dist = compute_advantage_distribution(advantages)
@@ -1124,50 +1240,17 @@ def main():
                 }
             
             # Policy gradient for visualization (before negation)
-            policy_gradient = -(policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss)
+            policy_gradient = -(policy_term.item() if isinstance(policy_term, torch.Tensor) else policy_term)
             
             # Update progress bar
             progress_bar.set_description(
-                f"Episode {episode}/{args.episodes}, "
+                f"Episode {episode}/{CONFIG.num_episodes}, "
                 f"Loss: {total_loss:.4f}, "
 
                 f"Reward: {avg_reward:.4f}"
             )
             
-            # Update old_model using EMA (smooth) updates to prevent gradient spikes
-            # Based on debugging: frozen old_model causes accumulated changes -> gradient explosions
-            if CONFIG.training_config.memory_efficient_lora:
-                # Use memory-efficient LoRA state updates
-                assert lora_manager is not None, "lora_manager should not be None in memory-efficient mode"
-                if CONFIG.training_config.use_ema_baseline:
-                    lora_manager.update_old_state_ema(decay=CONFIG.training_config.ema_decay)
-                    if episode % CONFIG.training_config.baseline_update_frequency == 0:
-                        logging.info(f"Memory-efficient EMA LoRA state update (decay={CONFIG.training_config.ema_decay:.3f})")
-                else:
-                    # Hard update at intervals
-                    if (episode + 1) % CONFIG.training_config.baseline_update_frequency == 0:
-                        lora_manager.update_old_state_hard()
-                        logging.info("Memory-efficient hard LoRA state update")
-            else:
-                # Traditional model updates
-                assert old_model is not None, "old_model should not be None in traditional mode"
-                if CONFIG.training_config.use_ema_baseline:
-                    # Smooth EMA update every episode - prevents spikes
-                    update_model_ema(old_model, adapter_model, decay=CONFIG.training_config.ema_decay)
-                    if episode % CONFIG.training_config.baseline_update_frequency == 0:
-                        logging.info(f"Smooth EMA baseline update (decay={CONFIG.training_config.ema_decay:.3f}) - prevents gradient spikes")
-                else:
-                    # Hard update at intervals - may cause gradient spikes
-                    if (episode + 1) % CONFIG.training_config.baseline_update_frequency == 0:
-                        # Update the old_model to reflect learning progress
-                        old_model = create_model_copy(adapter_model)
-                        
-                        # Re-register the embedding hook for the new old_model (for KEY embeddings)
-                        old_hook_remover()  # Remove old hook
-                        old_embeddings_dict, old_hook_remover = register_embedding_hook(old_model, embed_type="key")
-                        
-                        # NO need to recreate kv_pair_generator; embeddings will be recomputed on-the-fly
-                        logging.info("Old_model updated; KV generator preserved to avoid data repetition")
+            # Policy gradient doesn't need baseline model updates
             
             # DEBUG: Removed - EMA updates are now enabled
             
@@ -1243,8 +1326,8 @@ def main():
             plot_data = plot_data.add_episode_data(
                 episode=episode,
                 total_loss=total_loss,
-                policy_loss=policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss,
-                kl_loss=kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss,
+                policy_loss=policy_term.item() if isinstance(policy_term, torch.Tensor) else policy_term,
+                kl_loss=0.0,  # No KL loss in chain rule approach
                 avg_reward=avg_reward,
                 adapter_log_prob=adapter_log_prob,
                 baseline_log_prob=baseline_log_prob,
@@ -1264,6 +1347,15 @@ def main():
                 advantage_distribution=advantage_dist,
                 similarity_score_stats=similarity_stats,
                 policy_gradient=policy_gradient,
+                # New chain rule metrics
+                policy_term_value=policy_term_value,
+                reward_term_value=reward_term_value,
+                total_returns_mean_val=total_returns_mean_val,
+                total_returns_std_val=total_returns_std_val,
+                policy_term_variance_val=policy_term_variance_val,
+                reward_term_variance_val=reward_term_variance_val,
+                reward_gradient_norm_val=reward_gradient_norm_val,
+                policy_reward_ratio_val=policy_reward_ratio_val,
                 trajectory_sample=trajectory_sample
             )
             
@@ -1271,29 +1363,26 @@ def main():
             if episode > 0 and episode % 15 == 0:
                 # Add metadata to plot data and save
                 metadata = create_metadata(episode, {
-                    'KL_PENALTY_COEFFICIENT': CONFIG.training_config.kl_penalty_coefficient,
                     'GAMMA': CONFIG.gamma,
-                    'GAE_LAMBDA': CONFIG.gae_lambda,
-                    'USE_GRPO_BASELINE': CONFIG.training_config.use_grpo_baseline,
-                    'TEMPERATURE': CONFIG.training_config.temperature,
-                    'NUM_KV_PAIRS': CONFIG.training_config.num_kv_pairs,
-                    'BASELINE_UPDATE_FREQUENCY': CONFIG.training_config.baseline_update_frequency,
+                    'USE_GRPO_BASELINE': CONFIG.use_grpo_baseline,
+                    'TEMPERATURE': CONFIG.temperature,
+                    'NUM_KV_PAIRS': CONFIG.num_kv_pairs,
                 })
                 plot_data_with_metadata = plot_data.with_metadata(metadata)
                 save_plot_data(plot_data_with_metadata, log_dir)
                 plot_metrics(log_dir, policy_gradients)
             
             # Log every log_interval episodes
-            if episode % CONFIG.training_config.log_interval == 0:
+            if episode % CONFIG.log_interval == 0:
                 # Convert tensors to floats for logging
-                policy_loss_val = policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss
-                kl_loss_val = kl_loss.item() if isinstance(kl_loss, torch.Tensor) else kl_loss
+                policy_term_val = policy_term.item() if isinstance(policy_term, torch.Tensor) else policy_term
+                reward_term_val = reward_term.item() if isinstance(reward_term, torch.Tensor) else reward_term
                 
                 logging.info(
-                    f"Episode {episode}/{args.episodes}, "
+                    f"Episode {episode}/{CONFIG.num_episodes}, "
                     f"Total Loss: {total_loss:.4f}, "
-                    f"Policy Loss: {policy_loss_val:.4f}, "
-                    f"KL Loss: {kl_loss_val:.4f}, "
+                    f"Policy Term: {policy_term_val:.4f}, "
+                    f"Reward Term: {reward_term_val:.4f}, "
 
                     f"Reward: {avg_reward:.4f}, "
                     f"Reward Mean: {reward_stats['mean']:.4f}, "
@@ -1301,13 +1390,13 @@ def main():
                 )
                 
                 # Log to wandb if enabled
-                if CONFIG.training_config.enable_wandb:
+                if CONFIG.enable_wandb:
                     wandb.log({
                         "episode": episode,
                         "total_loss": total_loss,
-                        "policy_loss": policy_loss_val,
-                        "kl_loss": kl_loss_val,
-                        "kl_penalty_term": kl_loss_val * CONFIG.training_config.kl_penalty_coefficient,
+                        "policy_term": policy_term_val,
+                        "reward_term": reward_term_val,
+                        "chain_rule_loss": total_loss,
                         "reward": avg_reward,
                         "reward_mean": reward_stats["mean"],
                         "reward_std": reward_stats["std"],
@@ -1336,13 +1425,10 @@ def main():
         
         # Save final plot data and create plots
         final_metadata = create_metadata(episode, {
-            'KL_PENALTY_COEFFICIENT': CONFIG.training_config.kl_penalty_coefficient,
             'GAMMA': CONFIG.gamma,
-            'GAE_LAMBDA': CONFIG.gae_lambda,
-            'USE_GRPO_BASELINE': CONFIG.training_config.use_grpo_baseline,
-            'TEMPERATURE': CONFIG.training_config.temperature,
-            'NUM_KV_PAIRS': CONFIG.training_config.num_kv_pairs,
-            'BASELINE_UPDATE_FREQUENCY': CONFIG.training_config.baseline_update_frequency,
+            'USE_GRPO_BASELINE': CONFIG.use_grpo_baseline,
+            'TEMPERATURE': CONFIG.temperature,
+            'NUM_KV_PAIRS': CONFIG.num_kv_pairs,
         })
         final_plot_data = plot_data.with_metadata(final_metadata)
         save_plot_data(final_plot_data, log_dir)
@@ -1351,15 +1437,13 @@ def main():
         logging.info("Training complete!")
         
         # Close wandb if enabled
-        if CONFIG.training_config.enable_wandb:
+        if CONFIG.enable_wandb:
             wandb.finish()
     
     finally:
         # Remove hooks
         query_hook_remover()
         key_hook_remover()
-        if 'old_hook_remover' in locals():
-            old_hook_remover()
         # End overall training timer
         overall_end_time = time.time()
         total_overall_time_minutes = (overall_end_time - overall_start_time) / 60

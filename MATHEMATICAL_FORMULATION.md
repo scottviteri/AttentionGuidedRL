@@ -6,7 +6,7 @@
 
 ## Abstract
 
-This document provides a comprehensive mathematical formulation of the optimization objective implemented in the Attention-Guided Reinforcement Learning (AttentionGuidedRL) repository. The system trains a language model to autonomously guide its own training by sequencing key-value pairs from Wikipedia articles using reinforcement learning with policy gradients, multi-head attention mechanisms, and proximal policy optimization (PPO).
+This document provides a comprehensive mathematical formulation of the optimization objective implemented in the Attention-Guided Reinforcement Learning (AttentionGuidedRL) repository. The system trains a language model to autonomously guide its own training by sequencing key-value pairs from Wikipedia articles using vanilla policy gradient (REINFORCE) with multi-head attention mechanisms and GRPO baseline estimation.
 
 ---
 
@@ -17,17 +17,18 @@ This document provides a comprehensive mathematical formulation of the optimizat
 3. [Policy Definition](#policy-definition)
 4. [Reward Function](#reward-function)
 5. [Optimization Objective](#optimization-objective)
-6. [Loss Function and Training Algorithm](#loss-function-and-training-algorithm)
-7. [Training Algorithm](#training-algorithm)
-8. [Implementation Details](#implementation-details)
-9. [Key Mathematical Properties](#key-mathematical-properties)
-10. [Conclusion](#conclusion)
+6. [Advantage Estimation with GAE](#advantage-estimation-with-gae)
+7. [Loss Function and Training Algorithm](#loss-function-and-training-algorithm)
+8. [Training Algorithm](#training-algorithm)
+9. [Implementation Details](#implementation-details)
+10. [Key Mathematical Properties](#key-mathematical-properties)
+11. [Conclusion](#conclusion)
 
 ---
 
 ## Introduction
 
-The AttentionGuidedRL system implements a novel approach where a base language model (Llama-3.2-3B or GPT-2) learns to sequence its own training data through reinforcement learning. The model generates vector queries using attention mechanisms and selects key-value pairs to maximize learning progress, measured by conditional log probabilities of value tokens.
+The AttentionGuidedRL system implements a novel approach where a base language model (Llama-3.2-3B or GPT-2) learns to sequence its own training data through reinforcement learning. The model generates vector queries using attention mechanisms and selects key-value pairs to maximize learning progress, measured by conditional log probabilities of value tokens. The system uses an **advantage-based policy gradient approach with GRPO baseline estimation** and θ-dependent reward gradients for stable training.
 
 ---
 
@@ -65,13 +66,15 @@ The policy $\pi_\theta$ operates through a vector query mechanism parameterized 
 
 **Definition 3 (Query Vector Generation):** Given context $c_t$, the query vector is generated as:
 
-$$q_t = \text{AvgPool}(\text{Embed}_\theta(c_t \oplus [\text{"Query"}]))$$
+$$q_t = \text{Embed}_\theta(c_t \oplus [\text{"Query"}])_{-1}$$
 
 where:
 - $\text{Embed}_\theta(\cdot)$ extracts embeddings from the second-to-last attention layer
 - $\oplus$ denotes sequence concatenation
-- $\text{AvgPool}$ averages over the sequence dimension
+- $(\cdot)_{-1}$ extracts the embedding of the last token (the "Query" token)
 - $q_t \in \mathbb{R}^{d_{\text{model}}}$ where $d_{\text{model}}$ is the model dimension
+
+This focused extraction ensures that the model learns to encode its query intent specifically into the "Query" token, rather than diluting the signal across the entire context.
 
 ### Multi-Head Attention Similarity
 
@@ -102,18 +105,15 @@ $$\pi_\theta(k | s_t) = \frac{1}{H} \sum_{h=1}^{H} p_{t,k}^{(h)}$$
 
 ## Reward Function
 
-**Definition 7 (Step Reward):** The reward at step $t$ is defined as the conditional log probability of value tokens:
+**Definition 7 (θ-Dependent Step Reward):** The reward at step $t$ depends on the current model parameters $\theta$:
 
-$$r_t = \begin{cases}
-\log p_\theta(v_t | c_t, k_t) - \log p_{\text{ref}}(v_t | c_t, k_t) & \text{if SUBTRACT\_BASE\_MODEL\_LOGPROBS} \\
-\log p_\theta(v_t | c_t, k_t) & \text{otherwise}
-\end{cases}$$
+$$r_{\theta,t} = \log p_\theta(v_t | c_t, k_t)$$
 
 where:
 - $v_t$ are the value tokens at step $t$
-- $k_t$ are the selected key tokens at step $t$
-- $p_\theta(\cdot)$ is the adapter model probability
-- $p_{\text{ref}}(\cdot)$ is the reference model probability (base model without LoRA)
+- $k_t$ are the selected key tokens at step $t$  
+- $p_\theta(\cdot)$ is the current adapter model probability (with LoRA parameters $\theta$)
+- The reward is computed using the **current model**, making it θ-dependent
 
 **Definition 8 (Conditional Log Probability):** The conditional log probability is computed as:
 
@@ -121,150 +121,192 @@ $$\log p_\theta(v_t | c_t, k_t) = \frac{1}{|v_t|} \sum_{i=1}^{|v_t|} \log p_\the
 
 where $v_{t,i}$ is the $i$-th token in the value sequence and $v_{t,<i}$ represents the preceding tokens.
 
+**Implementation Note:** For computational efficiency, rewards are computed once during trajectory generation and reused during the chain rule update. This preserves the same gradient flow while reducing memory usage.
+
+**Configuration Option:** The system supports two reward modes:
+- `subtract_base_model_logprobs=True`: $r_{\theta,t} = \log p_\theta(v_t | c_t, k_t) - \log p_{\text{ref}}(v_t | c_t, k_t)$
+- `subtract_base_model_logprobs=False`: $r_{\theta,t} = \log p_\theta(v_t | c_t, k_t)$ (default)
+
 ---
 
 ## Optimization Objective
 
 ### Primary Objective Function
 
-**Theorem 1 (Trajectory Sampling with Step-Level Credit Assignment):** The system maximizes the following objective function:
+**Theorem 1 (Policy Gradient with θ-Dependent Rewards):** The system maximizes the following objective function:
 
-$$\mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=1}^T A_t(\tau) \cdot \log \pi_\theta(a_t | s_t) \right] - \beta \cdot D_{KL}(\pi_\theta || \pi_{\text{ref}})$$
+$$\mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ R_\theta(\tau) \right]$$
 
-where:
-- $\tau = (s_1, a_1, r_1, \ldots, s_T, a_T, r_T)$ is a complete trajectory sampled from policy $\pi_\theta$
-- $A_t(\tau) = R_t(\tau) - b_t$ is the **trajectory-dependent advantage** at step $t$
-- $R_t(\tau) = \sum_{t'=t}^T \gamma^{t'-t} r_{t'}$ are the discounted returns from step $t$ forward in trajectory $\tau$
-- $b_t = \mathbb{E}_{\text{batch}}[R_t(\tau)]$ is the GRPO baseline (batch average of returns at step $t$)
-- $\gamma = 0.99$ is the discount factor
-- $\beta = 0.1$ is the KL penalty coefficient
-- $\pi_{\text{ref}}$ is the fixed reference policy (base model without LoRA)
+where $R_\theta(\tau) = \sum_{t=1}^T \gamma^{t-1} r_{\theta,t}$ and the instantaneous reward depends on the current model parameters:
 
-**Key Insight:** We sample complete trajectories first, then assign step-specific credit. Each action $a_t$ receives weight $A_t(\tau)$ that depends on the **actual future rewards** observed in that trajectory, not a trajectory-average.
+$$r_{\theta,t} = \frac{1}{|v_t|} \sum_{i=1}^{|v_t|} \log p_\theta(v_{t,i} | c_t, k_t, v_{t,<i})$$
 
-### Return and Advantage Computation
+**Key Insight:** Since rewards depend on $\theta$, the gradient derivation uses the chain rule combined with **advantage-based policy gradients**:
 
-**Definition 9 (Discounted Returns):** The return at timestep $t$ is:
-
-$$R_t = \sum_{t'=t}^T \gamma^{t'-t} r_{t'}$$
-
-**Definition 10 (GRPO Advantage Estimation):** The system uses Group Relative Policy Optimization (GRPO) for advantage estimation:
-
-$$A_t(\tau^{(i)}) = R_t(\tau^{(i)}) - b_t$$
-$$b_t = \frac{1}{B} \sum_{i=1}^B R_t(\tau^{(i)})$$
+$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=1}^T A_t \cdot \nabla_\theta \log \pi_\theta(a_t | s_t) + \lambda \sum_{t=1}^T \gamma^{t-1} \nabla_\theta r_{\theta,t} \right]$$
 
 where:
-- $\tau^{(i)}$ is the $i$-th trajectory in the batch
-- $b_t$ is the per-timestep baseline computed as the batch average of returns at step $t$
-- $B$ is the batch size
-- Each trajectory gets its own advantage based on its actual returns vs. the batch average
+- $A_t$ are **normalized advantages** computed using GRPO baseline: $A_t = \frac{r_{\theta,t} - b_{\text{batch}} - \mu_A}{\sigma_A + \epsilon}$
+- $b_{\text{batch}} = \frac{1}{B} \sum_{i=1}^B \sum_{t=1}^T r_{\theta,t}^{(i)}$ is the GRPO batch baseline
+- $\mu_A, \sigma_A$ are the mean and standard deviation of advantages for normalization
+- $\lambda = 0.1$ is a scaling factor for the reward gradient term
+- $\nabla_\theta r_{\theta,t}$ is the reward gradient term (recomputed efficiently)
+
+**Chain Rule Justification:** Since the reward function $r_{\theta,t}$ depends on the same parameters $\theta$ as the policy, the chain rule for $\frac{d}{d\theta}\mathbb{E}_{\tau \sim \pi_\theta}[R_\theta(\tau)]$ requires both terms:
+
+1. **Policy gradient term:** How changing $\theta$ affects the probability of sampling high-reward trajectories
+2. **Reward gradient term:** How changing $\theta$ affects the reward evaluation of sampled trajectories
+
+**Mathematical Equivalence:** In expectation, this chain rule approach produces the same gradient direction as standard REINFORCE with advantages:
+$$\mathbb{E}_{\tau \sim \pi_\theta}[R_\theta(\tau) \cdot \nabla_\theta \log \pi_\theta(\tau)] = \mathbb{E}_{\tau \sim \pi_\theta}[\sum_{t=1}^T R_t(\tau) \cdot \nabla_\theta \log \pi_\theta(a_t | s_t)]$$
+
+where $R_t(\tau)$ are the returns-to-go. The reward gradient term $\nabla_\theta R_\theta(\tau)$ provides additional signal that standard REINFORCE lacks.
+
+**Key Insight:** This chain rule approach uses the **total trajectory return** $R_\theta(\tau)$ to weight each action's gradient contribution, rather than step-specific advantages. This creates a unified learning signal where all actions in successful trajectories receive positive gradients.
+
+### Total Return Computation
+
+**Definition 9 (Total Trajectory Return):** The total discounted return for trajectory $\tau$ is:
+
+$$R_\theta(\tau) = \sum_{t=1}^T \gamma^{t-1} r_{\theta,t}$$
+
+where $r_{\theta,t}$ is the θ-dependent reward at step $t$.
+
+**Key Property:** Unlike advantage-based methods, this approach assigns the **same weight** (the total return) to all actions within a trajectory, emphasizing trajectory-level success rather than step-specific credit assignment.
+
+**Note:** The system implements the chain rule approach directly and does not use advantage estimation or GAE. The advantages computation exists in the codebase for compatibility and monitoring purposes but is not used in the core training loop.
 
 ---
 
 ## Loss Function and Training Algorithm
 
-### PPO Loss Implementation
+### Chain Rule Policy Gradient Loss
 
-**Theorem 2 (Trajectory-Level PPO with Step-Specific Credit Assignment):** The actual loss function implements PPO over complete trajectories with step-specific advantages:
+**Theorem 2 (Policy Gradient with θ-Dependent Reward Chain Rule):** The loss function implements the chain rule derivation for θ-dependent rewards:
 
-$$\mathcal{L}(\theta) = \mathbb{E}_{\text{batch}} \left[ -\sum_{t=1}^T \min\left( \rho_t(\theta, \tau) \cdot A_t(\tau), \text{clip}(\rho_t(\theta, \tau), 1-\epsilon, 1+\epsilon) \cdot A_t(\tau) \right) \right] + \beta \cdot D_{KL}(\pi_\theta || \pi_{\text{ref}})$$
+$$\mathcal{L}(\theta) = \mathbb{E}_{\text{batch}} \left[ -R_\theta(\tau) \cdot \sum_{t=1}^T \log \pi_\theta(a_t | s_t) - \sum_{t=1}^T \gamma^{t-1} \nabla_\theta r_{\theta,t} \right]$$
 
-where:
-- $\tau$ is a complete trajectory sampled from $\pi_\theta$
-- $A_t(\tau) = R_t(\tau) - b_t$ is the **trajectory-dependent advantage** at step $t$
-- $\rho_t(\theta, \tau) = \frac{\pi_\theta(a_t | s_t)}{\pi_{\text{old}}(a_t | s_t)}$ is the probability ratio for action $a_t$ in trajectory $\tau$
-- $\epsilon = 0.2$ is the PPO clipping parameter
-- $\text{clip}(x, a, b) = \max(a, \min(x, b))$
-- KL divergence is computed against the fixed reference policy $\pi_{\text{ref}}$
+**Decomposition into Two Terms:**
 
-**Process Supervision Interpretation:** Each action $a_t$ in trajectory $\tau$ receives credit proportional to $A_t(\tau)$ - the actual rewards-to-go observed from that step forward in that specific trajectory, enabling precise temporal credit assignment.
+1. **Policy Gradient Term**: $-R_\theta(\tau) \cdot \nabla_\theta \log \pi_\theta(\tau)$
+   - Standard REINFORCE scaled by total trajectory return
+   - Encourages actions that led to high-reward trajectories
 
-### Step-Level Credit Assignment Details
+2. **Reward Gradient Term**: $-\nabla_\theta R_\theta(\tau) = -\sum_{t=1}^T \gamma^{t-1} \nabla_\theta r_{\theta,t}$
+   - Direct optimization of reward model parameters
+   - Natural regularization by encouraging the model to assign higher rewards
 
-**Definition 12 (Trajectory-Dependent Gradient Decomposition):** The policy gradient decomposes into trajectory-dependent step contributions:
+**Key Properties:**
+1. **Self-Consistent Rewards**: Both policy and reward computation use current model $\pi_\theta$
+2. **Natural Regularization**: Reward gradient term provides stability without artificial KL penalty
+3. **Unified Objective**: Both action selection and reward assignment optimized jointly
+4. **Mathematical Rigor**: Proper chain rule application for θ-dependent rewards
 
-$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=1}^T A_t(\tau) \cdot \nabla_\theta \log \pi_\theta(a_t | s_t) \right]$$
+### Trajectory Sampling 
 
-This formulation ensures:
+**Definition 12 (Current Policy Sampling):** All trajectories are sampled using the current policy:
 
-1. **Proper Temporal Credit**: Action $a_1$ in trajectory $\tau$ affects actual rewards $\{r_1, r_2, \ldots, r_T\}$ observed in $\tau$, so $A_1(\tau) = \sum_{t'=1}^T \gamma^{t'-1} r_{t'} - b_1$
-2. **Diminishing Influence**: Action $a_T$ in trajectory $\tau$ only affects the final reward $r_T$ in $\tau$, so $A_T(\tau) = r_T - b_T$  
-3. **Trajectory-Specific Assessment**: Each action's contribution is evaluated against actual observed outcomes in that trajectory
+$$\tau \sim \pi_\theta$$
 
-**Comparison with Alternative Formulations:**
+- Trajectories are generated using the current adapter model (with LoRA weights)
+- This ensures truly on-policy data for policy gradient updates
+- No old model copies or memory-efficient state management needed
+- Simpler implementation with lower memory footprint
 
-- **Trajectory-Average**: $\mathcal{L} = -\bar{A}(\tau) \sum_{t=1}^T \log \pi_\theta(a_t | s_t)$ where $\bar{A}(\tau) = \frac{1}{T}\sum_{t=1}^T A_t(\tau)$
-- **Step-Specific** (our approach): $\mathcal{L} = -\sum_{t=1}^T A_t(\tau) \log \pi_\theta(a_t | s_t)$
+**Mathematical Formulation:** The chain rule policy gradient becomes:
 
-**Key Difference:** In trajectory-average, all actions in a trajectory get the same gradient weight. In our step-specific approach, early actions naturally receive higher gradients when they lead to better future outcomes in that specific trajectory.
+$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ R_\theta(\tau) \cdot \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t) + \sum_{t=1}^T \gamma^{t-1} \nabla_\theta r_{\theta,t} \right]$$
+
+where $\nabla_\theta \log \pi_\theta(\tau) = \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t)$ is the sum of individual action log-gradients.
+
+### Chain Rule Implementation Details
+
+**Definition 13 (Chain Rule Gradient Decomposition):** The θ-dependent objective decomposes into two complementary terms:
+
+1. **Policy Term**: $R_\theta(\tau) \cdot \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t)$
+   - Uses total trajectory return to weight all action gradients equally
+   - Successful trajectories reinforce all actions that led to success
+   - Simpler credit assignment: trajectory-level rather than step-level
+
+2. **Reward Term**: $\sum_{t=1}^T \gamma^{t-1} \nabla_\theta r_{\theta,t}$
+   - Direct optimization of the reward function itself
+   - Encourages the model to assign higher probabilities to selected value tokens
+   - Provides natural regularization without artificial penalties
+
+**Key Property:** Both terms optimize the same parameters θ, creating a **self-consistent learning signal** where the model learns to both select good actions AND accurately evaluate their outcomes.
+
+**Comparison with Standard REINFORCE:**
+
+- **Standard REINFORCE**: $\mathcal{L} = -\sum_{t=1}^T A_t(\tau) \log \pi_\theta(a_t | s_t)$ (step-specific advantages)
+- **Chain Rule Approach**: $\mathcal{L} = -R_\theta(\tau) \sum_{t=1}^T \log \pi_\theta(a_t | s_t) - \sum_{t=1}^T \gamma^{t-1} \nabla_\theta r_{\theta,t}$ (total return + reward gradient)
+
+**Advantages of Chain Rule Approach:**
+1. **Unified Objective**: Policy and reward optimization happen simultaneously
+2. **Natural Regularization**: Reward term prevents divergence without KL penalties
+3. **Self-Consistency**: No mismatch between action sampling and reward evaluation
+4. **Simplified Training**: No need for advantage computation or baseline management
 
 ### Implementation Details: Math-Code Correspondence
 
 **Code Implementation Overview:**
 ```python
-# 1. Generate complete trajectories first
+# 1. Generate complete trajectories using current policy
 trajectory = generate_trajectory(adapter_model, ...)
 
-# 2. Compute trajectory-dependent advantages 
-advantages, _ = compute_advantages(trajectory.rewards, gamma=GAMMA)
-# advantages[batch_idx, step_t] = A_t(τ^(batch_idx))
+# 2. Compute total trajectory returns R_θ(τ)
+total_returns = trajectory.rewards.sum(dim=1)  # Sum over time steps for each trajectory
 
-# 3. Apply step-specific PPO loss
+# 3. Apply θ-dependent reward chain rule loss
+policy_term = 0.0
+reward_term = 0.0
+
 for t, qkv_step in enumerate(trajectory.qkv_steps):
-    step_advantages = advantages[:, t]  # A_t(τ) for each trajectory in batch
+    # Policy gradient term: R_θ(τ) * ∇log π_θ(a_t|s_t)
+    current_action_log_probs = compute_action_log_probs(qkv_step)
+    policy_gradient_t = total_returns * current_action_log_probs
+    policy_term += policy_gradient_t.sum()  # Sum over batch
     
-    # Compute probability ratios
-    ratio = π_θ(a_t|s_t) / π_old(a_t|s_t)
-    
-    # PPO clipped objective with step-specific advantages
-    unclipped = ratio * step_advantages  # ρ_t(θ,τ) * A_t(τ)
-    clipped = clip(ratio, 1-ε, 1+ε) * step_advantages
-    ppo_loss_t = -min(unclipped, clipped)
-    
-    total_loss += ppo_loss_t  # Accumulate across steps
+    # Reward gradient term: ∇_θ r_{θ,t} (via pre-computed rewards with autograd)
+    step_reward = trajectory.rewards[:, t]  # Pre-computed during trajectory generation
+    gamma_t = gamma ** t
+    reward_term += gamma_t * step_reward.sum()  # Sum over batch
+
+# Total loss: negative for gradient ascent → descent  
+total_loss = -(policy_term + reward_term)
 ```
 
 **Mathematical Correspondence:**
-- **Line `advantages[:, t]`** ↔ $A_t(\tau^{(i)})$ - trajectory-dependent advantage at step $t$
-- **Line `ratio * step_advantages`** ↔ $\rho_t(\theta, \tau) \cdot A_t(\tau)$ - weighted by trajectory-specific advantage
-- **Loop accumulation** ↔ $\sum_{t=1}^T$ in the loss function
-- **Batch processing** ↔ $\mathbb{E}_{\text{batch}}[\cdot]$ expectation over trajectories
+- **Line `total_returns`** ↔ $R_\theta(\tau)$ - total discounted return for each trajectory in batch
+- **Line `total_returns * current_action_log_probs`** ↔ $R_\theta(\tau) \cdot \log \pi_\theta(a_t | s_t)$ - policy gradient term
+- **Line `reward_t`** ↔ $r_{\theta,t}$ - instantaneous θ-dependent reward
+- **Line `gamma_t * reward_t.sum()`** ↔ $\gamma^{t-1} \nabla_\theta r_{\theta,t}$ - discounted reward gradient
+- **Line `policy_term + reward_term`** ↔ complete chain rule decomposition $\nabla_\theta \mathcal{J}(\theta)$
 
-**Key Insight:** The code samples complete trajectories, computes their actual returns, then assigns credit to each action based on what actually happened in that trajectory - not on average expectations.
+**Key Insight:** Both the policy (action selection) and reward (outcome evaluation) are optimized using the same current model parameters $\theta$. This creates a self-consistent learning signal where the model learns to both select good actions AND accurately evaluate their outcomes.
 
-### KL Divergence Regularization
-
-**Definition 11 (KL Divergence Term):** The KL divergence regularization is computed as:
-
-$$D_{KL}(\pi_\theta || \pi_{\text{ref}}) = \sum_{t=1}^T \sum_{k \in \mathcal{K}_t^{\text{available}}} \pi_\theta(k|s_t) \log \frac{\pi_\theta(k|s_t)}{\pi_{\text{ref}}(k|s_t)}$$
-
-This is implemented using PyTorch's `F.kl_div` with `log_target=True` for numerical stability. The reference policy $\pi_{\text{ref}}$ is the fixed base model without LoRA, providing a stable regularization target.
+**Stability Analysis:** The reward gradient term $\nabla_\theta R_\theta(\tau)$ provides natural regularization by encouraging the model to assign higher probabilities to the value tokens it selected. This prevents divergence without requiring artificial KL penalties against a mismatched reference policy.
 
 ---
 
 ## Training Algorithm
 
-**Algorithm 1: Attention-Guided RL Training**
+**Algorithm 1: Attention-Guided RL Training (Chain Rule Policy Gradient)**
 
 ```
 Input: Base model, tokenizer, Wikipedia dataset
-Input: Hyperparameters γ, β, ε, learning rate, batch size
+Input: Hyperparameters γ, learning rate, batch size
 
 1. Initialize LoRA adapter parameters θ
-2. Initialize reference model π_ref (base model without LoRA, fixed)
-3. Initialize old model π_old ← π_θ
-4. Initialize optimizer (AdamW with learning rate 5×10⁻⁴)
+2. Initialize optimizer (AdamW with learning rate 5×10⁻⁴)
 
-5. For episode = 1 to NUM_EPISODES:
+3. For episode = 1 to NUM_EPISODES:
    a. Sample Wikipedia article and extract key-value pairs
    b. Generate trajectory τ using current policy π_θ
-   c. Compute rewards {r_t}ᵀₜ₌₁ using Equation (7)
-   d. Compute returns {R_t}ᵀₜ₌₁ using Equation (9)
-   e. Compute advantages {A_t}ᵀₜ₌₁ using GRPO (Equations 10-11)
-   f. Compute PPO loss ℒ(θ) using Equation (12) with KL vs π_ref
-   g. Update parameters: θ ← θ - ∇_θ ℒ(θ)
-   h. If episode mod BASELINE_UPDATE_FREQUENCY == 0:
-      Update old model: π_old ← π_θ (for PPO ratios only)
+   c. Compute rewards {r_{θ,t}}ᵀₜ₌₁ using current model θ
+   d. Compute total returns R_θ(τ) = Σₜγᵗ⁻¹r_{θ,t} for each trajectory
+   e. Compute chain rule loss: ℒ(θ) = -(R_θ(τ)·∇log π_θ(τ) + ∇R_θ(τ))
+   f. Update parameters: θ ← θ - ∇_θ ℒ(θ)
+   g. Save checkpoint periodically
 ```
 
 ---
@@ -296,7 +338,7 @@ Input: Hyperparameters γ, β, ε, learning rate, batch size
 
 ### Convergence Properties
 
-**Lemma 1 (Policy Improvement):** Under the PPO clipped objective with appropriate clipping parameter $\epsilon$, the policy improvement is guaranteed to be conservative, preventing destructively large updates.
+**Lemma 1 (Policy Improvement):** Under the chain rule policy gradient objective, the policy improvement follows standard REINFORCE convergence guarantees. The additional reward gradient term provides natural regularization without requiring explicit baseline estimation.
 
 ### Attention Mechanism Properties
 
@@ -304,13 +346,13 @@ Input: Hyperparameters γ, β, ε, learning rate, batch size
 
 $$\sum_{k \in \mathcal{K}_t^{\text{available}}} \pi_\theta(k | s_t) = 1$$
 
-### GRPO Baseline Properties
+### Chain Rule Properties
 
-**Theorem 3 (Unbiased Advantage Estimation):** The GRPO baseline provides unbiased gradient estimates:
+**Theorem 3 (Self-Consistent Learning):** The chain rule approach ensures self-consistent parameter updates:
 
-$$\mathbb{E}[A_t] = 0 \quad \text{for each timestep } t$$
+$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}[R_\theta(\tau) \cdot \nabla_\theta \log \pi_\theta(\tau) + \nabla_\theta R_\theta(\tau)]$$
 
-This property holds by construction since $A_t = R_t - \mathbb{E}[R_t]$ where the expectation is over the batch.
+Both terms optimize the same parameters $\theta$, creating a unified learning signal where the model learns to both select high-reward actions AND accurately evaluate their outcomes.
 
 ---
 
@@ -319,13 +361,26 @@ This property holds by construction since $A_t = R_t - \mathbb{E}[R_t]$ where th
 This mathematical formulation describes a sophisticated reinforcement learning system that combines:
 
 1. **Vector-based policy**: Using attention layer embeddings for query generation
-2. **Multi-head attention similarity**: Handling both MHA and GQA architectures
-3. **Step-level PPO optimization**: With proper temporal credit assignment through step-specific advantages
-4. **GRPO advantage estimation**: For variance reduction without additional parameters
-5. **Process supervision**: Where each action receives credit proportional to its impact on future outcomes
+2. **Multi-head attention similarity**: Handling both MHA and GQA architectures  
+3. **θ-dependent reward chain rule**: Proper gradient computation for model-dependent rewards
+4. **Total return weighting**: All actions in successful trajectories receive positive gradients
+5. **Self-consistent training**: Both policy and rewards computed using current model θ
 6. **Self-supervised learning**: Where the model learns to sequence its own training data
 
-The key innovation is the **step-level formulation** that ensures proper credit assignment: early key selections (which affect more future rewards) naturally receive higher gradient magnitudes than later selections. This creates a natural curriculum where the model learns to prioritize the quality of early decisions while still optimizing the entire sequence.
+The key innovation is the **θ-dependent reward formulation** with proper chain rule application:
+
+$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ R_\theta(\tau) \cdot \nabla_\theta \log \pi_\theta(\tau) + \nabla_\theta R_\theta(\tau) \right]$$
+
+This creates two complementary learning signals:
+- **Policy gradient term**: Encourages actions that led to high-reward trajectories
+- **Reward gradient term**: Directly optimizes the model's ability to generate high rewards
+
+**Advantages of the θ-Dependent Approach:**
+- **Self-Consistent**: No mismatch between policy and reward model (both use current θ)
+- **Natural Regularization**: Reward gradient term provides stability without artificial KL penalties
+- **Mathematically Rigorous**: Proper chain rule application for θ-dependent objectives
+- **Unified Learning**: Action selection and outcome evaluation optimized jointly
+- **Memory Efficient**: No need for reference models or old model copies
 
 The system represents a novel approach to active learning where the model's attention mechanisms directly drive the selection of training examples, creating a feedback loop between the model's internal representations and its learning curriculum.
 

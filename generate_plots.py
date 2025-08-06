@@ -223,6 +223,13 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     advantage_distributions = data['advantage_distributions'][:min_length]
     similarity_score_stats = data['similarity_score_stats'][:min_length]
     
+    # Chain rule specific metrics (with fallbacks for backwards compatibility)
+    policy_term_values = smooth_data(data.get('policy_term_values', [0.0] * min_length)[:min_length], smooth_window)
+    reward_term_values = smooth_data(data.get('reward_term_values', [0.0] * min_length)[:min_length], smooth_window)
+    total_returns_mean = smooth_data(data.get('total_returns_mean', [0.0] * min_length)[:min_length], smooth_window)
+    total_returns_std = smooth_data(data.get('total_returns_std', [0.0] * min_length)[:min_length], smooth_window)
+    policy_reward_ratio = smooth_data(data.get('policy_reward_ratio', [1.0] * min_length)[:min_length], smooth_window)
+    
     # Create comprehensive figure with 3 rows and 4 columns (removing 2 redundant plots)
     fig, axes = plt.subplots(3, 4, figsize=(24, 18))
     axes = axes.flatten()
@@ -230,13 +237,13 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     # Determine title suffix for smoothing
     title_suffix = f" (smoothed, window={smooth_window})" if smooth_window > 1 else ""
     
-    # Plot 1: Loss Components
-    axes[0].plot(training_steps, total_losses, 'b-', label='Total Loss', linewidth=2)
-    axes[0].plot(training_steps, policy_losses, 'g--', label='Policy Loss', linewidth=1.5)
-    axes[0].plot(training_steps, kl_penalty_terms, 'r:', label=f'KL Penalty (β={KL_PENALTY_COEFFICIENT})', linewidth=1.5)
+    # Plot 1: Chain Rule Loss Components  
+    axes[0].plot(training_steps, total_losses, 'b-', label='Total Chain Rule Loss', linewidth=2)
+    axes[0].plot(training_steps, policy_losses, 'g--', label=r'Policy Term $R_\theta(\tau) \cdot \nabla\log\pi_\theta(\tau)$', linewidth=1.5)
+    axes[0].plot(training_steps, kl_penalty_terms, 'r:', label=r'Reward Term $\nabla R_\theta(\tau)$', linewidth=1.5)
     axes[0].set_xlabel('Training Step')
     axes[0].set_ylabel('Loss')
-    axes[0].set_title(f'Loss Components{title_suffix}')
+    axes[0].set_title(f'Chain Rule Loss Components{title_suffix}')
     axes[0].legend(fontsize=8)
     axes[0].grid(True, alpha=0.3)
     
@@ -258,29 +265,29 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         if episode <= max(training_steps):
             axes[1].axvline(x=episode, color='red', linestyle='--', alpha=0.6, linewidth=1)
     
-    # Plot 3: Model Log Probabilities
-    axes[2].plot(training_steps, adapter_log_probs, 'darkgreen', label='Adapter Model', linewidth=2)
-    axes[2].plot(training_steps, baseline_log_probs, 'orange', label='Baseline Model', linewidth=2)
-    axes[2].plot(training_steps, base_log_probs, 'blue', label='Base Model', linewidth=2)
+    # Plot 3: θ-Dependent Step Rewards  
+    axes[2].plot(training_steps, adapter_log_probs, 'darkgreen', label=r'$r_{\theta,t}$ (Adapter)', linewidth=2)
+    axes[2].plot(training_steps, baseline_log_probs, 'orange', label=r'$r_{\theta,t}$ (Baseline)', linewidth=2)
+    axes[2].plot(training_steps, base_log_probs, 'blue', label=r'$r_{\theta,t}$ (Reference)', linewidth=2)
     axes[2].set_xlabel('Training Step')
-    axes[2].set_ylabel('Avg Log Prob (per token)')
-    axes[2].set_title(f'Model Log Probabilities{title_suffix}')
+    axes[2].set_ylabel(r'$r_{\theta,t} = \log p_\theta(v_t | c_t, k_t)$')
+    axes[2].set_title(f'θ-Dependent Step Rewards{title_suffix}')
     axes[2].legend(fontsize=8)
     axes[2].grid(True, alpha=0.3)
     
-    # Plot 4: Advantages
-    axes[3].plot(training_steps, avg_advantages, 'brown', linewidth=2, label='Avg Advantage')
-    axes[3].axhline(y=0, color='gray', linestyle='-', alpha=0.5)
+    # Plot 4: Chain Rule Component Analysis
+    policy_term_abs = [abs(x) for x in policy_term_values]
+    reward_term_abs = [abs(x) for x in reward_term_values]
+    
+    axes[3].plot(training_steps, policy_term_abs, 'green', linewidth=2, label=r'$|R_\theta(\tau) \cdot \nabla\log\pi_\theta(\tau)|$')
+    axes[3].plot(training_steps, reward_term_abs, 'red', linewidth=2, label=r'$|\nabla R_\theta(\tau)|$')
+    axes[3].plot(training_steps, policy_reward_ratio, 'blue', linewidth=1.5, linestyle='--', label='Policy/Reward Ratio')
     axes[3].set_xlabel('Training Step')
-    axes[3].set_ylabel('Average Advantage')
-    axes[3].set_title(f'Advantage Statistics{title_suffix}')
+    axes[3].set_ylabel('Magnitude')
+    axes[3].set_title(f'Chain Rule Component Magnitudes{title_suffix}')
     axes[3].legend(fontsize=8)
     axes[3].grid(True, alpha=0.3)
-    if len(training_steps) > 10:
-        z = np.polyfit(training_steps, avg_advantages, 1)
-        p = np.poly1d(z)
-        axes[3].plot(training_steps, p(training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
-        axes[3].legend(fontsize=8)
+    axes[3].set_yscale('log')
     
     # Plot 5: Gradient Norm
     axes[4].plot(training_steps, gradient_magnitudes, 'red', linewidth=2)
@@ -409,7 +416,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[10].set_yscale('log')
     axes[10].grid(True, alpha=0.3)
     
-    # Plot 12: Advantage Distribution Analysis
+    # Plot 12: GRPO Advantage Monitoring (Not Used in Training)
     positive_percentages = smooth_data([d['positive_percentage'] for d in advantage_distributions], smooth_window)
     negative_percentages = smooth_data([d['negative_percentage'] for d in advantage_distributions], smooth_window)
     
@@ -418,7 +425,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[11].axhline(y=50.0, color='gray', linestyle='--', alpha=0.5, label='50% (Balanced)')
     axes[11].set_xlabel('Training Step')
     axes[11].set_ylabel('Percentage (%)')
-    axes[11].set_title(f'Advantage Distribution (Step-Level Learning Signal){title_suffix}')
+    axes[11].set_title(f'GRPO Advantages (Monitoring Only - Not Used in Training){title_suffix}')
     axes[11].set_ylim(0, 100)
     axes[11].legend(fontsize=7)
     axes[11].grid(True, alpha=0.3)
@@ -532,6 +539,45 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         plt.savefig(similarity_path, dpi=150)
         plt.close()
         print(f"Saved similarity analysis to: {similarity_path}")
+
+    # Create chain rule total return analysis
+    if len(training_steps) > 5:
+        plt.figure(figsize=(12, 6))
+        
+        # Create subplot for total return statistics
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+        
+        # Subplot 1: Total returns with confidence intervals
+        ax1.plot(training_steps, total_returns_mean, 'blue', linewidth=2, label=r'Mean $R_\theta(\tau)$')
+        if any(x > 0 for x in total_returns_std):
+            upper_bound = [m + s for m, s in zip(total_returns_mean, total_returns_std)]
+            lower_bound = [m - s for m, s in zip(total_returns_mean, total_returns_std)]
+            ax1.fill_between(training_steps, lower_bound, upper_bound, alpha=0.3, color='blue', label='±1 Std Dev')
+        ax1.set_xlabel('Training Step')
+        ax1.set_ylabel(r'Total Return $R_\theta(\tau)$')
+        title = 'Total Trajectory Returns'
+        if smooth_window > 1:
+            title += f' (smoothed, window={smooth_window})'
+        ax1.set_title(title)
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+        
+        # Subplot 2: Return variance over time
+        ax2.plot(training_steps, total_returns_std, 'red', linewidth=2, label='Return Std Dev')
+        ax2.set_xlabel('Training Step')
+        ax2.set_ylabel('Standard Deviation')
+        title = 'Return Variance (Gradient Estimator Quality)'
+        if smooth_window > 1:
+            title += f' (smoothed, window={smooth_window})'
+        ax2.set_title(title)
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+        
+        plt.tight_layout()
+        returns_path = os.path.join(output_dir, 'total_returns_analysis.png')
+        plt.savefig(returns_path, dpi=150)
+        plt.close()
+        print(f"Saved total returns analysis to: {returns_path}")
 
     # Create step-level learning dynamics analysis
     if len(training_steps) > 10:

@@ -280,14 +280,19 @@ def compute_embeddings(embedding_fn: Callable[[torch.Tensor], torch.Tensor], bat
 
         total_time_ms = (end_time - start_time) * 1000
         
-        logging.info(f"Key embedding computation took: {total_time_ms:.2f} ms")
-        if torch.cuda.is_available():
-            # Report increase in allocated memory
-            allocated_increase_mb = (final_mem_allocated - initial_mem_allocated) / (1024 * 1024)
-            # Report total cached/reserved memory
-            cached_memory_mb = final_mem_cached / (1024 * 1024)
-            logging.info(f"  CUDA Allocated Memory Increase: {allocated_increase_mb:.2f} MB")
-            logging.info(f"  CUDA Total Cached Memory: {cached_memory_mb:.2f} MB")
+        # Only log memory details for first few episodes or every 100 episodes to reduce verbosity
+        episode_num = getattr(compute_for_keys, '_episode_counter', 0)
+        compute_for_keys._episode_counter = episode_num + 1
+        
+        if episode_num < 5 or episode_num % 100 == 0:
+            logging.info(f"Key embedding computation took: {total_time_ms:.2f} ms")
+            if torch.cuda.is_available():
+                # Report increase in allocated memory
+                allocated_increase_mb = (final_mem_allocated - initial_mem_allocated) / (1024 * 1024)
+                # Report total cached/reserved memory
+                cached_memory_mb = final_mem_cached / (1024 * 1024)
+                logging.info(f"  CUDA Allocated Memory Increase: {allocated_increase_mb:.2f} MB")
+                logging.info(f"  CUDA Total Cached Memory: {cached_memory_mb:.2f} MB")
 
         return all_embeddings
     return compute_for_keys
