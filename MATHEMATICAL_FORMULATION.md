@@ -111,7 +111,7 @@ $$r_{\theta,t} = \log p_\theta(v_t | c_t, k_t)$$
 
 where:
 - $v_t$ are the value tokens at step $t$
-- $k_t$ are the selected key tokens at step $t$  
+- $k_t$ are the selected key tokens at step $t$
 - $p_\theta(\cdot)$ is the current adapter model probability (with LoRA parameters $\theta$)
 - The reward is computed using the **current model**, making it θ-dependent
 
@@ -133,67 +133,46 @@ where $v_{t,i}$ is the $i$-th token in the value sequence and $v_{t,<i}$ represe
 
 ### Primary Objective Function
 
-**Theorem 1 (Policy Gradient with θ-Dependent Rewards):** The system maximizes the following objective function using average future reward weighting:
+**Theorem 1 (Policy Gradient with θ-Dependent Rewards):** The system maximizes the following objective function:
 
 $$\mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=1}^T \bar{R}_t(\tau) \right]$$
 
-where the instantaneous reward depends on the current model parameters:
-
-$$r_{\theta,t} = \frac{1}{|v_t|} \sum_{i=1}^{|v_t|} \log p_\theta(v_{t,i} | c_t, k_t, v_{t,<i})$$
-
-**Key Insight:** Since rewards depend on $\theta$, the gradient derivation uses the chain rule combined with **average future reward weighting**:
-
-$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=1}^T \tilde{A}_t \cdot \nabla_\theta \log \pi_\theta(a_t | s_t) + \lambda \sum_{t=1}^T \nabla_\theta r_{\theta,t} \right]$$
-
 where:
 - $\bar{R}_t(\tau) = \frac{1}{T-t+1} \sum_{s=t}^T r_{\theta,s}$ is the **average reward after time $t$**
-- $A_t = \bar{R}_t(\tau) - b_{\text{batch}}$ where $b_{\text{batch}}$ is the GRPO batch baseline
-- $\tilde{A}_t = \frac{A_t - \mu_A}{\sigma_A + \epsilon}$ are **normalized advantages**
-- $\lambda = 0.1$ is a scaling factor for the reward gradient term
-- This approach avoids discount factors in the gradient computation while maintaining proper credit assignment
+- $r_{\theta,t} = \frac{1}{|v_t|} \sum_{i=1}^{|v_t|} \log p_\theta(v_{t,i} | c_t, k_t, v_{t,<i})$ is the instantaneous θ-dependent reward
 
-**Chain Rule Justification:** Since the reward function $r_{\theta,t}$ depends on the same parameters $\theta$ as the policy, the chain rule for $\frac{d}{d\theta}\mathbb{E}_{\tau \sim \pi_\theta}[\sum_{t=1}^T \bar{R}_t(\tau)]$ requires both terms:
+**Detailed Gradient Derivation:** Since both the policy and rewards depend on $\theta$, we apply the chain rule:
 
-1. **Policy gradient term:** How changing $\theta$ affects the probability of sampling high-reward trajectories
-2. **Reward gradient term:** How changing $\theta$ affects the reward evaluation of sampled trajectories
+$$\nabla_\theta \mathcal{J}(\theta) = \nabla_\theta \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=1}^T \bar{R}_t(\tau) \right]$$
 
-**Advantage-Based Formulation:** This approach uses **step-specific advantages** rather than total trajectory returns, providing better credit assignment:
+**Step 1: Expand $\bar{R}_t(\tau)$**
+$$\mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=1}^T \frac{1}{T-t+1} \sum_{s=t}^T r_{\theta,s} \right]$$
 
-$$\mathbb{E}_{\tau \sim \pi_\theta}[\sum_{t=1}^T A_t \cdot \nabla_\theta \log \pi_\theta(a_t | s_t)]$$
+**Step 2: Interchange summation order**
+$$= \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{s=1}^T r_{\theta,s} \sum_{t=1}^s \frac{1}{T-t+1} \right]$$
 
-where $A_t$ captures the relative improvement of action $a_t$ over the baseline. The reward gradient term $\lambda \nabla_\theta R_\theta(\tau)$ provides additional signal for parameter optimization.
+Let $w_s = \sum_{t=1}^s \frac{1}{T-t+1}$ be the **weight coefficient** for reward $r_{\theta,s}$.
 
-**Key Benefits:**
-1. **Reduced Variance**: GRPO baseline subtraction and advantage normalization stabilize training
-2. **Better Credit Assignment**: Step-specific advantages rather than trajectory-level returns
-3. **Stable Magnitudes**: Loss components are scaled to similar magnitudes (~1-10 range)
+**Step 3: Apply chain rule for θ-dependent rewards and policy**
+$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{s=1}^T w_s \nabla_\theta r_{\theta,s} \right] + \mathbb{E}_{\tau \sim \pi_\theta} \left[ \nabla_\theta \log \pi_\theta(\tau) \sum_{t=1}^T \bar{R}_t(\tau) \right]$$
 
-### Advantage Computation (GRPO)
+**Step 4: Expand trajectory log-probability**
+Since $\nabla_\theta \log \pi_\theta(\tau) = \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t)$:
 
-**Definition 9 (Average Future Reward):** For each action at time $t$, we compute the average reward after time $t$:
+$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{s=1}^T w_s \nabla_\theta r_{\theta,s} + \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t) \sum_{k=1}^T \bar{R}_k(\tau) \right]$$
 
-$$\bar{R}_t^{(i)}(\tau) = \frac{1}{T-t+1} \sum_{s=t}^T r_{\theta,s}^{(i)}$$
+**Key Insight:** This exact derivation shows that each action $a_t$ should be weighted by the **total sum** $\sum_{k=1}^T \bar{R}_k(\tau)$, not by step-specific advantages. Our implementation uses an approximation for better credit assignment.
 
-**Definition 10 (GRPO Advantage Estimation):** Advantages are computed using the average future rewards:
+**Implementation Note:** While the exact gradient derivation suggests weighting each action by $\sum_{k=1}^T \bar{R}_k(\tau)$, our implementation uses step-specific advantages $\bar{R}_t(\tau) - \text{baseline}$ for better credit assignment and variance reduction. This is a principled approximation that improves practical training stability.
 
-$$A_t^{(i)} = \bar{R}_t^{(i)}(\tau) - b_{\text{batch}}$$
+### Practical Implementation
 
-where the **batch baseline** is:
-$$b_{\text{batch}} = \frac{1}{B \cdot T} \sum_{i=1}^B \sum_{t=1}^T \bar{R}_t^{(i)}(\tau)$$
+**Exact vs. Approximation:** The rigorous mathematical derivation shows that the policy gradient should weight each action by the total sum of average future rewards across all time steps. However, for better credit assignment, our implementation uses step-specific weighting:
 
-**Definition 11 (Advantage Normalization):** For numerical stability, advantages are normalized:
+- **Exact (from derivation):** $\nabla_\theta \log \pi_\theta(a_t | s_t) \cdot \sum_{k=1}^T \bar{R}_k(\tau)$
+- **Implementation (approximation):** $\nabla_\theta \log \pi_\theta(a_t | s_t) \cdot (\bar{R}_t(\tau) - \text{baseline})$
 
-$$\tilde{A}_t^{(i)} = \frac{A_t^{(i)} - \mu_A}{\sigma_A + \epsilon}$$
-
-where:
-- $\mu_A = \frac{1}{B \cdot T} \sum_{i=1}^B \sum_{t=1}^T A_t^{(i)}$ (mean of advantages)
-- $\sigma_A = \sqrt{\frac{1}{B \cdot T} \sum_{i=1}^B \sum_{t=1}^T (A_t^{(i)} - \mu_A)^2}$ (standard deviation)
-- $\epsilon = 10^{-8}$ prevents division by zero
-
-**Key Properties:**
-1. **Batch-relative baseline**: Each reward compared to current batch average
-2. **Zero-mean advantages**: Normalization ensures balanced positive/negative updates
-3. **Unit variance**: Prevents gradient explosion/vanishing
+This approximation provides better temporal credit assignment by giving each action credit primarily for its future consequences rather than the entire trajectory outcome.
 
 ---
 
@@ -398,7 +377,7 @@ Both terms optimize the same parameters $\theta$, creating a unified learning si
 This mathematical formulation describes a sophisticated reinforcement learning system that combines:
 
 1. **Vector-based policy**: Using attention layer embeddings for query generation
-2. **Multi-head attention similarity**: Handling both MHA and GQA architectures  
+2. **Multi-head attention similarity**: Handling both MHA and GQA architectures
 3. **Advantage-based policy gradients**: GRPO baseline with advantage normalization
 4. **θ-dependent reward chain rule**: Proper gradient computation for model-dependent rewards
 5. **Stable loss magnitudes**: Careful scaling prevents any component from dominating
