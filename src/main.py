@@ -94,14 +94,25 @@ def policy_gradient_train_step(
     
     current_context = context_tokens
     
-    # Compute advantages using trajectory rewards
+    # Compute average rewards after time t for each step
+    batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
+    T = len(trajectory.qkv_steps)
+    
+    # Compute average reward after time t: R̄_t = (1/(T-t+1)) * Σ_{s=t}^T r_s
+    avg_rewards_after_t = torch.zeros_like(trajectory.rewards)  # [batch_size, T]
+    
+    for t in range(T):
+        # Average of rewards from time t to end
+        future_rewards = trajectory.rewards[:, t:]  # [batch_size, T-t]
+        avg_rewards_after_t[:, t] = future_rewards.mean(dim=1)  # [batch_size]
+    
     if CONFIG.use_grpo_baseline:
-        # Use GRPO-style batch baseline (mean of current batch)
-        batch_baseline = trajectory.rewards.mean()
-        advantages = trajectory.rewards - batch_baseline
+        # Use GRPO-style batch baseline (mean of all average rewards)
+        batch_baseline = avg_rewards_after_t.mean()
+        advantages = avg_rewards_after_t - batch_baseline
     else:
-        # Use total returns as-is (no baseline subtraction)
-        advantages = trajectory.rewards
+        # Use average rewards after t as-is (no baseline subtraction)
+        advantages = avg_rewards_after_t
     
     # Normalize advantages for stability
     if advantages.numel() > 1:
