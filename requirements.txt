@@ -1,5 +1,5 @@
 # CUDA-enabled PyTorch is required - this project assumes GPU availability
-torch>=2.0.0+cu118  # CUDA-enabled PyTorch (adjust CUDA version as needed)
+torch>=2.0.0  # CUDA-enabled PyTorch (install with: pip install torch --index-url https://download.pytorch.org/whl/cu118)
 transformers>=4.45.0  # Recent version with correct BitsAndBytesConfig import
 datasets>=2.13.0
 peft>=0.4.0
@@ -12,4 +12,4 @@ scipy>=1.10.0
 matplotlib>=3.7.0
 pandas>=2.0.0
 toolz>=0.12.0
-wandb>=0.15.0 
+wandb>=0.15.0  # For experiment tracking and logging 
