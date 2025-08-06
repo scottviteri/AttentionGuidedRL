@@ -133,26 +133,26 @@ where $v_{t,i}$ is the $i$-th token in the value sequence and $v_{t,<i}$ represe
 
 ### Primary Objective Function
 
-**Theorem 1 (Policy Gradient with θ-Dependent Rewards):** The system maximizes the following objective function:
+**Theorem 1 (Policy Gradient with θ-Dependent Rewards):** The system maximizes the following objective function using average future reward weighting:
 
-$$\mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ R_\theta(\tau) \right]$$
+$$\mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=1}^T \bar{R}_t(\tau) \right]$$
 
-where $R_\theta(\tau) = \sum_{t=1}^T \gamma^{t-1} r_{\theta,t}$ and the instantaneous reward depends on the current model parameters:
+where the instantaneous reward depends on the current model parameters:
 
 $$r_{\theta,t} = \frac{1}{|v_t|} \sum_{i=1}^{|v_t|} \log p_\theta(v_{t,i} | c_t, k_t, v_{t,<i})$$
 
 **Key Insight:** Since rewards depend on $\theta$, the gradient derivation uses the chain rule combined with **average future reward weighting**:
 
-$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=1}^T \tilde{A}_t \cdot \nabla_\theta \log \pi_\theta(a_t | s_t) + \lambda \sum_{t=1}^T \gamma^{t-1} \nabla_\theta r_{\theta,t} \right]$$
+$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=1}^T \tilde{A}_t \cdot \nabla_\theta \log \pi_\theta(a_t | s_t) + \lambda \sum_{t=1}^T \nabla_\theta r_{\theta,t} \right]$$
 
 where:
 - $\bar{R}_t(\tau) = \frac{1}{T-t+1} \sum_{s=t}^T r_{\theta,s}$ is the **average reward after time $t$**
 - $A_t = \bar{R}_t(\tau) - b_{\text{batch}}$ where $b_{\text{batch}}$ is the GRPO batch baseline
 - $\tilde{A}_t = \frac{A_t - \mu_A}{\sigma_A + \epsilon}$ are **normalized advantages**
 - $\lambda = 0.1$ is a scaling factor for the reward gradient term
-- This approach avoids discount factors while maintaining proper credit assignment
+- This approach avoids discount factors in the gradient computation while maintaining proper credit assignment
 
-**Chain Rule Justification:** Since the reward function $r_{\theta,t}$ depends on the same parameters $\theta$ as the policy, the chain rule for $\frac{d}{d\theta}\mathbb{E}_{\tau \sim \pi_\theta}[R_\theta(\tau)]$ requires both terms:
+**Chain Rule Justification:** Since the reward function $r_{\theta,t}$ depends on the same parameters $\theta$ as the policy, the chain rule for $\frac{d}{d\theta}\mathbb{E}_{\tau \sim \pi_\theta}[\sum_{t=1}^T \bar{R}_t(\tau)]$ requires both terms:
 
 1. **Policy gradient term:** How changing $\theta$ affects the probability of sampling high-reward trajectories
 2. **Reward gradient term:** How changing $\theta$ affects the reward evaluation of sampled trajectories
@@ -203,7 +203,7 @@ where:
 
 **Theorem 2 (Advantage-Based Policy Gradient with θ-Dependent Reward Chain Rule):** The loss function combines advantage-based policy gradients with reward gradient terms:
 
-$$\mathcal{L}(\theta) = \mathbb{E}_{\text{batch}} \left[ -\sum_{t=1}^T \tilde{A}_t \cdot \log \pi_\theta(a_t | s_t) - \lambda \sum_{t=1}^T \gamma^{t-1} r_{\theta,t} \right]$$
+$$\mathcal{L}(\theta) = \mathbb{E}_{\text{batch}} \left[ -\sum_{t=1}^T \tilde{A}_t \cdot \log \pi_\theta(a_t | s_t) - \lambda \sum_{t=1}^T r_{\theta,t} \right]$$
 
 **Decomposition into Two Terms:**
 
@@ -212,7 +212,7 @@ $$\mathcal{L}(\theta) = \mathbb{E}_{\text{batch}} \left[ -\sum_{t=1}^T \tilde{A}
    - Encourages actions that perform better than the batch baseline
    - Typical magnitude: ~1-10 (normalized)
 
-2. **Reward Gradient Term**: $-\lambda \sum_{t=1}^T \gamma^{t-1} r_{\theta,t}$
+2. **Reward Gradient Term**: $-\lambda \sum_{t=1}^T r_{\theta,t}$
    - Direct optimization of reward model parameters
    - Scaled by $\lambda = 0.1$ to balance with policy term
    - Natural regularization encouraging higher rewards
@@ -235,38 +235,42 @@ $$\tau \sim \pi_\theta$$
 - No old model copies or memory-efficient state management needed
 - Simpler implementation with lower memory footprint
 
-**Mathematical Formulation:** The chain rule policy gradient becomes:
+**Mathematical Formulation:** The chain rule policy gradient for average future rewards becomes:
 
-$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ R_\theta(\tau) \cdot \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t) + \sum_{t=1}^T \gamma^{t-1} \nabla_\theta r_{\theta,t} \right]$$
+$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=1}^T \tilde{A}_t \cdot \nabla_\theta \log \pi_\theta(a_t | s_t) + \lambda \sum_{t=1}^T \nabla_\theta r_{\theta,t} \right]$$
 
-where $\nabla_\theta \log \pi_\theta(\tau) = \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t)$ is the sum of individual action log-gradients.
+where each action is weighted by its normalized advantage $\tilde{A}_t$ based on average future rewards $\bar{R}_t(\tau)$.
 
 ### Chain Rule Implementation Details
 
 **Definition 13 (Chain Rule Gradient Decomposition):** The θ-dependent objective decomposes into two complementary terms:
 
-1. **Policy Term**: $R_\theta(\tau) \cdot \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t)$
-   - Uses total trajectory return to weight all action gradients equally
-   - Successful trajectories reinforce all actions that led to success
-   - Simpler credit assignment: trajectory-level rather than step-level
+1. **Policy Term**: $\sum_{t=1}^T \tilde{A}_t \cdot \nabla_\theta \log \pi_\theta(a_t | s_t)$
+   - Uses normalized advantages $\tilde{A}_t$ based on average future rewards $\bar{R}_t(\tau)$
+   - Actions weighted by how much better their future outcomes are than baseline
+   - Better credit assignment: step-specific advantages rather than trajectory-level returns
 
-2. **Reward Term**: $\sum_{t=1}^T \gamma^{t-1} \nabla_\theta r_{\theta,t}$
+2. **Reward Term**: $\lambda \sum_{t=1}^T \nabla_\theta r_{\theta,t}$
    - Direct optimization of the reward function itself
    - Encourages the model to assign higher probabilities to selected value tokens
    - Provides natural regularization without artificial penalties
+   - Scaled by $\lambda = 0.1$ for balanced optimization
 
 **Key Property:** Both terms optimize the same parameters θ, creating a **self-consistent learning signal** where the model learns to both select good actions AND accurately evaluate their outcomes.
 
 **Comparison with Standard REINFORCE:**
 
-- **Standard REINFORCE**: $\mathcal{L} = -\sum_{t=1}^T A_t(\tau) \log \pi_\theta(a_t | s_t)$ (step-specific advantages)
-- **Chain Rule Approach**: $\mathcal{L} = -R_\theta(\tau) \sum_{t=1}^T \log \pi_\theta(a_t | s_t) - \sum_{t=1}^T \gamma^{t-1} \nabla_\theta r_{\theta,t}$ (total return + reward gradient)
+- **Standard REINFORCE**: $\mathcal{L} = -\sum_{t=1}^T G_t \log \pi_\theta(a_t | s_t)$ (returns-to-go with discount factors)
+- **Our Approach**: $\mathcal{L} = -\sum_{t=1}^T \tilde{A}_t \log \pi_\theta(a_t | s_t) - \lambda \sum_{t=1}^T r_{\theta,t}$ (average future rewards + reward gradient)
 
-**Advantages of Chain Rule Approach:**
-1. **Unified Objective**: Policy and reward optimization happen simultaneously
-2. **Natural Regularization**: Reward term prevents divergence without KL penalties
+where $G_t = \sum_{s=t}^T \gamma^{s-t} r_s$ vs. $\tilde{A}_t$ based on $\bar{R}_t(\tau) = \frac{1}{T-t+1} \sum_{s=t}^T r_{\theta,s}$
+
+**Advantages of Our Approach:**
+1. **Intuitive Credit Assignment**: Average future rewards more interpretable than discounted returns
+2. **Natural Regularization**: Reward term prevents divergence without KL penalties  
 3. **Self-Consistency**: No mismatch between action sampling and reward evaluation
-4. **Simplified Training**: No need for advantage computation or baseline management
+4. **Stable Training**: GRPO baseline and normalization reduce variance
+5. **No Discount Factors**: Simpler formulation without γ hyperparameter tuning
 
 ### Implementation Details: Math-Code Correspondence
 
@@ -275,33 +279,44 @@ where $\nabla_\theta \log \pi_\theta(\tau) = \sum_{t=1}^T \nabla_\theta \log \pi
 # 1. Generate complete trajectories using current policy
 trajectory = generate_trajectory(adapter_model, ...)
 
-# 2. Compute total trajectory returns R_θ(τ)
-total_returns = trajectory.rewards.sum(dim=1)  # Sum over time steps for each trajectory
+# 2. Compute average future rewards R̄_t(τ) for each step
+batch_size, T = trajectory.rewards.shape
+avg_rewards_after_t = torch.zeros_like(trajectory.rewards)
+for t in range(T):
+    future_rewards = trajectory.rewards[:, t:]  # From t to end
+    avg_rewards_after_t[:, t] = future_rewards.mean(dim=1)
 
-# 3. Apply θ-dependent reward chain rule loss
+# 3. Compute advantages with GRPO baseline and normalize
+batch_baseline = avg_rewards_after_t.mean()
+advantages = avg_rewards_after_t - batch_baseline
+advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+# 4. Apply θ-dependent reward chain rule loss
 policy_term = 0.0
 reward_term = 0.0
 
 for t, qkv_step in enumerate(trajectory.qkv_steps):
-    # Policy gradient term: R_θ(τ) * ∇log π_θ(a_t|s_t)
+    # Policy gradient term: Ã_t * ∇log π_θ(a_t|s_t)
     current_action_log_probs = compute_action_log_probs(qkv_step)
-    policy_gradient_t = total_returns * current_action_log_probs
+    step_advantages = advantages[:, t]
+    policy_gradient_t = step_advantages * current_action_log_probs
     policy_term += policy_gradient_t.sum()  # Sum over batch
     
-    # Reward gradient term: ∇_θ r_{θ,t} (via pre-computed rewards with autograd)
-    step_reward = trajectory.rewards[:, t]  # Pre-computed during trajectory generation
-    gamma_t = gamma ** t
-    reward_term += gamma_t * step_reward.sum()  # Sum over batch
+    # Reward gradient term: λ * ∇_θ r_{θ,t} (via pre-computed rewards)
+    step_reward = trajectory.rewards[:, t]
+    reward_scaling = 0.1  # λ scaling factor
+    reward_term += reward_scaling * step_reward.sum()
 
 # Total loss: negative for gradient ascent → descent  
 total_loss = -(policy_term + reward_term)
 ```
 
 **Mathematical Correspondence:**
-- **Line `total_returns`** ↔ $R_\theta(\tau)$ - total discounted return for each trajectory in batch
-- **Line `total_returns * current_action_log_probs`** ↔ $R_\theta(\tau) \cdot \log \pi_\theta(a_t | s_t)$ - policy gradient term
-- **Line `reward_t`** ↔ $r_{\theta,t}$ - instantaneous θ-dependent reward
-- **Line `gamma_t * reward_t.sum()`** ↔ $\gamma^{t-1} \nabla_\theta r_{\theta,t}$ - discounted reward gradient
+- **Line `avg_rewards_after_t[:, t]`** ↔ $\bar{R}_t(\tau) = \frac{1}{T-t+1} \sum_{s=t}^T r_{\theta,s}$ - average future rewards
+- **Line `advantages`** ↔ $A_t = \bar{R}_t(\tau) - b_{\text{batch}}$ - GRPO advantages  
+- **Line `step_advantages * current_action_log_probs`** ↔ $\tilde{A}_t \cdot \log \pi_\theta(a_t | s_t)$ - advantage-weighted policy gradient
+- **Line `step_reward`** ↔ $r_{\theta,t}$ - instantaneous θ-dependent reward
+- **Line `reward_scaling * step_reward.sum()`** ↔ $\lambda \nabla_\theta r_{\theta,t}$ - scaled reward gradient
 - **Line `policy_term + reward_term`** ↔ complete chain rule decomposition $\nabla_\theta \mathcal{J}(\theta)$
 
 **Key Insight:** Both the policy (action selection) and reward (outcome evaluation) are optimized using the same current model parameters $\theta$. This creates a self-consistent learning signal where the model learns to both select good actions AND accurately evaluate their outcomes.
@@ -390,18 +405,21 @@ This mathematical formulation describes a sophisticated reinforcement learning s
 6. **Self-consistent training**: Both policy and rewards computed using current model θ
 7. **Self-supervised learning**: Where the model learns to sequence its own training data
 
-The key innovation is the **advantage-based θ-dependent reward formulation** with proper chain rule application:
+The key innovation is the **average future reward θ-dependent formulation** with proper chain rule application:
 
-$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=1}^T \tilde{A}_t \cdot \nabla_\theta \log \pi_\theta(a_t | s_t) + \lambda \sum_{t=1}^T \gamma^{t-1} \nabla_\theta r_{\theta,t} \right]$$
+$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=1}^T \tilde{A}_t \cdot \nabla_\theta \log \pi_\theta(a_t | s_t) + \lambda \sum_{t=1}^T \nabla_\theta r_{\theta,t} \right]$$
+
+where $\tilde{A}_t$ are normalized advantages based on average future rewards $\bar{R}_t(\tau) = \frac{1}{T-t+1} \sum_{s=t}^T r_{\theta,s}$.
 
 This creates two complementary learning signals:
-- **Policy gradient term**: Uses normalized advantages for better credit assignment
+- **Policy gradient term**: Uses normalized advantages based on average future rewards for intuitive credit assignment
 - **Reward gradient term**: Directly optimizes the model's ability to generate high rewards (scaled by λ=0.1)
 
 **Advantages of the Current Approach:**
+- **Intuitive Credit Assignment**: Average future rewards more interpretable than discounted returns
+- **No Discount Factors**: Eliminates γ hyperparameter tuning and complex temporal discounting
 - **Stable Training**: GRPO baseline and advantage normalization reduce variance
 - **Balanced Components**: Loss terms scaled to similar magnitudes (~1-10 range)
-- **Better Credit Assignment**: Step-specific advantages rather than trajectory-level returns
 - **Self-Consistent**: No mismatch between policy and reward model (both use current θ)
 - **Natural Regularization**: Reward gradient term provides stability without artificial KL penalties
 - **Mathematically Rigorous**: Proper chain rule application for θ-dependent objectives
