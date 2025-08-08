@@ -10,10 +10,12 @@ import torch
 from typing import Iterator, List, Dict, Callable
 import itertools
 
-# Add src to path to import modules
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+# Add project root to sys.path to import the src package
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from data import (
+from src.data import (
     get_tokenizer, 
     wikipedia_articles, 
     complete_batches_only,

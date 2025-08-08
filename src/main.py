@@ -102,35 +102,17 @@ def policy_gradient_train_step(
     
     current_context = context_tokens
     
-    # Compute average rewards after time t for each step
+    # Use average reward over the entire trajectory for each action
     batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
     T = len(trajectory.qkv_steps)
- 
-    # Compute weighting targets per step for advantages
-    # Either average of future rewards or discounted returns
-    if CONFIG.reward_aggregation == "average":
-        # R̄_t = (1/(T-t+1)) * Σ_{s=t}^T r_s
-        weighting_targets = torch.zeros_like(trajectory.rewards)
-        for t in range(T):
-            future_rewards = trajectory.rewards[:, t:]
-            weighting_targets[:, t] = future_rewards.mean(dim=1)
-    elif CONFIG.reward_aggregation == "discounted":
-        # Use discounted returns as weighting targets
-        weighting_targets = compute_returns(trajectory.rewards, gamma=CONFIG.gamma)
-    else:
-        raise ValueError(f"Invalid CONFIG.reward_aggregation: {CONFIG.reward_aggregation}")
-
-    if CONFIG.use_grpo_baseline:
-        # Use GRPO-style batch baseline (mean of all average rewards)
-        batch_baseline = weighting_targets.mean()
-        advantages = weighting_targets - batch_baseline
-    else:
-        # Use average rewards after t as-is (no baseline subtraction)
-        advantages = weighting_targets
     
-    # Normalize advantages for stability
-    if advantages.numel() > 1:
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    # Compute average reward over entire trajectory: R̄ = (1/T) * Σ_{s=1}^T r_s
+    avg_trajectory_reward = trajectory.rewards.mean(dim=1, keepdim=True)  # [batch_size, 1]
+    
+    # Use the same average reward for all time steps (no baseline subtraction)
+    advantages = avg_trajectory_reward.expand(-1, T)  # [batch_size, T]
+    
+    # No normalization needed since we're using raw average rewards
     
     for t, qkv_step in enumerate(trajectory.qkv_steps):
         # === POLICY GRADIENT TERM: A_t * ∇log π_θ(a_t|s_t) ===
@@ -446,11 +428,7 @@ def parse_args():
     parser.add_argument("--dataset", type=str, default="wikipedia", 
                         choices=["wikipedia", "twenty_questions"],
                         help="Dataset to use for training")
-    parser.add_argument("--grpo-batching", action="store_true", help="Use GRPO-style batching (repeat each data point)")
     parser.add_argument("--model-type", type=str, choices=['gpt2', 'llama'], help='Model type to use')
-    parser.add_argument('--use-grpo-baseline', action='store_true', help='Use GRPO baseline in advantages')
-    parser.add_argument('--reward-aggregation', type=str, choices=['average', 'discounted'], help='Aggregate rewards for advantages using average or discounted returns')
-    parser.add_argument('--differentiable-rewards', action='store_true', help='Enable differentiable reward term (chain rule)')
     
     # Configuration parameters
     parser.add_argument('--enable-wandb', action='store_true', help='Enable Weights & Biases logging')
@@ -723,7 +701,7 @@ def main():
     if CONFIG.subtract_base_model_logprobs:
         logging.info("Reward computation: Using adapter - base model (classic baseline subtraction)")
     else:
-        logging.info("Reward computation: Using raw adapter log probabilities (GRPO handles baselines)")
+        logging.info("Reward computation: Using raw adapter log probabilities")
     
     # Log training algorithm
     logging.info("Training algorithm: Advantage-weighted policy gradient with differentiable reward (chain rule)")
@@ -798,46 +776,27 @@ def main():
         )
         from typing import Iterator, cast
         
-        # Determine if we're using GRPO-style batching
-        use_grpo_batching = args.grpo_batching
-        
-        if use_grpo_batching:
-            # GRPO approach: repeat each data point batch_size times
-            # This creates a batch where each unique item appears multiple times
-            base_iterator: Iterator[KVPair] = iter_key_value_pairs_unified_with_tokenizer(
+        # Standard batching approach
+        # This creates a batch where each unique item appears multiple times
+        base_iterator: Iterator[KVPair] = iter_key_value_pairs_unified_with_tokenizer(
                 dataset_name=args.dataset,
                 batch_size=1,  # Generate single items
                 tokenizer=tokenizer,
                 embedding_fn=compute_key_embedding,
-            )
+        )
+        
+        # Add debugging if requested
+        if args.debug_generators:
+            logging.info("Debug mode enabled for generators")
+            base_iterator = cast(Iterator[KVPair], peek_stream(base_iterator, peek_count=1))
+            base_iterator = cast(Iterator[KVPair], debug_stream(base_iterator, "unique_kv_pairs", max_items=2))
+            base_iterator = cast(Iterator[KVPair], time_stream(base_iterator, "kv_generation"))
             
-            # Add debugging if requested
-            if args.debug_generators:
-                logging.info("Debug mode enabled for generators")
-                base_iterator = cast(Iterator[KVPair], peek_stream(base_iterator, peek_count=1))
-                base_iterator = cast(Iterator[KVPair], debug_stream(base_iterator, "unique_kv_pairs", max_items=2))
-                base_iterator = cast(Iterator[KVPair], time_stream(base_iterator, "kv_generation"))
-                
-            # Repeat each item batch_size times for GRPO-style batching
-            kv_pair_generator: Iterator[KVPair] = cast(Iterator[KVPair], repeat_n_times(CONFIG.batch_size, base_iterator))
-            
-            if args.debug_generators:
-                kv_pair_generator = cast(Iterator[KVPair], debug_stream(kv_pair_generator, "repeated_kv_pairs", max_items=CONFIG.batch_size + 1))
-        else:
-            # Standard approach: different items in each batch position
-            kv_pair_generator = iter_key_value_pairs_unified_with_tokenizer(
-                dataset_name=args.dataset,
-                batch_size=CONFIG.batch_size,
-                tokenizer=tokenizer,
-                embedding_fn=compute_key_embedding,
-            )
-            
-            # Add debugging if requested
-            if args.debug_generators:
-                logging.info("Debug mode enabled for generators")
-                kv_pair_generator = cast(Iterator[KVPair], peek_stream(kv_pair_generator, peek_count=1))
-                kv_pair_generator = cast(Iterator[KVPair], debug_stream(kv_pair_generator, "standard_kv_pairs", max_items=2))
-                kv_pair_generator = cast(Iterator[KVPair], time_stream(kv_pair_generator, "kv_generation"))
+        # Repeat each item batch_size times for batching
+        kv_pair_generator: Iterator[KVPair] = cast(Iterator[KVPair], repeat_n_times(CONFIG.batch_size, base_iterator))
+        
+        if args.debug_generators:
+            kv_pair_generator = cast(Iterator[KVPair], debug_stream(kv_pair_generator, "repeated_kv_pairs", max_items=CONFIG.batch_size + 1))
         
         # Get reference to the base model (pi_ref)
         ref_model = base_model
@@ -846,7 +805,7 @@ def main():
         logging.info("Model setup complete:")
         logging.info("- adapter_model: LoRA adapter (trainable)")
         logging.info("- ref_model: Reference model (pi_ref, for reward computation)")
-        logging.info(f"- GRPO batching: {'Enabled' if use_grpo_batching else 'Disabled'}")
+        logging.info(f"- Batching: Enabled (repeat each data point {CONFIG.batch_size} times)")
         
         # Function to compute gradient statistics
         def get_gradient_stats(model):
@@ -1142,12 +1101,8 @@ def main():
             
             # Compute and track average advantages from this episode
             if trajectory.rewards is not None:
-                advantages, _ = compute_advantages(
-                    trajectory.rewards,
-                    gamma=CONFIG.gamma,
-                    gae_lambda=0.95,  # Fixed value for policy gradient
-                    use_grpo_baseline=CONFIG.use_grpo_baseline,
-                )
+                # Simple trajectory average advantages (no GAE or baseline)
+                advantages = trajectory.rewards.mean(dim=1, keepdim=True).expand_as(trajectory.rewards)
                 avg_advantage = advantages.mean().item()
                 advantage_dist = compute_advantage_distribution(advantages)
             else:
@@ -1284,7 +1239,7 @@ def main():
                 # Add metadata to plot data and save
                 metadata = create_metadata(episode, {
                     'GAMMA': CONFIG.gamma,
-                    'USE_GRPO_BASELINE': CONFIG.use_grpo_baseline,
+        
                     'TEMPERATURE': CONFIG.temperature,
                     'NUM_KV_PAIRS': CONFIG.num_kv_pairs,
                 })
@@ -1346,7 +1301,7 @@ def main():
         # Save final plot data and create plots
         final_metadata = create_metadata(episode, {
             'GAMMA': CONFIG.gamma,
-            'USE_GRPO_BASELINE': CONFIG.use_grpo_baseline,
+
             'TEMPERATURE': CONFIG.temperature,
             'NUM_KV_PAIRS': CONFIG.num_kv_pairs,
         })

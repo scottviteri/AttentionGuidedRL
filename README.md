@@ -151,10 +151,10 @@ For users with limited GPU memory, the system includes an optional memory-effici
 Comprehensive plotting and analysis tools:
 ```bash
 # Generate plots from saved training data
-python generate_plots.py logs/*/plots/plot_data.pkl
+python scripts/generate_plots.py logs/*/plots/plot_data.pkl
 
 # Generate text analysis for LLM consumption
-python generate_text_analysis.py logs/*/plots/plot_data.pkl
+python scripts/generate_text_analysis.py logs/*/plots/plot_data.pkl
 ```
 
 ## Project Structure
@@ -163,16 +163,18 @@ python generate_text_analysis.py logs/*/plots/plot_data.pkl
 attention-guided-rl/
 ├── README.md
 ├── requirements.txt
+├── scripts/                  # Standalone utilities (plotting, analysis, runners)
+├── examples/                 # Example and walkthrough scripts
 ├── src/
-│   ├── main.py                 # Training entry point
-│   ├── config.py               # TrainingConfig dataclass and utilities
-│   ├── model.py                # Model setup with LoRA adaptation
-│   ├── embeddings.py           # Attention-based embedding extraction
-│   ├── data.py                 # Dataset iterators and preprocessing
-│   ├── training.py             # Training utilities and policy optimization
-├── tests/                      # Comprehensive test suite (66+ tests)
-├── logs/                       # Training outputs and visualizations
-└── docs/                       # Additional documentation
+│   ├── main.py               # Training entry point
+│   ├── config.py             # TrainingConfig dataclass and utilities
+│   ├── model.py              # Model setup with LoRA adaptation
+│   ├── embeddings.py         # Attention-based embedding extraction
+│   ├── data.py               # Dataset iterators and preprocessing
+│   ├── training.py           # Training utilities and policy optimization
+├── tests/                    # Comprehensive test suite (66+ tests)
+├── logs/                     # Training outputs and visualizations
+└── docs/                     # Additional documentation (math, plotting, design)
 ```
 
 ## Advanced Usage
@@ -190,10 +192,10 @@ Training automatically generates comprehensive visualizations:
 
 ```bash
 # Generate plots from saved training data
-python generate_plots.py logs/*/plots/plot_data.pkl
+python scripts/generate_plots.py logs/*/plots/plot_data.pkl
 
 # Generate text analysis for LLM consumption  
-python generate_text_analysis.py logs/*/plots/plot_data.pkl
+python scripts/generate_text_analysis.py logs/*/plots/plot_data.pkl
 ```
 
 ### Custom Configuration

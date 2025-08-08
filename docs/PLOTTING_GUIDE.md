@@ -62,10 +62,10 @@ Use `generate_plots.py` to regenerate plots from saved data:
 
 ```bash
 # Basic usage - saves in same directory as pickle file
-python generate_plots.py logs/20250619-073435/plots/plot_data_episode_49.pkl
+python scripts/generate_plots.py logs/20250619-073435/plots/plot_data_episode_49.pkl
 
 # Specify output directory
-python generate_plots.py data.pkl --output-dir custom_plots/
+python scripts/generate_plots.py data.pkl --output-dir custom_plots/
 
 # Override KL coefficient in labels
 python generate_plots.py data.pkl --kl-coef 0.05
@@ -77,10 +77,10 @@ Use `generate_text_analysis.py` to generate LM-friendly analysis from saved data
 
 ```bash
 # Basic usage - saves analysis in same directory as pickle file
-python generate_text_analysis.py logs/20250717-155819/plots/plot_data.pkl
+python scripts/generate_text_analysis.py logs/20250717-155819/plots/plot_data.pkl
 
 # Specify output directory  
-python generate_text_analysis.py data.pkl --output-dir analysis_results/
+python scripts/generate_text_analysis.py data.pkl --output-dir analysis_results/
 ```
 
 This generates:
@@ -119,7 +119,7 @@ The text analysis provides comprehensive insights optimized for language model c
 Use `custom_plot_example.py` as a template for creating custom visualizations:
 
 ```bash
-python custom_plot_example.py logs/path/to/plot_data.pkl
+python examples/custom_plot_example.py logs/path/to/plot_data.pkl
 ```
 
 This creates:
@@ -142,13 +142,13 @@ This creates:
 ```bash
 # Find the latest plot data
 latest_data=$(find logs -name "plot_data.pkl" | sort | tail -1)
-python generate_plots.py $latest_data
+python scripts/generate_plots.py $latest_data
 ```
 
 ### Compare Multiple Runs
 ```bash
 # The custom_plot_example.py automatically finds and compares multiple runs
-python custom_plot_example.py logs/*/plots/plot_data.pkl
+python examples/custom_plot_example.py logs/*/plots/plot_data.pkl
 ```
 
 ### Create Publication-Quality Figures

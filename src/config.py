@@ -55,7 +55,6 @@ class TrainingConfig:
     differentiable_rewards: bool = True   # Enable chain-rule reward gradients
     
     # Training behavior
-    use_grpo_baseline: bool = True
     subtract_base_model_logprobs: bool = False
     grpo_batching: bool = True  # GRPO-style batching
     gae_lambda: float = 0.95
@@ -167,7 +166,6 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
         differentiable_rewards=getattr(args, 'differentiable_rewards', False) or base_config.differentiable_rewards,
         
         # Training behavior (CLI overrides or defaults)
-        use_grpo_baseline=getattr(args, 'use_grpo_baseline', False) or base_config.use_grpo_baseline,
         subtract_base_model_logprobs=getattr(args, 'subtract_base_logprobs', False) or base_config.subtract_base_model_logprobs,
         grpo_batching=getattr(args, 'grpo_batching', False) or base_config.grpo_batching,
         gae_lambda=getattr(args, 'gae_lambda', None) or base_config.gae_lambda,
@@ -212,9 +210,7 @@ def training_config_to_dict(config: TrainingConfig) -> Dict[str, Any]:
         'batch_size': config.batch_size,
         'gamma': config.gamma,
         'temperature': config.temperature,
-        'use_grpo_baseline': config.use_grpo_baseline,
         'subtract_base_model_logprobs': config.subtract_base_model_logprobs,
-        'grpo_batching': config.grpo_batching,
         'enable_wandb': config.enable_wandb,
         'num_kv_pairs': config.num_kv_pairs,
         'max_context_length': config.max_context_length,
@@ -232,10 +228,7 @@ def log_training_config(config: TrainingConfig, logger) -> None:
     
     logger.info(f"RL: gamma={config.gamma}, temperature={config.temperature}")
     
-    if config.use_grpo_baseline:
-        logger.info(f"Baseline: GRPO batch average baseline")
-    else:
-        logger.info(f"Baseline: Per-trajectory mean baseline")
+    logger.info("Baseline: None (trajectory average rewards)")
         
     logger.info(f"Context: {config.num_kv_pairs} KV pairs, {config.tokens_per_round} tokens/round")
     logger.info(f"         {config.max_context_length} max context, {config.initial_prompt_tokens} prompt tokens")

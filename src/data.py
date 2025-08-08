@@ -131,7 +131,7 @@ def complete_batches_only(batch_size: int):
 
 @curry
 def repeat_each(n: int, stream: Iterator):
-    """Repeat each item n times (for GRPO batching)."""
+    """Repeat each item n times (for batching)."""
     for item in stream:
         for _ in range(n):
             yield item
