@@ -771,6 +771,63 @@ def compute_kl_from_reference(
     return sum(kl_vals) / len(kl_vals)
 
 
+def compute_value_kl_from_reference(
+    trajectory: "Trajectory",
+    adapter_model: torch.nn.Module,
+    ref_model: torch.nn.Module,
+    tokenizer,
+) -> float:
+    """Compute KL(adapter || ref) over value-token distributions for an entire trajectory (diagnostic).
+
+    For each step, we reconstruct the reward context and extract logits at the
+    value-token positions for both adapter and reference models, compute log-softmax
+    and KL in log-space, then average over tokens and steps (batchmean).
+    """
+    device = next(adapter_model.parameters()).device
+    batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
+    
+    # Initialize context with initial prompt
+    context_tokens = tokenizer(
+        [CONFIG.initial_prompt] * batch_size,
+        return_tensors="pt",
+        padding=True,
+        add_special_tokens=False,
+    ).input_ids.to(device)
+    
+    kl_vals = []
+    for step in trajectory.qkv_steps:
+        key_tokens = step.key_tokens.to(device)
+        value_tokens = step.value_tokens.to(device)
+        kp = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        vp = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        reward_context = torch.cat([context_tokens, kp, key_tokens, vp], dim=1)
+        
+        # Adapter logits (no grad for diagnostic)
+        with torch.no_grad():
+            adapter_full = torch.cat([reward_context, value_tokens], dim=1)
+            adapter_logits = adapter_model(adapter_full).logits
+            ctx_len = reward_context.shape[1]
+            adapter_token_logits = adapter_logits[:, ctx_len-1:ctx_len + value_tokens.shape[1] - 1, :]
+            adapter_log_probs = F.log_softmax(adapter_token_logits, dim=-1)
+            
+            # Reference logits
+            ref_full = adapter_full  # same sequence
+            ref_logits = ref_model(ref_full).logits
+            ref_token_logits = ref_logits[:, ctx_len-1:ctx_len + value_tokens.shape[1] - 1, :]
+            ref_log_probs = F.log_softmax(ref_token_logits, dim=-1)
+            
+            # KL over tokens, average across batch and tokens
+            kl_step = F.kl_div(adapter_log_probs, ref_log_probs, reduction="batchmean", log_target=True)
+            kl_vals.append(kl_step.item())
+        
+        # Advance context by appending key/value
+        context_tokens = torch.cat([reward_context, value_tokens], dim=1)
+    
+    if not kl_vals:
+        return 0.0
+    return sum(kl_vals) / len(kl_vals)
+
+
 def main():
     """Main training function."""
     # Start overall training timer
@@ -1108,10 +1165,16 @@ def main():
             kl_from_ref_value = compute_kl_from_reference(
                 trajectory,
                 adapter_model,
-                ref_model,
+                base_model,
                 tokenizer,
             )
-            kl_from_ref.append(kl_from_ref_value)
+            kl_keys_from_ref_value = kl_from_ref_value
+            kl_values_from_ref_value = compute_value_kl_from_reference(
+                trajectory,
+                adapter_model,
+                base_model,
+                tokenizer,
+            )
             
             # Update reward stats
             reward_stats = update_reward_stats(reward_stats, trajectory.avg_reward)
@@ -1387,6 +1450,8 @@ def main():
                 clipping_ratio=avg_clipping_ratio,
                 batch_selection_entropy=selection_entropy,
                 kl_from_ref_value=kl_from_ref_value,
+                kl_keys_from_ref_value=kl_keys_from_ref_value,
+                kl_values_from_ref_value=kl_values_from_ref_value,
                 lora_layer_gradients_episode=layer_grads,
                 advantage_distribution=advantage_dist,
                 similarity_score_stats=similarity_stats,

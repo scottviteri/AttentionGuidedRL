@@ -310,14 +310,20 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[5].grid(True, alpha=0.3)
     
     # Plot 7: KL Divergence from Reference (diagnostic)
-    axes[6].plot(training_steps, kl_from_ref, 'darkred', linewidth=2)
+    kl_keys = data.get('kl_keys_from_ref', [])
+    kl_values = data.get('kl_values_from_ref', [])
+    if kl_keys and len(kl_keys) == len(training_steps):
+        axes[6].plot(training_steps, kl_keys, label='KL (keys)', color='darkred', linewidth=2)
+    if kl_values and len(kl_values) == len(training_steps):
+        axes[6].plot(training_steps, kl_values, label='KL (values)', color='orange', linewidth=2)
+    if (not kl_keys) and (not kl_values):
+        # Back-compat: single series
+        axes[6].plot(training_steps, kl_from_ref, label='KL (keys)', color='darkred', linewidth=2)
     axes[6].set_xlabel('Training Step')
     axes[6].set_ylabel('KL Divergence')
-    axes[6].set_title(f'KL Divergence from Reference Model (π_ref){title_suffix}')
+    axes[6].set_title(f'KL Divergence from Reference Model (diagnostic){title_suffix}')
+    axes[6].legend(fontsize=7)
     axes[6].grid(True, alpha=0.3)
-    mean_kl = np.mean(kl_from_ref)
-    axes[6].axhline(y=mean_kl, color='gray', linestyle='--', alpha=0.5, label=f'Mean: {mean_kl:.4f}')
-    axes[6].legend(fontsize=8)
     
     # Plot 8: Reward Variance
     axes[7].plot(training_steps, reward_variance, 'magenta', linewidth=2)
