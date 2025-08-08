@@ -335,31 +335,8 @@ def wikipedia_kv_stream(batch_size: int, tokenizer: PreTrainedTokenizer, embeddi
 
 def load_twenty_questions(dataset_path: str) -> Dict:
     """Load twenty questions dataset."""
-    if os.path.exists(dataset_path):
-        with open(dataset_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    # Fallback tiny dataset for tests if file is missing
-    questions = [
-        "Is it an animal?",
-        "Is it bigger than a breadbox?",
-        "Is it man-made?",
-        "Is it used daily?",
-        "Is it electronic?",
-    ]
-    # Provide enough games to cover tests that pull > num_kv_pairs items
-    games = [
-        {"answers": ["Yes", "No", "Yes", "Yes", "No"]},
-        {"answers": ["No", "Yes", "No", "No", "Yes"]},
-        {"answers": ["Yes", "Yes", "No", "Yes", "No"]},
-        {"answers": ["No", "No", "Yes", "No", "Yes"]},
-        {"answers": ["Yes", "No", "No", "Yes", "Yes"]},
-        {"answers": ["No", "Yes", "Yes", "No", "No"]},
-        {"answers": ["Yes", "Yes", "Yes", "No", "No"]},
-        {"answers": ["No", "No", "No", "Yes", "Yes"]},
-        {"answers": ["Yes", "No", "Yes", "No", "Yes"]},
-        {"answers": ["No", "Yes", "No", "Yes", "No"]},
-    ]
-    return {"questions": questions, "data": games}
+    with open(dataset_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def get_twenty_questions_path() -> str:

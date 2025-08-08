@@ -1,0 +1,21 @@
+{
+  "questions": [
+    "Is it an animal?",
+    "Is it bigger than a breadbox?",
+    "Is it man-made?",
+    "Is it used daily?",
+    "Is it electronic?"
+  ],
+  "data": [
+    {"answers": ["YES", "NO", "YES", "YES", "NO"]},
+    {"answers": ["NO", "YES", "NO", "NO", "YES"]},
+    {"answers": ["YES", "YES", "NO", "YES", "NO"]},
+    {"answers": ["NO", "NO", "YES", "NO", "YES"]},
+    {"answers": ["YES", "NO", "NO", "YES", "YES"]},
+    {"answers": ["NO", "YES", "YES", "NO", "NO"]},
+    {"answers": ["YES", "YES", "YES", "NO", "NO"]},
+    {"answers": ["NO", "NO", "NO", "YES", "YES"]},
+    {"answers": ["YES", "NO", "YES", "NO", "YES"]},
+    {"answers": ["NO", "YES", "NO", "YES", "NO"]}
+  ]
+}
