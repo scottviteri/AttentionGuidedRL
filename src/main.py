@@ -42,7 +42,7 @@ from src.metrics import (
     compute_similarity_score_stats,
 )
 
-# Simple policy gradient training - no memory-efficient components needed
+# Simple policy gradient training using LoRA adapters
 
 import wandb
 
@@ -761,7 +761,7 @@ def main():
                         logging.info(f"Resumed from episode {start_episode}")
                         break
         
-        # Policy gradient doesn't need old model copies or memory-efficient LoRA
+        # Policy gradient with simple LoRA adapter training
         # We only use the current adapter_model for both sampling and training
 
         # Import the data iterator and repeat function

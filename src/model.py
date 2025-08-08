@@ -207,7 +207,7 @@ def update_model_ema(target_model: torch.nn.Module, source_model: torch.nn.Modul
         decay: EMA decay factor (0.9-0.99 typical, higher = smoother)
                target = decay * target + (1 - decay) * source
     """
-    # Use the memory-efficient LoRA-only EMA update
+    # Use LoRA-only EMA update (more efficient than full model EMA)
     update_lora_ema(target_model, source_model, decay)
 
 

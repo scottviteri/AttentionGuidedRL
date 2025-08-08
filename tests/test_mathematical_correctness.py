@@ -79,33 +79,30 @@ def test_masking_correctness():
 
 
 def test_gae_mathematical_properties():
-    """Test that GAE computation has correct mathematical properties."""
+    """Test that simplified trajectory average approach has correct mathematical properties."""
     batch_size = 3
     num_steps = 5
-    
+
     # Create test rewards
     rewards = torch.randn(batch_size, num_steps)
-    
+
     gamma = 0.99
     gae_lambda = 0.95
     
-    # Test GAE computation
-    advantages, returns = compute_advantages(rewards, gamma, gae_lambda, use_grpo_baseline=True)
+    # Test simplified trajectory average computation
+    advantages, returns = compute_advantages(rewards, gamma, gae_lambda)
     
-    # Test that returns are computed correctly
-    expected_returns = compute_returns(rewards, gamma)
-    assert torch.allclose(returns, expected_returns, atol=1e-6), "Returns computation is incorrect"
+    # With our simplified approach, returns should be the same as advantages (trajectory averages)
+    assert torch.allclose(returns, advantages, atol=1e-6), "Returns should equal advantages in simplified approach"
     
-    # Test baseline centering: advantages should have mean close to 0 across batch
-    baseline = returns.mean(dim=0, keepdim=True)
-    expected_baseline_centered = returns - baseline
+    # Test that advantages are trajectory averages
+    for batch_idx in range(batch_size):
+        expected_avg = rewards[batch_idx].mean()
+        for t in range(num_steps):
+            assert torch.allclose(advantages[batch_idx, t], expected_avg, atol=1e-6), \
+                f"Advantage at batch {batch_idx}, timestep {t} should equal trajectory average"
     
-    # The final advantages should be centered around the baseline
-    mean_advantages = advantages.mean(dim=0)
-    assert torch.allclose(mean_advantages, torch.zeros_like(mean_advantages), atol=1e-6), \
-        f"Advantages not properly centered: {mean_advantages}"
-    
-    print("✅ GAE mathematical properties test passed")
+    print("✅ Simplified trajectory average mathematical properties test passed")
 
 
 def test_returns_computation():

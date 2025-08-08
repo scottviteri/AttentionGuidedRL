@@ -102,15 +102,6 @@ def verify_implementation_line_by_line():
     print(f"                   use_grpo_baseline=CONFIG.use_grpo_baseline")
     print(f"                 )")
     
-    print(f"\n📈 STEP 6: Usage in Memory Efficient Training (src/memory_efficient_training.py:125-130)")
-    print("   Code mapping:")
-    print(f"   Line 125-130: advantages, _ = compute_advantages(")
-    print(f"                   trajectory.rewards,")
-    print(f"                   gamma=gamma,")
-    print(f"                   gae_lambda=CONFIG.gae_lambda,")
-    print(f"                   use_grpo_baseline=CONFIG.use_grpo_baseline")
-    print(f"                 )")
-    
     print(f"\n✅ VERIFICATION COMPLETE")
     print("=" * 80)
     

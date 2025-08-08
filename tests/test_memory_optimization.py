@@ -1,5 +1,5 @@
 """
-Test cases for memory-efficient LoRA state management.
+Test cases for LoRA state management.
 
 These tests verify that we can manage LoRA adapter states without
 storing multiple full model copies, achieving significant memory savings.
@@ -295,9 +295,9 @@ class TestIntegration:
     """Integration tests for complete LoRA state management workflow."""
     
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA for realistic memory testing")
-    def test_memory_efficient_training_simulation(self):
-        """Test a simplified training loop using LoRA state management."""
-        # This test simulates the training loop optimization
+    def test_lora_state_management_in_training_simulation(self):
+        """Test LoRA state save/load operations in a simulated training loop."""
+        # This test simulates basic LoRA state operations during training
         # Skip actual model loading, use simple mock
         
         class TrainingModel(torch.nn.Module):

@@ -205,7 +205,7 @@ This approach gives each action credit for the overall trajectory performance, w
 
 - Trajectories are generated using the current adapter model (with LoRA weights)
 - This ensures truly on-policy data for policy gradient updates
-- No old model copies or memory-efficient state management needed
+- No old model copies or complex state management needed
 - Simpler implementation with lower memory footprint
 
 **Mathematical Formulation:** The chain rule policy gradient for average future rewards becomes:

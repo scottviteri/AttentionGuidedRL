@@ -142,10 +142,10 @@ loss = -sum_t(A_t * logpi_t) - λ * sum_t(r_t)
 - Temperature-scaled similarity computation for policy distribution
 
 ### Memory Efficiency
-For users with limited GPU memory, the system includes an optional memory-efficient mode:
-- LoRA state management reduces memory usage by 60-90%
+The system uses LoRA (Low-Rank Adaptation) for efficient training:
+- LoRA adapters reduce memory usage by 60-90% compared to full fine-tuning
 - Enables training larger models on smaller GPUs
-- Mathematically equivalent to standard training
+- Only trains small adapter weights while keeping base model frozen
 
 ### Visualization and Analysis
 Comprehensive plotting and analysis tools:
