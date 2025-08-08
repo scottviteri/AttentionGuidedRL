@@ -45,6 +45,8 @@ class PlotData:
     batch_selection_entropy: List[float] = field(default_factory=list)
     trajectory_samples: List[Dict[str, Any]] = field(default_factory=list)
     kl_from_ref: List[float] = field(default_factory=list)
+    kl_keys_from_ref: List[float] = field(default_factory=list)
+    kl_values_from_ref: List[float] = field(default_factory=list)
     policy_gradients: List[float] = field(default_factory=list)  # Policy gradients (before negation)
     
     # Enhanced debugging metrics
@@ -86,6 +88,8 @@ class PlotData:
         clipping_ratio: float,
         batch_selection_entropy: float,
         kl_from_ref_value: float,
+        kl_keys_from_ref_value: float = 0.0,
+        kl_values_from_ref_value: float = 0.0,
         lora_layer_gradients_episode: Dict[int, float],
         advantage_distribution: Dict[str, float],
         similarity_score_stats: Dict[str, float],
@@ -127,6 +131,8 @@ class PlotData:
         new_clipping_ratios = self.clipping_ratios + [clipping_ratio]
         new_batch_selection_entropy = self.batch_selection_entropy + [batch_selection_entropy]
         new_kl_from_ref = self.kl_from_ref + [kl_from_ref_value]
+        new_kl_keys_from_ref = self.kl_keys_from_ref + [kl_keys_from_ref_value]
+        new_kl_values_from_ref = self.kl_values_from_ref + [kl_values_from_ref_value]
         new_policy_gradients = self.policy_gradients + [policy_gradient]
         new_advantage_distributions = self.advantage_distributions + [advantage_distribution]
         new_similarity_score_stats = self.similarity_score_stats + [similarity_score_stats]
@@ -178,6 +184,8 @@ class PlotData:
             batch_selection_entropy=new_batch_selection_entropy,
             trajectory_samples=new_trajectory_samples,
             kl_from_ref=new_kl_from_ref,
+            kl_keys_from_ref=new_kl_keys_from_ref,
+            kl_values_from_ref=new_kl_values_from_ref,
             policy_gradients=new_policy_gradients,
             lora_layer_gradients=new_lora_layer_gradients,
             advantage_distributions=new_advantage_distributions,
@@ -219,6 +227,8 @@ class PlotData:
             batch_selection_entropy=self.batch_selection_entropy,
             trajectory_samples=self.trajectory_samples,
             kl_from_ref=self.kl_from_ref,
+            kl_keys_from_ref=self.kl_keys_from_ref,
+            kl_values_from_ref=self.kl_values_from_ref,
             policy_gradients=self.policy_gradients,
             lora_layer_gradients=self.lora_layer_gradients,
             advantage_distributions=self.advantage_distributions,
@@ -251,6 +261,8 @@ class PlotData:
             'batch_selection_entropy': self.batch_selection_entropy,
             'trajectory_samples': self.trajectory_samples,
             'kl_from_ref': self.kl_from_ref,
+            'kl_keys_from_ref': self.kl_keys_from_ref,
+            'kl_values_from_ref': self.kl_values_from_ref,
             'policy_gradients': self.policy_gradients,
             'lora_layer_gradients': self.lora_layer_gradients,
             'advantage_distributions': self.advantage_distributions,
@@ -284,6 +296,8 @@ class PlotData:
             batch_selection_entropy=data.get('batch_selection_entropy', []),
             trajectory_samples=data.get('trajectory_samples', []),
             kl_from_ref=data.get('kl_from_ref', []),
+            kl_keys_from_ref=data.get('kl_keys_from_ref', []),
+            kl_values_from_ref=data.get('kl_values_from_ref', []),
             policy_gradients=data.get('policy_gradients', []),
             lora_layer_gradients=data.get('lora_layer_gradients', {}),
             advantage_distributions=data.get('advantage_distributions', []),

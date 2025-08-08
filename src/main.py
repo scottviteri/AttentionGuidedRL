@@ -31,6 +31,8 @@ from src.training import (
     update_reward_stats,
     compute_advantages,
     generate_query_vector,
+    calculate_conditional_log_prob,
+    compute_returns,
 )
 from src.plotting import PlotData, save_plot_data, create_metadata
 
@@ -97,22 +99,28 @@ def policy_gradient_train_step(
     # Compute average rewards after time t for each step
     batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
     T = len(trajectory.qkv_steps)
-    
-    # Compute average reward after time t: R̄_t = (1/(T-t+1)) * Σ_{s=t}^T r_s
-    avg_rewards_after_t = torch.zeros_like(trajectory.rewards)  # [batch_size, T]
-    
-    for t in range(T):
-        # Average of rewards from time t to end
-        future_rewards = trajectory.rewards[:, t:]  # [batch_size, T-t]
-        avg_rewards_after_t[:, t] = future_rewards.mean(dim=1)  # [batch_size]
-    
+ 
+    # Compute weighting targets per step for advantages
+    # Either average of future rewards or discounted returns
+    if CONFIG.reward_aggregation == "average":
+        # R̄_t = (1/(T-t+1)) * Σ_{s=t}^T r_s
+        weighting_targets = torch.zeros_like(trajectory.rewards)
+        for t in range(T):
+            future_rewards = trajectory.rewards[:, t:]
+            weighting_targets[:, t] = future_rewards.mean(dim=1)
+    elif CONFIG.reward_aggregation == "discounted":
+        # Use discounted returns as weighting targets
+        weighting_targets = compute_returns(trajectory.rewards, gamma=CONFIG.gamma)
+    else:
+        raise ValueError(f"Invalid CONFIG.reward_aggregation: {CONFIG.reward_aggregation}")
+
     if CONFIG.use_grpo_baseline:
         # Use GRPO-style batch baseline (mean of all average rewards)
-        batch_baseline = avg_rewards_after_t.mean()
-        advantages = avg_rewards_after_t - batch_baseline
+        batch_baseline = weighting_targets.mean()
+        advantages = weighting_targets - batch_baseline
     else:
         # Use average rewards after t as-is (no baseline subtraction)
-        advantages = avg_rewards_after_t
+        advantages = weighting_targets
     
     # Normalize advantages for stability
     if advantages.numel() > 1:
@@ -150,7 +158,6 @@ def policy_gradient_train_step(
         policy_term = policy_term + policy_gradient_t.sum()  # Sum over batch
         
         # === REWARD GRADIENT TERM: ∇_θ r_{θ,t} ===
-        
         # Prepare context for reward computation
         key_prefix_tokens = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
         value_prefix_tokens = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
@@ -163,21 +170,20 @@ def policy_gradient_train_step(
             value_prefix_tokens
         ], dim=1)
         
-        # === REWARD GRADIENT TERM: ∇_θ r_{θ,t} ===
-        # Instead of recomputing, use the reward that was already computed for this step
-        # This is mathematically equivalent but much more memory efficient
-        
-        # Get the reward for this step (already computed during trajectory generation)
-        step_reward = trajectory.rewards[:, t]  # [batch_size]
-        
-        # The gradient will automatically flow through step_reward since it was computed
-        # with the current model during trajectory generation
-        gamma_t = CONFIG.gamma ** t
+        # Recompute reward differentiably if enabled; otherwise fall back to cached rewards
+        if CONFIG.differentiable_rewards:
+            step_reward = calculate_conditional_log_prob(
+                adapter_model,
+                qkv_step.value_tokens.to(device),
+                reward_context,
+                differentiable=True,
+            )  # [batch_size]
+        else:
+            step_reward = trajectory.rewards[:, t]
         
         # Scale reward term to be comparable in magnitude to policy term
-        # Policy term is normalized advantages * log_probs, while reward term is raw rewards
-        reward_scaling = 0.1  # Scale down reward term relative to policy term
-        reward_term = reward_term + gamma_t * reward_scaling * step_reward.sum()  # Sum over batch
+        reward_scaling = 0.1
+        reward_term = reward_term + reward_scaling * step_reward.sum()
         
         # Update context for next iteration
         current_context = torch.cat([
@@ -436,6 +442,8 @@ def parse_args():
     parser.add_argument("--grpo-batching", action="store_true", help="Use GRPO-style batching (repeat each data point)")
     parser.add_argument("--model-type", type=str, choices=['gpt2', 'llama'], help='Model type to use')
     parser.add_argument('--use-grpo-baseline', action='store_true', help='Use GRPO baseline in advantages')
+    parser.add_argument('--reward-aggregation', type=str, choices=['average', 'discounted'], help='Aggregate rewards for advantages using average or discounted returns')
+    parser.add_argument('--differentiable-rewards', action='store_true', help='Enable differentiable reward term (chain rule)')
     
     # Configuration parameters
     parser.add_argument('--enable-wandb', action='store_true', help='Enable Weights & Biases logging')
@@ -763,6 +771,63 @@ def compute_kl_from_reference(
     return sum(kl_vals) / len(kl_vals)
 
 
+def compute_value_kl_from_reference(
+    trajectory: "Trajectory",
+    adapter_model: torch.nn.Module,
+    ref_model: torch.nn.Module,
+    tokenizer,
+) -> float:
+    """Compute KL(adapter || ref) over value-token distributions for an entire trajectory (diagnostic).
+
+    For each step, we reconstruct the reward context and extract logits at the
+    value-token positions for both adapter and reference models, compute log-softmax
+    and KL in log-space, then average over tokens and steps (batchmean).
+    """
+    device = next(adapter_model.parameters()).device
+    batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
+    
+    # Initialize context with initial prompt
+    context_tokens = tokenizer(
+        [CONFIG.initial_prompt] * batch_size,
+        return_tensors="pt",
+        padding=True,
+        add_special_tokens=False,
+    ).input_ids.to(device)
+    
+    kl_vals = []
+    for step in trajectory.qkv_steps:
+        key_tokens = step.key_tokens.to(device)
+        value_tokens = step.value_tokens.to(device)
+        kp = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        vp = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        reward_context = torch.cat([context_tokens, kp, key_tokens, vp], dim=1)
+        
+        # Adapter logits (no grad for diagnostic)
+        with torch.no_grad():
+            adapter_full = torch.cat([reward_context, value_tokens], dim=1)
+            adapter_logits = adapter_model(adapter_full).logits
+            ctx_len = reward_context.shape[1]
+            adapter_token_logits = adapter_logits[:, ctx_len-1:ctx_len + value_tokens.shape[1] - 1, :]
+            adapter_log_probs = F.log_softmax(adapter_token_logits, dim=-1)
+            
+            # Reference logits
+            ref_full = adapter_full  # same sequence
+            ref_logits = ref_model(ref_full).logits
+            ref_token_logits = ref_logits[:, ctx_len-1:ctx_len + value_tokens.shape[1] - 1, :]
+            ref_log_probs = F.log_softmax(ref_token_logits, dim=-1)
+            
+            # KL over tokens, average across batch and tokens
+            kl_step = F.kl_div(adapter_log_probs, ref_log_probs, reduction="batchmean", log_target=True)
+            kl_vals.append(kl_step.item())
+        
+        # Advance context by appending key/value
+        context_tokens = torch.cat([reward_context, value_tokens], dim=1)
+    
+    if not kl_vals:
+        return 0.0
+    return sum(kl_vals) / len(kl_vals)
+
+
 def main():
     """Main training function."""
     # Start overall training timer
@@ -794,7 +859,8 @@ def main():
         logging.info("Reward computation: Using raw adapter log probabilities (GRPO handles baselines)")
     
     # Log training algorithm
-    logging.info("Training algorithm: Vanilla Policy Gradient (REINFORCE)")
+    logging.info("Training algorithm: Advantage-weighted policy gradient with differentiable reward (chain rule)")
+    logging.info(f"Reward aggregation: {CONFIG.reward_aggregation}")
     
     # Set up models and tokenizer
     logging.info("Setting up models and tokenizer...")
@@ -1041,8 +1107,7 @@ def main():
         gradient_history = []
         weight_changes = []  # Track weight changes over time
         policy_gradients = []  # Track policy gradients (before negation) for conceptual clarity
-        clipping_ratios = []  # Track PPO clipping ratios
-        kl_from_ref = []  # Track KL divergence from reference model (pi_ref)
+        kl_from_ref = []  # Track KL divergence from reference model (for diagnostics only)
         
         for episode in progress_bar:
             if args.verbose:
@@ -1096,14 +1161,20 @@ def main():
             # Policy gradient doesn't need old model log probs
             old_log_probs_batch = adapter_log_probs_batch
 
-            # Exact KL(adapter || reference) over key-selection distribution
+            # KL(adapter || reference) over key-selection distribution (for diagnostics)
             kl_from_ref_value = compute_kl_from_reference(
                 trajectory,
                 adapter_model,
-                ref_model,
+                base_model,
                 tokenizer,
             )
-            kl_from_ref.append(kl_from_ref_value)
+            kl_keys_from_ref_value = kl_from_ref_value
+            kl_values_from_ref_value = compute_value_kl_from_reference(
+                trajectory,
+                adapter_model,
+                base_model,
+                tokenizer,
+            )
             
             # Update reward stats
             reward_stats = update_reward_stats(reward_stats, trajectory.avg_reward)
@@ -1147,6 +1218,33 @@ def main():
             
             # Policy gradient doesn't need old model updates
             
+            # DEBUG: Removed - EMA updates are now enabled
+            
+            # Periodically verify weight changes (every 5 episodes) – check LoRA params correctly
+            if (episode + 1) % 5 == 0:
+                # Build initial snapshot of LoRA params if not already
+                if 'initial_lora_weights' not in locals():
+                    initial_lora_weights = {name: p.data.clone() for name, p in adapter_model.named_parameters() if 'lora' in name}
+
+                # Check any LoRA param diverged from initial snapshot
+                any_changed = False
+                for name, param in adapter_model.named_parameters():
+                    if 'lora' in name and name in initial_lora_weights:
+                        if not torch.allclose(initial_lora_weights[name], param.data):
+                            any_changed = True
+                            break
+
+                if any_changed:
+                    logging.info("Adapter LoRA weights are changing as expected ✅")
+                else:
+                    logging.warning("Adapter LoRA weights have not changed – investigate optimizer/grad flow ⚠️")
+            
+            # Save checkpoint if needed
+            if episode > 0 and episode % CONFIG.checkpoint_interval == 0:
+                save_checkpoint(adapter_model, "latest")
+                if args.verbose:
+                    print(f"\nCheckpoint saved at episode {episode}")
+                
             # Calculate average reward across the batch
             avg_reward = trajectory.avg_reward.mean().item()
             
@@ -1233,8 +1331,6 @@ def main():
             
             # Compute and track average advantages from this episode
             if trajectory.rewards is not None:
-                from src.training import compute_advantages
-                pass  # All config values now accessed via CONFIG
                 advantages, _ = compute_advantages(
                     trajectory.rewards,
                     gamma=CONFIG.gamma,
@@ -1354,6 +1450,8 @@ def main():
                 clipping_ratio=avg_clipping_ratio,
                 batch_selection_entropy=selection_entropy,
                 kl_from_ref_value=kl_from_ref_value,
+                kl_keys_from_ref_value=kl_keys_from_ref_value,
+                kl_values_from_ref_value=kl_values_from_ref_value,
                 lora_layer_gradients_episode=layer_grads,
                 advantage_distribution=advantage_dist,
                 similarity_score_stats=similarity_stats,

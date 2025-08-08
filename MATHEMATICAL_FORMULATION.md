@@ -161,13 +161,13 @@ Since $\nabla_\theta \log \pi_\theta(\tau) = \sum_{t=1}^T \nabla_\theta \log \pi
 
 $$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{s=1}^T w_s \nabla_\theta r_{\theta,s} + \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t) \sum_{k=1}^T \bar{R}_k(\tau) \right]$$
 
-**Key Insight:** This exact derivation shows that each action $a_t$ should be weighted by the **total sum** $\sum_{k=1}^T \bar{R}_k(\tau)$, not by step-specific advantages. Our implementation uses an approximation for better credit assignment.
+**Key Insight:** This exact derivation shows that each action $a_t$ could be weighted by the **total sum** $\sum_{k=1}^T \bar{R}_k(\tau)$, but we adopt step-specific advantages for better temporal credit assignment.
 
 **Implementation Note:** While the exact gradient derivation suggests weighting each action by $\sum_{k=1}^T \bar{R}_k(\tau)$, our implementation uses step-specific advantages $\bar{R}_t(\tau) - \text{baseline}$ for better credit assignment and variance reduction. This is a principled approximation that improves practical training stability.
 
 ### Practical Implementation
 
-**Exact vs. Approximation:** The rigorous mathematical derivation shows that the policy gradient should weight each action by the total sum of average future rewards across all time steps. However, for better credit assignment, our implementation uses step-specific weighting:
+**Exact vs. Approximation:** The rigorous derivation suggests weighting each action by the total sum of average future rewards across all steps. For better credit assignment, our implementation uses step-specific weighting:
 
 - **Exact (from derivation):** $\nabla_\theta \log \pi_\theta(a_t | s_t) \cdot \sum_{k=1}^T \bar{R}_k(\tau)$
 - **Implementation (approximation):** $\nabla_\theta \log \pi_\theta(a_t | s_t) \cdot (\bar{R}_t(\tau) - \text{baseline})$
@@ -178,7 +178,7 @@ This approximation provides better temporal credit assignment by giving each act
 
 ## Loss Function and Training Algorithm
 
-### Advantage-Based Policy Gradient Loss
+### Advantage-Based Policy Gradient Loss (Chain Rule)
 
 **Theorem 2 (Advantage-Based Policy Gradient with θ-Dependent Reward Chain Rule):** The loss function combines advantage-based policy gradients with reward gradient terms:
 
@@ -191,11 +191,10 @@ $$\mathcal{L}(\theta) = \mathbb{E}_{\text{batch}} \left[ -\sum_{t=1}^T \tilde{A}
    - Encourages actions that perform better than the batch baseline
    - Typical magnitude: ~1-10 (normalized)
 
-2. **Reward Gradient Term**: $-\lambda \sum_{t=1}^T r_{\theta,t}$
-   - Direct optimization of reward model parameters
-   - Scaled by $\lambda = 0.1$ to balance with policy term
-   - Natural regularization encouraging higher rewards
-   - Typical magnitude: ~1-10 (after scaling)
+2. **Reward Gradient Term**: $-\lambda \sum_{t=1}^T r_{\theta,t}$ (Differentiable)
+   - Direct optimization of reward model parameters via $\nabla_\theta r_{\theta,t}$
+   - Implemented by recomputing $r_{\theta,t}$ in the training step without `no_grad`
+   - Scaled by $\lambda$ (default 0.1) to balance with the policy term
 
 **Key Properties:**
 1. **Stable Magnitudes**: Both terms scaled to similar ranges (preventing one from dominating)
@@ -240,7 +239,7 @@ where each action is weighted by its normalized advantage $\tilde{A}_t$ based on
 **Comparison with Standard REINFORCE:**
 
 - **Standard REINFORCE**: $\mathcal{L} = -\sum_{t=1}^T G_t \log \pi_\theta(a_t | s_t)$ (returns-to-go with discount factors)
-- **Our Approach**: $\mathcal{L} = -\sum_{t=1}^T \tilde{A}_t \log \pi_\theta(a_t | s_t) - \lambda \sum_{t=1}^T r_{\theta,t}$ (average future rewards + reward gradient)
+- **Our Approach**: $\mathcal{L} = -\sum_{t=1}^T \tilde{A}_t \log \pi_\theta(a_t | s_t) - \lambda \sum_{t=1}^T r_{\theta,t}$ (average-future-reward advantages + differentiable reward term)
 
 where $G_t = \sum_{s=t}^T \gamma^{s-t} r_s$ vs. $\tilde{A}_t$ based on $\bar{R}_t(\tau) = \frac{1}{T-t+1} \sum_{s=t}^T r_{\theta,s}$
 
@@ -265,7 +264,9 @@ for t in range(T):
     future_rewards = trajectory.rewards[:, t:]  # From t to end
     avg_rewards_after_t[:, t] = future_rewards.mean(dim=1)
 
-# 3. Compute advantages with GRPO baseline and normalize
+# 3. Compute weighting targets and advantages
+# Option A (average): R̄_t = mean of future rewards
+# Option B (discounted): standard discounted returns with gamma
 batch_baseline = avg_rewards_after_t.mean()
 advantages = avg_rewards_after_t - batch_baseline
 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -281,8 +282,8 @@ for t, qkv_step in enumerate(trajectory.qkv_steps):
     policy_gradient_t = step_advantages * current_action_log_probs
     policy_term += policy_gradient_t.sum()  # Sum over batch
     
-    # Reward gradient term: λ * ∇_θ r_{θ,t} (via pre-computed rewards)
-    step_reward = trajectory.rewards[:, t]
+    # Reward gradient term: λ * ∇_θ r_{θ,t} (differentiable)
+    step_reward = conditional_log_prob(model, value_tokens, reward_context, differentiable=True)
     reward_scaling = 0.1  # λ scaling factor
     reward_term += reward_scaling * step_reward.sum()
 
@@ -300,7 +301,7 @@ total_loss = -(policy_term + reward_term)
 
 **Key Insight:** Both the policy (action selection) and reward (outcome evaluation) are optimized using the same current model parameters $\theta$. This creates a self-consistent learning signal where the model learns to both select good actions AND accurately evaluate their outcomes.
 
-**Stability Analysis:** The reward gradient term $\nabla_\theta R_\theta(\tau)$ provides natural regularization by encouraging the model to assign higher probabilities to the value tokens it selected. This prevents divergence without requiring artificial KL penalties against a mismatched reference policy.
+**Stability Analysis:** The reward gradient term $\nabla_\theta R_\theta(\tau)$ provides natural regularization by encouraging the model to assign higher probabilities to the value tokens it selected. This avoids the need for any KL penalty.
 
 ---
 
@@ -319,8 +320,8 @@ Input: Hyperparameters γ, learning rate, batch size
    a. Sample Wikipedia article and extract key-value pairs
    b. Generate trajectory τ using current policy π_θ
    c. Compute rewards {r_{θ,t}}ᵀₜ₌₁ using current model θ
-   d. Compute total returns R_θ(τ) = Σₜγᵗ⁻¹r_{θ,t} for each trajectory
-   e. Compute chain rule loss: ℒ(θ) = -(R_θ(τ)·∇log π_θ(τ) + ∇R_θ(τ))
+   d. Compute weighting targets per step: either average future rewards or discounted returns
+   e. Compute chain rule loss: ℒ(θ) = -Σ_t(Ã_t · log π_θ(a_t|s_t)) - λ Σ_t r_{θ,t}  (with r_{θ,t} differentiable)
    f. Update parameters: θ ← θ - ∇_θ ℒ(θ)
    g. Save checkpoint periodically
 ```
@@ -369,6 +370,24 @@ $$\sum_{k \in \mathcal{K}_t^{\text{available}}} \pi_\theta(k | s_t) = 1$$
 $$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}[R_\theta(\tau) \cdot \nabla_\theta \log \pi_\theta(\tau) + \nabla_\theta R_\theta(\tau)]$$
 
 Both terms optimize the same parameters $\theta$, creating a unified learning signal where the model learns to both select high-reward actions AND accurately evaluate their outcomes.
+
+### Average vs Discounted Weighting: Trade-offs
+
+We support two ways to construct stepwise weighting targets for advantages:
+
+1. Average future rewards (default):
+   - $\bar{R}_t = \frac{1}{T-t+1} \sum_{s=t}^T r_{\theta,s}$
+   - Pros: interpretable credit assignment; robust to "gaming" easy short segments because each action is credited for its impact on the remainder of the trajectory
+   - Cons: longer effective gradient paths (each action influences many future rewards), potentially higher variance
+
+2. Discounted returns:
+   - $G_t = \sum_{s=t}^T \gamma^{s-t} r_{\theta,s}$ with $\gamma \in (0,1]$
+   - Pros: shorter effective credit horizon; can stabilize training when later rewards are noisier; tunable temporal bias via $\gamma$
+   - Cons: introduces extra hyperparameter; may over-emphasize immediate/"easy" gains if $\gamma$ is small
+
+Gradient path considerations: With average weighting, each action receives signal from all subsequent rewards, which lengthens the dependency chain but is still handled by modern autograd through the explicit recomputation of $r_{\theta,t}$. Discounting reduces the weight of distant rewards, shortening the effective horizon and often reducing variance.
+
+Given your preference for average weighting (to avoid gaming by selecting trivially easy subsegments), the average formulation is principled here because each episode considers a permutation of a full datapoint, and the average encourages consistent, globally beneficial selections.
 
 ---
 

@@ -5,7 +5,7 @@ These tests verify that all components work together correctly:
 - Data pipeline (functional toolz-based processing)
 - Embedding extraction and similarity computation  
 - Trajectory generation with vector queries
-- PPO training with GRPO batching
+- Chain-rule advantage-based training
 - Model checkpointing and loading
 """
 

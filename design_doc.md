@@ -87,9 +87,9 @@ This project presents a reinforcement learning (RL)-based active learning framew
    - Filter trajectories with rewards >1 SD above the moving average for updates.
 
 5. **Policy Update:**  
-   - Compute policy gradient loss on query tokens using the reward.  
-   - Add KL divergence penalty (`β * KL_penalty`, β=0.1), where KL is computed as `KL(P_previous || P_current)` using `torch.nn.functional.kl_div(log P_previous, log P_current)`.  
-   - Update LoRA parameters with BitsAndBytes 8-bit Adam optimizer (learning rate=2e-4, gradient norm clipped to 1.0).
+  - Compute advantage-weighted policy gradient loss on chosen actions using average-future-reward advantages.  
+  - Add a differentiable reward term per step (chain rule) scaled by λ to directly improve value-token likelihoods.  
+  - Update LoRA parameters with 8-bit Adam optimizer (learning rate=2e-4, gradient norm clipped to 1.0).
 
 6. **Model Management:**  
    - Save the current LoRA state as the "previous model" before each update using a straightforward copy (e.g., `copy.deepcopy(model.lora_params)`).  
@@ -126,26 +126,7 @@ $$
 \text{Loss} = -\sum_{\text{selected trajectories}} \left[ \sum_{t=1}^T r_t \cdot \sum_{i=1}^L \log \pi(token_{t,i} | s_{t,i}) \right] + \beta \cdot \sum_{\text{selected trajectories}} \left[ \sum_{t=1}^T \sum_{i=1}^L \text{KL}(\pi_{\text{previous}}(\cdot | s_{t,i}) || \pi(\cdot | s_{t,i})) \right]
 $$
 
-This implements a standard REINFORCE policy gradient approach with the addition of a KL divergence regularization term.
-
-For numerical stability, the KL divergence between the previous policy and current policy is computed using log probabilities for both distributions:
-
-$$
-\text{KL}(\pi_{\text{previous}} || \pi) = \sum_x \exp(\log \pi_{\text{previous}}(x)) \cdot (\log \pi_{\text{previous}}(x) - \log \pi(x))
-$$
-
-Which is implemented using PyTorch's `F.kl_div` function with `log_target=True`:
-
-```python
-kl_div = F.kl_div(
-    F.log_softmax(current_logits, dim=-1),
-    F.log_softmax(previous_logits, dim=-1),
-    reduction="batchmean",
-    log_target=True
-)
-```
-
-This batched implementation ensures both numerical stability and efficient computation.
+This implements an advantage-weighted REINFORCE objective with an additional differentiable reward term (chain rule) instead of any KL penalty.
 
 ### 3.3. Resource Requirements and Error Handling
 
