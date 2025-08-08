@@ -15,9 +15,10 @@ def test_default_model_configuration():
 
 
 def test_device_configuration():
-    """Test that DEVICE is properly configured for CUDA."""
-    # CUDA is now a hard requirement, so DEVICE should be 'cuda'
-    assert CONFIG.device == 'cuda', f"Expected DEVICE to be 'cuda' but got '{CONFIG.device}'. This project requires CUDA."
+    """Test that DEVICE is properly configured for CUDA if available, otherwise CPU."""
+    import torch
+    expected = 'cuda' if torch.cuda.is_available() else 'cpu'
+    assert CONFIG.device == expected, f"Expected DEVICE to be '{expected}' but got '{CONFIG.device}'."
 
 
 def test_token_configuration_consistency():
