@@ -304,9 +304,7 @@ CONFIGURATION HIGHLIGHTS
 -----------------------
 • KL Penalty Coefficient: {config.get('KL_PENALTY_COEFFICIENT', 'unknown')}
 • Gamma (discount): {config.get('CONFIG.gamma', 'unknown')}
-• Baseline Update Frequency: {config.get('BASELINE_UPDATE_FREQUENCY', 'unknown')} episodes
 • Temperature: {config.get('CONFIG.temperature', 'unknown')}
-• PPO Clip Epsilon: {config.get('CONFIG.ppo_clip_epsilon', 'unknown')}
 
 DATA SUMMARY
 -----------

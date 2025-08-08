@@ -1,10 +1,11 @@
 
 """
-Memory-efficient training loop implementation using LoRA state management.
+Memory-efficient training utilities using LoRA state management.
 
-This module provides drop-in replacements for training functions that
-use LoRA state dictionaries instead of full model copies, achieving
-significant memory savings (typically 60-90% reduction).
+This module provides helpers that swap LoRA state dictionaries instead of full
+model copies to reduce memory usage (typically 60-90% reduction). It can be used
+to reproduce old-policy diagnostics if desired, but the default training path
+uses a chain-rule advantage-based objective without PPO/KL penalties.
 """
 
 import torch
@@ -117,8 +118,8 @@ def memory_efficient_compute_policy_loss(
     """
     Memory-efficient policy loss computation using LoRA state swapping.
     
-    This function computes PPO loss by temporarily switching the adapter model
-    to old LoRA state when needed, instead of maintaining separate model copies.
+    This function demonstrates a memory-efficient computation that can swap
+    LoRA states; it is not part of the default chain-rule training path.
     """
     device = next(adapter_model.parameters()).device
     
@@ -236,9 +237,8 @@ def memory_efficient_compute_policy_loss(
             reduction="batchmean", log_target=True
         )
         
-        # PPO computation
-        import src.config as config
-        if config.CONFIG.use_ppo:
+        # Optional computation path (not used by default)
+        if CONFIG.use_ppo:
             # PPO with ratio clipping
             log_ratio = current_action_log_probs - old_action_log_probs
             ratio = torch.exp(log_ratio)
@@ -269,7 +269,7 @@ def memory_efficient_compute_policy_loss(
         total_loss = total_policy_loss + kl_penalty_coef * total_kl_loss
         
         if verbose:
-            method_name = "PPO" if config.CONFIG.use_ppo else "Vanilla PG"
+            method_name = "PPO" if CONFIG.use_ppo else "Vanilla PG"
             logging.info(f"Memory-efficient {method_name} loss computed")
             logging.info(f"Policy loss: {total_policy_loss.item():.4f}")
             logging.info(f"KL loss: {total_kl_loss.item():.4f}")

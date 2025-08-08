@@ -10,7 +10,7 @@ The core innovation is an RL system where:
 2. **Attention-Guided Selection**: Multi-head attention computes similarity between queries and available key embeddings
 3. **Sequential Decision Making**: The model builds trajectories by iteratively selecting key-value pairs
 4. **Self-Supervised Rewards**: Training progress is measured by improvement in predicting values given context
-5. **Policy Optimization**: PPO with KL regularization trains the model to make better selections
+5. **Policy Optimization**: Advantage-based policy gradients with a chain-rule reward term train the model to make better selections
 
 This creates a feedback loop where the model's internal representations directly guide what it learns next, enabling autonomous curriculum learning.
 
@@ -19,7 +19,7 @@ This creates a feedback loop where the model's internal representations directly
 - **Attention-guided selection**: Uses embeddings from the model's attention layers for content selection
 - **Self-directed learning**: Model autonomously sequences its training data based on internal representations  
 - **Multi-model architecture**: Support for both Llama-3.2-3B and GPT-2 with unified interface
-- **Robust RL training**: PPO with adaptive KL regularization and baseline subtraction
+- **Robust RL training**: Advantage-based policy gradients with GRPO-style baselines and a differentiable reward term
 - **Parameter efficiency**: LoRA adapters enable efficient training of large models
 - **Comprehensive evaluation**: 66+ tests covering all components, extensive visualization tools
 - **Multiple datasets**: Wikipedia articles and Twenty Questions for different learning scenarios
@@ -78,10 +78,15 @@ python -m src.main --model-type llama
 python -m src.main --batch-size 8 --episodes 5000 --learning-rate 1e-4
 
 # Reinforcement learning parameters
-python -m src.main --kl-penalty-coef 0.05 --ppo-clip-epsilon 0.3
+# Choose reward aggregation for advantages: average (default) or discounted
+python -m src.main --reward-aggregation average
+python -m src.main --reward-aggregation discounted --use-grpo-baseline --batch-size 8
 
-# Baseline update frequency (affects KL regularization)
-python -m src.main --baseline-update-freq 10  # Update every 10 episodes
+# Enable differentiable reward term (chain rule)
+python -m src.main --differentiable-rewards
+
+# GRPO baseline (per-step batch mean) for variance reduction
+python -m src.main --use-grpo-baseline
 ```
 
 ### Dataset Options
@@ -126,9 +131,9 @@ reward = log_prob_adapter(value | context, key) - log_prob_base(value | context,
 ```
 
 ### 3. Policy Optimization
-Uses PPO with KL regularization against the previous policy:
+Uses advantage-weighted policy gradient with an additional differentiable reward term (chain rule):
 ```python
-loss = -min(ratio * advantage, clip(ratio) * advantage) + β * KL(π_θ || π_old)
+loss = -sum_t(A_t * logpi_t) - λ * sum_t(r_t)
 ```
 
 ## Implementation Details
@@ -166,7 +171,7 @@ attention-guided-rl/
 │   ├── model.py                # Model setup with LoRA adaptation
 │   ├── embeddings.py           # Attention-based embedding extraction
 │   ├── data.py                 # Dataset iterators and preprocessing
-│   ├── training.py             # PPO training loop and policy optimization
+│   ├── training.py             # Training utilities and policy optimization
 │   └── memory_efficient_training.py  # Memory-efficient LoRA training
 ├── tests/                      # Comprehensive test suite (66+ tests)
 ├── logs/                       # Training outputs and visualizations

@@ -30,7 +30,8 @@ def build_trajectory_from_raw(
 def calculate_conditional_log_prob(
     model: torch.nn.Module,
     tokens: torch.Tensor,
-    context: torch.Tensor
+    context: torch.Tensor,
+    differentiable: bool = False,
 ) -> torch.Tensor:
     """
     Calculate the conditional log probability of generating tokens given context.
@@ -39,6 +40,7 @@ def calculate_conditional_log_prob(
         model: The language model
         tokens: The tokens to evaluate [batch_size, seq_length]
         context: The context tokens [batch_size, context_length]
+        differentiable: If True, compute with gradients; otherwise, compute under no_grad
         
     Returns:
         torch.Tensor: Log probabilities for each batch item [batch_size]
@@ -47,9 +49,13 @@ def calculate_conditional_log_prob(
     full_sequence = torch.cat([context, tokens], dim=1)
     
     # Get model outputs
-    with torch.no_grad():
+    if differentiable:
         outputs = model(full_sequence)
         logits = outputs.logits
+    else:
+        with torch.no_grad():
+            outputs = model(full_sequence)
+            logits = outputs.logits
     
     # Extract logits for the token positions
     # We need logits from positions [context_length-1] to [context_length + seq_length - 2]

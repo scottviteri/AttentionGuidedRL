@@ -161,8 +161,8 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     if custom_config:
         config.update(custom_config)
     
-    # Get KL penalty coefficient for labels
-    KL_PENALTY_COEFFICIENT = config.get('KL_PENALTY_COEFFICIENT', 0.1)
+    # Keep backward-compat fields if present; no KL penalty in default path
+    KL_PENALTY_COEFFICIENT = config.get('KL_PENALTY_COEFFICIENT', None)
     
     # Create output directory
     if output_dir is None:
@@ -309,7 +309,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[5].legend(fontsize=7)
     axes[5].grid(True, alpha=0.3)
     
-    # Plot 7: KL Divergence from Reference
+    # Plot 7: KL Divergence from Reference (diagnostic)
     axes[6].plot(training_steps, kl_from_ref, 'darkred', linewidth=2)
     axes[6].set_xlabel('Training Step')
     axes[6].set_ylabel('KL Divergence')
@@ -380,17 +380,11 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
                      ha='center', va='center', transform=axes[8].transAxes, fontsize=10)
         axes[8].set_title('Log Prob by Step Index')
     
-    # Plot 10: PPO Clipping Ratio
-    axes[9].plot(training_steps, clipping_ratios, 'navy', linewidth=2)
-    axes[9].axhline(y=0.8, color='red', linestyle='--', alpha=0.5, label='Lower clip (0.8)')
-    axes[9].axhline(y=1.2, color='red', linestyle='--', alpha=0.5, label='Upper clip (1.2)')
-    axes[9].axhline(y=1.0, color='gray', linestyle='-', alpha=0.3, label='No change (1.0)')
-    axes[9].set_xlabel('Training Step')
-    axes[9].set_ylabel('Average Clipping Ratio')
-    axes[9].set_title(f'PPO Clipping Ratio (π_θ / π_old){title_suffix}')
-    axes[9].legend(fontsize=7)
-    axes[9].grid(True, alpha=0.3)
-    axes[9].set_ylim(0.5, 1.5)
+    # Plot 10: (unused placeholder in chain-rule setup)
+    axes[9].plot(training_steps, [0.0]*len(training_steps), label='N/A', color='gray', linestyle='--')
+    axes[9].set_ylabel('N/A')
+    axes[9].set_title('Unused (Chain-rule setup)')
+    axes[9].legend()
     
     # Plot 11: LoRA Layer Gradient Flow
     if lora_layer_gradients:
@@ -666,7 +660,7 @@ def main():
     parser.add_argument('--output-dir', '-o', default=None,
                        help='Directory to save plots (default: same directory as input file)')
     parser.add_argument('--kl-coef', type=float, default=None,
-                       help='Override KL penalty coefficient for labels')
+                       help='(Deprecated) Override KL penalty coefficient for labels')
     parser.add_argument('--smooth-window', '-s', type=int, default=1,
                        help='Smoothing window size (default: 1, no smoothing)')
     parser.add_argument('--recent', type=int, metavar='N',

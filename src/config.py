@@ -51,6 +51,8 @@ class TrainingConfig:
     # RL-specific parameters
     gamma: float = 0.99
     temperature: float = 1.0
+    reward_aggregation: str = "average"  # "average" or "discounted"
+    differentiable_rewards: bool = True   # Enable chain-rule reward gradients
     
     # Training behavior
     use_grpo_baseline: bool = True
@@ -157,6 +159,8 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
         # RL parameters (CLI overrides or defaults)
         gamma=base_config.gamma,
         temperature=base_config.temperature,
+        reward_aggregation=getattr(args, 'reward_aggregation', None) or base_config.reward_aggregation,
+        differentiable_rewards=getattr(args, 'differentiable_rewards', False) or base_config.differentiable_rewards,
         
         # Training behavior (CLI overrides or defaults)
         use_grpo_baseline=getattr(args, 'use_grpo_baseline', False) or base_config.use_grpo_baseline,

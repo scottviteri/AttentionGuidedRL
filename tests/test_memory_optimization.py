@@ -330,11 +330,11 @@ class TestIntegration:
                 if 'lora_' in name:
                     param.data.add_(0.01 * torch.randn_like(param.data))
         
-        # Simulate needing old model for PPO ratios
+        # Simulate needing old model state (if using optional diagnostics)
         current_lora_state = save_lora_state(current_model)  # Save current
         load_lora_state(current_model, old_lora_state)       # Switch to old
         
-        # ... Here we would compute PPO ratios using "old" model ...
+        # ... Old-policy diagnostics could be computed here if enabled ...
         test_input = torch.randn(10, 100)
         old_output = current_model(test_input)
         
