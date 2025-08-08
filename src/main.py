@@ -35,6 +35,12 @@ from src.training import (
     compute_returns,
 )
 from src.plotting import PlotData, save_plot_data, create_metadata
+from src.metrics import (
+    compute_wikipedia_order_consistency,
+    compute_batch_selection_entropy,
+    compute_advantage_distribution,
+    compute_similarity_score_stats,
+)
 
 # Simple policy gradient training - no memory-efficient components needed
 
@@ -299,6 +305,7 @@ def generate_trajectory(
     batch_size: int,
     config: TrainingConfig,
     verbose: bool = False,
+    rng: Optional[torch.Generator] = None,
 ) -> RawTrajectory:
     """
     Generate a single trajectory using vector queries (refactored, purely functional).
@@ -343,7 +350,7 @@ def generate_trajectory(
                                              availability_mask=available_mask)
 
         # 4) Sample an index per batch item, respecting already-used keys
-        selected_indices, _ = sample_key_value(similarity_scores, available_indices_per_batch, batch_size)
+        selected_indices, _ = sample_key_value(similarity_scores, available_indices_per_batch, batch_size, rng=rng)
 
         # 5) Assemble tensors for the chosen KV pair
         selected_key_tokens = []
@@ -431,150 +438,10 @@ def parse_args():
     return parser.parse_args()
 
 
-def compute_wikipedia_order_consistency(trajectory) -> float:
-    """
-    Compute how consistently the model selects keys in their original Wikipedia article order.
-    
-    Uses edit distance from the perfect sequential order to measure consistency.
-    Perfect order consistency = 1.0 (sequence matches 0,1,2,3,...)
-    Maximum disorder = 0.0 (sequence requires maximum edits to fix)
-    
-    Args:
-        trajectory: The trajectory containing selected key indices
-        
-    Returns:
-        float: Order consistency score between 0.0 and 1.0
-    """
-    # import torch  # redundant (already at module level)
-    if not trajectory.qkv_steps:
-        raise ValueError("Trajectory must contain qkv_steps")
-
-    first_step = trajectory.qkv_steps[0]
-    if not isinstance(first_step.selected_idx, torch.Tensor):
-        raise TypeError("selected_idx must be a torch.Tensor")
-    if first_step.selected_idx.numel() == 0:
-        raise ValueError("selected_idx tensor is empty")
-    
-    batch_size = trajectory.qkv_steps[0].selected_idx.shape[0]
-    all_batch_consistency_scores = []
-
-    # Define the edit_distance function locally for clarity
-    def edit_distance(seq1, seq2):
-        """Compute edit distance between two sequences."""
-        m, n = len(seq1), len(seq2)
-        dp = [[0] * (n + 1) for _ in range(m + 1)]
-        
-        # Initialize base cases
-        for i in range(m + 1):
-            dp[i][0] = i
-        for j in range(n + 1):
-            dp[0][j] = j
-        
-        # Fill the DP table
-        for i in range(1, m + 1):
-            for j in range(1, n + 1):
-                if seq1[i-1] == seq2[j-1]:
-                    dp[i][j] = dp[i-1][j-1]  # No operation needed
-                else:
-                    dp[i][j] = 1 + min(
-                        dp[i-1][j],    # Delete
-                        dp[i][j-1],    # Insert
-                        dp[i-1][j-1]   # Replace
-                    )
-        
-        return dp[m][n]
-
-    for b in range(batch_size):
-        selected_indices_for_batch_item = []
-        for step in trajectory.qkv_steps:
-            if hasattr(step, 'selected_idx') and isinstance(step.selected_idx, torch.Tensor):
-                selected_indices_for_batch_item.append(step.selected_idx[b].item())
-        
-        if len(selected_indices_for_batch_item) < 2:
-            all_batch_consistency_scores.append(0.5) # Neutral if not enough steps for this batch item
-            continue
-        
-        n = len(selected_indices_for_batch_item)
-        perfect_sequence = list(range(n))
-        
-        # Compute edit distance from perfect sequence
-        distance = edit_distance(selected_indices_for_batch_item, perfect_sequence)
-        
-        # Normalize: maximum possible edit distance is n (for complete reversal or large differences)
-        max_distance = n
-        
-        if max_distance == 0:
-            consistency_score = 1.0  # Edge case: single element
-        else:
-            consistency_score = 1.0 - (distance / max_distance)
-        
-        all_batch_consistency_scores.append(max(0.0, min(1.0, consistency_score)))  # Clamp to [0, 1]
-
-    return sum(all_batch_consistency_scores) / len(all_batch_consistency_scores) if all_batch_consistency_scores else 0.5
+# moved to src.metrics.compute_wikipedia_order_consistency
 
 
-def compute_batch_selection_entropy(trajectory) -> float:
-    """
-    Compute the entropy of key selection orders within a batch.
-    
-    High entropy indicates diverse selection patterns across batch items.
-    Low entropy indicates similar/identical selection patterns.
-    
-    Args:
-        trajectory: The trajectory containing selected key indices for all batch items
-        
-    Returns:
-        float: Shannon entropy of the selection order distribution
-    """
-    # Redundant local imports removed – all symbols available at module level
-    # import math
-    # from collections import Counter
-    # import torch
-
-    if not trajectory.qkv_steps:
-        raise ValueError("Trajectory must contain qkv_steps")
-
-    if not isinstance(trajectory.qkv_steps[0].selected_idx, torch.Tensor):
-        raise TypeError("selected_idx must be a torch.Tensor")
-
-    if trajectory.qkv_steps[0].selected_idx.numel() == 0:
-        raise ValueError("selected_idx tensor is empty")
-
-    batch_size = trajectory.qkv_steps[0].selected_idx.shape[0]
-
-    if batch_size <= 1:
-        return 0.0
-    
-    all_batch_sequences = [] # List of tuples, each inner tuple is a sequence for one batch item
-    
-    # For each batch item, build its selection sequence of scalar indices
-    for b in range(batch_size):
-        sequence = []
-        for step in trajectory.qkv_steps:
-            if hasattr(step, 'selected_idx') and isinstance(step.selected_idx, torch.Tensor):
-                sequence.append(step.selected_idx[b].item())
-        all_batch_sequences.append(tuple(sequence)) # Convert to tuple for hashing
-    
-    if not all_batch_sequences:
-        return 0.0
-    
-    # Count unique sequences and their frequencies
-    sequence_counts = Counter(all_batch_sequences)
-    
-    # Compute Shannon entropy
-    total_sequences = len(all_batch_sequences)
-    entropy_val = 0.0
-    
-    for count in sequence_counts.values():
-        if count > 0:
-            p = count / total_sequences
-            entropy_val -= p * math.log2(p) # Using log2 for bits
-    
-    # Normalize by maximum possible entropy, which is log2(batch_size) if all sequences are unique
-    max_entropy = math.log2(batch_size) 
-    normalized_entropy = entropy_val / max_entropy if max_entropy > 0 else 0.0
-    
-    return normalized_entropy
+# moved to src.metrics.compute_batch_selection_entropy
 
 
 def test_edit_distance_function():
@@ -992,65 +859,9 @@ def main():
             
             return layer_grads
 
-        def compute_advantage_distribution(advantages):
-            """
-            Compute the distribution of positive vs negative advantages.
-            
-            Args:
-                advantages: Tensor of shape [batch, steps]
-                
-            Returns:
-                Dict with positive_percentage, negative_percentage, zero_percentage
-            """
-            total_advantages = advantages.numel()
-            positive_count = (advantages > 0).sum().item()
-            negative_count = (advantages < 0).sum().item()
-            zero_count = (advantages == 0).sum().item()
-            
-            return {
-                'positive_percentage': positive_count / total_advantages * 100,
-                'negative_percentage': negative_count / total_advantages * 100,
-                'zero_percentage': zero_count / total_advantages * 100,
-                'mean': advantages.mean().item(),
-                'std': advantages.std().item()
-            }
+        # moved to src.metrics.compute_advantage_distribution
 
-        def compute_similarity_score_stats(trajectory):
-            """
-            Compute statistics about similarity scores in a trajectory.
-            
-            Args:
-                trajectory: Trajectory object with qkv_steps
-                
-            Returns:
-                Dict with mean, std, entropy, max, min of similarity scores
-            """
-            all_similarities = []
-            
-            for step in trajectory.qkv_steps:
-                if hasattr(step, 'similarity_scores') and step.similarity_scores is not None:
-                    similarities = step.similarity_scores
-                    probs = torch.exp(similarities)
-                    
-                    all_similarities.append({
-                        'mean': probs.mean().item(),
-                        'std': probs.std().item(),
-                        'entropy': -(probs * similarities).sum(dim=-1).mean().item(),
-                        'max': probs.max().item(),
-                        'min': probs.min().item()
-                    })
-            
-            if not all_similarities:
-                return {'mean': 0.0, 'std': 0.0, 'entropy': 0.0, 'max': 0.0, 'min': 0.0}
-            
-            # Average across all steps
-            return {
-                'mean': sum(s['mean'] for s in all_similarities) / len(all_similarities),
-                'std': sum(s['std'] for s in all_similarities) / len(all_similarities),
-                'entropy': sum(s['entropy'] for s in all_similarities) / len(all_similarities),
-                'max': sum(s['max'] for s in all_similarities) / len(all_similarities),
-                'min': sum(s['min'] for s in all_similarities) / len(all_similarities)
-            }
+        # moved to src.metrics.compute_similarity_score_stats
         
         # Training loop
         logging.info("Starting training...")

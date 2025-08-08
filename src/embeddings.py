@@ -494,18 +494,21 @@ def compute_similarity(
 def sample_key_value(
     similarity_scores: torch.Tensor,  # Shape: [batch, num_keys]
     available_keys: List[List[int]],
-    batch_size: int
+    batch_size: int,
+    rng: Optional[torch.Generator] = None,
 ) -> Tuple[List[int], torch.Tensor]:  # Returns: Tuple[List[int], Tensor[batch]]
     """
     Sample key indices based on similarity scores using batched operations.
+    Determinism can be achieved by passing a torch.Generator.
     
     Args:
         similarity_scores: Similarity scores [batch, num_keys]
         available_keys: List of available key indices for each batch item
         batch_size: Batch size
+        rng: Optional torch.Generator for deterministic sampling
         
     Returns:
-        Tuple[List[int], torch.Tensor]: Sampled key indices and their probabilities
+        Tuple[List[int], torch.Tensor]: Sampled key indices and their log-probabilities
         
     Raises:
         ValueError: If any batch item has no available keys
@@ -529,18 +532,21 @@ def sample_key_value(
     # Apply mask to similarity scores (adds 0 to available keys, -inf to unavailable)
     masked_scores = similarity_scores + key_mask
     
-    # Create categorical distributions for each batch element
-    distributions = torch.distributions.Categorical(logits=masked_scores)
-    
-    # Sample from all distributions at once
-    sampled_indices_tensor = distributions.sample()
+    if rng is None:
+        # Create categorical distributions for each batch element
+        distributions = torch.distributions.Categorical(logits=masked_scores)
+        sampled_indices_tensor = distributions.sample()
+    else:
+        # Use torch.multinomial with explicit generator for determinism
+        probs = torch.softmax(masked_scores, dim=-1)
+        sampled_indices_tensor = torch.multinomial(probs, 1, replacement=True, generator=rng).squeeze(1)
     
     # Convert to Python list for compatibility with previous version
     sampled_indices = sampled_indices_tensor.tolist()
     
-    # Get probabilities for the sampled indices
+    # Get log-probabilities for the sampled indices from the original (masked) logits
     sampled_log_probs = torch.zeros(batch_size, device=device)
     for b in range(batch_size):
-        sampled_log_probs[b] = similarity_scores[b, sampled_indices[b]]
+        sampled_log_probs[b] = masked_scores[b, sampled_indices[b]]
     
     return sampled_indices, sampled_log_probs 
