@@ -416,7 +416,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[10].set_yscale('log')
     axes[10].grid(True, alpha=0.3)
     
-    # Plot 12: GRPO Advantage Monitoring (Not Used in Training)
+    # Plot 12: Advantage Monitoring
     positive_percentages = smooth_data([d['positive_percentage'] for d in advantage_distributions], smooth_window)
     negative_percentages = smooth_data([d['negative_percentage'] for d in advantage_distributions], smooth_window)
     
@@ -425,7 +425,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[11].axhline(y=50.0, color='gray', linestyle='--', alpha=0.5, label='50% (Balanced)')
     axes[11].set_xlabel('Training Step')
     axes[11].set_ylabel('Percentage (%)')
-    axes[11].set_title(f'GRPO Advantages (Monitoring Only - Not Used in Training){title_suffix}')
+    axes[11].set_title(f'Advantage Distribution{title_suffix}')
     axes[11].set_ylim(0, 100)
     axes[11].legend(fontsize=7)
     axes[11].grid(True, alpha=0.3)

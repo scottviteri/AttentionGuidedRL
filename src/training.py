@@ -212,7 +212,7 @@ def compute_trajectory_rewards(
             # Classic approach: reward = improvement over reference model
             rewards[:, i] = adapter_log_prob - ref_log_prob
         else:
-            # Simplified approach: use raw adapter performance, let GRPO handle baselines
+            # Simplified approach: use raw adapter performance with trajectory averages
             rewards[:, i] = adapter_log_prob
         
         if verbose:
@@ -332,50 +332,25 @@ def compute_returns(rewards: torch.Tensor, gamma: float = 0.99) -> torch.Tensor:
 def compute_advantages(
     rewards: torch.Tensor,
     gamma: float = 0.99,
-    gae_lambda: float = 0.95,
-    use_grpo_baseline: bool = True
+    gae_lambda: float = 0.95
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute advantages using Generalized Advantage Estimation (GAE) or GRPO-style baseline.
+    Compute advantages using trajectory average (simple baseline).
     
     Args:
         rewards: Tensor of rewards [batch_size, num_steps]
-        gamma: Discount factor
-        gae_lambda: GAE lambda parameter for bias-variance tradeoff
-        use_grpo_baseline: If True, use GRPO-style per-timestep batch average
+        gamma: Discount factor (unused in current implementation)
+        gae_lambda: GAE lambda parameter (unused in current implementation)
         
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: (advantages, returns)
     """
-    returns = compute_returns(rewards, gamma)
-
-    if use_grpo_baseline:
-        # GRPO-style: per-timestep batch mean as baseline
-        baseline = returns.mean(dim=0, keepdim=True)
-        
-        if gae_lambda < 1.0:
-            # Standard GAE without value function - use rewards for temporal differences
-            batch_size, num_steps = rewards.shape
-            advantages = torch.zeros_like(rewards)
-            
-            # Work backwards computing GAE advantages
-            for t in reversed(range(num_steps)):
-                if t == num_steps - 1:
-                    # Last timestep: A_T = R_T - baseline_T
-                    advantages[:, t] = returns[:, t] - baseline[:, t]
-                else:
-                    # GAE recurrence: A_t = δ_t + γλA_{t+1}
-                    # where δ_t = r_t + γV_{t+1} - V_t
-                    # Since we don't have V, use baseline as proxy
-                    delta_t = rewards[:, t] + gamma * baseline[:, t + 1] - baseline[:, t]
-                    advantages[:, t] = delta_t + gamma * gae_lambda * advantages[:, t + 1]
-        else:
-            # Standard Monte Carlo (lambda = 1.0)
-            advantages = returns - baseline
-    else:
-        # Simpler: subtract per-trajectory mean then normalize
-        advantages = returns - returns.mean(dim=1, keepdim=True)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    # Simple trajectory average approach - each action gets same credit
+    trajectory_avg = rewards.mean(dim=1, keepdim=True)  # [batch_size, 1]
+    advantages = trajectory_avg.expand_as(rewards)  # [batch_size, num_steps]
+    
+    # For compatibility, also return the trajectory averages as "returns"
+    returns = advantages.clone()
 
     return advantages, returns
 
@@ -438,7 +413,7 @@ def compute_policy_loss(
         trajectory.rewards, 
         gamma=gamma,
         gae_lambda=CONFIG.gae_lambda,
-        use_grpo_baseline=CONFIG.use_grpo_baseline
+        
     )
     
 

@@ -135,44 +135,39 @@ where \(v_{t,i}\) is the \(i\)-th token in the value sequence and \(v_{t,<i}\) r
 
 **Theorem 1 (Policy Gradient with θ-Dependent Rewards):** The system maximizes the following objective function:
 
-\[\mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=1}^T \bar{R}_t(\tau) \right]\]
+$$\mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \bar{R}(\tau) \right]$$
 
 where:
-- $\bar{R}_t(\tau) = \frac{1}{T-t+1} \sum_{s=t}^T r_{\theta,s}$ is the **average reward after time $t$**
+- $\bar{R}(\tau) = \frac{1}{T} \sum_{t=1}^T r_{\theta,t}$ is the **average reward over the entire trajectory**
 - $r_{\theta,t} = \frac{1}{|v_t|} \sum_{i=1}^{|v_t|} \log p_\theta(v_{t,i} | c_t, k_t, v_{t,<i})$ is the instantaneous θ-dependent reward
 
 **Detailed Gradient Derivation:** Since both the policy and rewards depend on \(\theta\), we apply the chain rule:
 
-\[\nabla_\theta \mathcal{J}(\theta) = \nabla_\theta \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=1}^T \bar{R}_t(\tau) \right]\]
+$$\nabla_\theta \mathcal{J}(\theta) = \nabla_\theta \mathbb{E}_{\tau \sim \pi_\theta} \left[ \bar{R}(\tau) \right]$$
 
-**Step 1: Expand \(\bar{R}_t(\tau)\)**
-\[\mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{t=1}^T \frac{1}{T-t+1} \sum_{s=t}^T r_{\theta,s} \right]\]
+**Step 1: Expand $\bar{R}(\tau)$**
+$$\mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \frac{1}{T} \sum_{t=1}^T r_{\theta,t} \right]$$
 
-**Step 2: Interchange summation order**
-\[= \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{s=1}^T r_{\theta,s} \sum_{t=1}^s \frac{1}{T-t+1} \right]\]
+**Step 2: Apply chain rule for θ-dependent rewards and policy**
+$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \frac{1}{T} \sum_{t=1}^T \nabla_\theta r_{\theta,t} \right] + \mathbb{E}_{\tau \sim \pi_\theta} \left[ \nabla_\theta \log \pi_\theta(\tau) \cdot \bar{R}(\tau) \right]$$
 
-Let $w_s = \sum_{t=1}^s \frac{1}{T-t+1}$ be the **weight coefficient** for reward $r_{\theta,s}$.
+**Step 3: Expand trajectory log-probability**
+Since $\nabla_\theta \log \pi_\theta(\tau) = \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t)$:
 
-**Step 3: Apply chain rule for θ-dependent rewards and policy**
-\[\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{s=1}^T w_s \nabla_\theta r_{\theta,s} \right] + \mathbb{E}_{\tau \sim \pi_\theta} \left[ \nabla_\theta \log \pi_\theta(\tau) \sum_{t=1}^T \bar{R}_t(\tau) \right]\]
+$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \frac{1}{T} \sum_{t=1}^T \nabla_\theta r_{\theta,t} + \bar{R}(\tau) \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t) \right]$$
 
-**Step 4: Expand trajectory log-probability**
-Since \(\nabla_\theta \log \pi_\theta(\tau) = \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t)\):
+**Key Insight:** This exact derivation shows that each action $a_t$ should be weighted by the **same trajectory average** $\bar{R}(\tau)$. This is much simpler than step-specific advantages and matches our implementation exactly!
 
-\[\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \sum_{s=1}^T w_s \nabla_\theta r_{\theta,s} + \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t) \sum_{k=1}^T \bar{R}_k(\tau) \right]\]
-
-**Key Insight:** This exact derivation shows that each action $a_t$ could be weighted by the **total sum** $\sum_{k=1}^T \bar{R}_k(\tau)$, but we adopt step-specific advantages for better temporal credit assignment.
-
-**Implementation Note:** While the exact gradient derivation suggests weighting each action by $\sum_{k=1}^T \bar{R}_k(\tau)$, our implementation uses step-specific advantages $\bar{R}_t(\tau) - \text{baseline}$ for better credit assignment and variance reduction. This is a principled approximation that improves practical training stability.
+**Perfect Alignment:** The mathematical derivation and implementation are now **exactly consistent**! Each action is weighted by the same trajectory average $\bar{R}(\tau)$ with no baseline subtraction or normalization, providing a clean and theoretically sound approach.
 
 ### Practical Implementation
 
-**Exact vs. Approximation:** The rigorous derivation suggests weighting each action by the total sum of average future rewards across all steps. For better credit assignment, our implementation uses step-specific weighting:
+**Mathematical Consistency:** The rigorous derivation perfectly matches our implementation:
 
-- **Exact (from derivation):** \(\nabla_\theta \log \pi_\theta(a_t | s_t) \cdot \sum_{k=1}^T \bar{R}_k(\tau)\)
-- **Implementation (approximation):** \(\nabla_\theta \log \pi_\theta(a_t | s_t) \cdot (\bar{R}_t(\tau) - \text{baseline})\)
+- **Theory:** $\nabla_\theta \log \pi_\theta(a_t | s_t) \cdot \bar{R}(\tau)$
+- **Implementation:** $\nabla_\theta \log \pi_\theta(a_t | s_t) \cdot \bar{R}(\tau)$
 
-This approximation provides better temporal credit assignment by giving each action credit primarily for its future consequences rather than the entire trajectory outcome.
+This approach gives each action credit for the overall trajectory performance, which is mathematically correct and conceptually simple.
 
 ---
 
