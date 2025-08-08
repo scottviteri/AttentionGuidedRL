@@ -23,7 +23,6 @@ This creates a feedback loop where the model's internal representations directly
 - **Parameter efficiency**: LoRA adapters enable efficient training of large models
 - **Comprehensive evaluation**: 66+ tests covering all components, extensive visualization tools
 - **Multiple datasets**: Wikipedia articles and Twenty Questions for different learning scenarios
-- Memory-efficient training mode available for resource-constrained environments
 
 ## Requirements
 
@@ -105,8 +104,7 @@ python -m src.main --dataset twenty_questions
 # Standard training
 python -m src.main
 
-# Memory-efficient mode (60-90% memory reduction)
-python -m src.main --memory-efficient
+# (Memory-efficient mode removed; default training uses a single adapter model)
 
 # Resume from checkpoint
 python -m src.main --resume
@@ -172,7 +170,6 @@ attention-guided-rl/
 │   ├── embeddings.py           # Attention-based embedding extraction
 │   ├── data.py                 # Dataset iterators and preprocessing
 │   ├── training.py             # Training utilities and policy optimization
-│   └── memory_efficient_training.py  # Memory-efficient LoRA training
 ├── tests/                      # Comprehensive test suite (66+ tests)
 ├── logs/                       # Training outputs and visualizations
 └── docs/                       # Additional documentation
