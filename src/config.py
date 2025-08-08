@@ -58,6 +58,8 @@ class TrainingConfig:
     use_grpo_baseline: bool = True
     subtract_base_model_logprobs: bool = False
     grpo_batching: bool = True  # GRPO-style batching
+    gae_lambda: float = 0.95
+    kl_penalty_coefficient: float = 0.1
     
     # Training infrastructure
     checkpoint_interval: int = 100
@@ -166,6 +168,8 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
         use_grpo_baseline=getattr(args, 'use_grpo_baseline', False) or base_config.use_grpo_baseline,
         subtract_base_model_logprobs=getattr(args, 'subtract_base_logprobs', False) or base_config.subtract_base_model_logprobs,
         grpo_batching=getattr(args, 'grpo_batching', False) or base_config.grpo_batching,
+        gae_lambda=getattr(args, 'gae_lambda', None) or base_config.gae_lambda,
+        kl_penalty_coefficient=getattr(args, 'kl_penalty_coefficient', None) or base_config.kl_penalty_coefficient,
         
         # Infrastructure
         checkpoint_interval=base_config.checkpoint_interval,

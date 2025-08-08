@@ -90,10 +90,10 @@ class PlotData:
         kl_from_ref_value: float,
         kl_keys_from_ref_value: float = 0.0,
         kl_values_from_ref_value: float = 0.0,
-        lora_layer_gradients_episode: Dict[int, float],
-        advantage_distribution: Dict[str, float],
-        similarity_score_stats: Dict[str, float],
-        policy_gradient: float,
+        lora_layer_gradients_episode: Optional[Dict[int, float]] = None,
+        advantage_distribution: Optional[Dict[str, float]] = None,
+        similarity_score_stats: Optional[Dict[str, float]] = None,
+        policy_gradient: float = 0.0,
         # New chain rule metrics
         policy_term_value: float = 0.0,
         reward_term_value: float = 0.0,
@@ -111,6 +111,20 @@ class PlotData:
         This method follows the pure functional approach preferred by the user,
         taking the current frozen instance and returning a new updated instance.
         """
+        # Provide defaults for optional dicts
+        if advantage_distribution is None:
+            advantage_distribution = {
+                'positive_percentage': 0.0,
+                'negative_percentage': 0.0,
+                'zero_percentage': 100.0,
+                'mean': 0.0,
+                'std': 0.0,
+            }
+        if similarity_score_stats is None:
+            similarity_score_stats = {'mean': 0.0, 'std': 0.0, 'entropy': 0.0, 'max': 0.0, 'min': 0.0}
+        if lora_layer_gradients_episode is None:
+            lora_layer_gradients_episode = {}
+
         # Create new lists by copying existing data and appending new values
         new_training_steps = self.training_steps + [episode]
         new_total_losses = self.total_losses + [total_loss]
