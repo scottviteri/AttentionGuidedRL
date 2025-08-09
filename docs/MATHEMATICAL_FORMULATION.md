@@ -135,7 +135,9 @@ where \(v_{t,i}\) is the \(i\)-th token in the value sequence and \(v_{t,<i}\) r
 
 **Theorem 1 (Policy Gradient with θ-Dependent Rewards):** The system maximizes the following objective function:
 
-$$\mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \bar{R}(\tau) \right]$$
+$$
+\mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \bar{R}(\tau) \right]
+$$
 
 where:
 - $\bar{R}(\tau) = \frac{1}{T} \sum_{t=1}^T r_{\theta,t}$ is the **average reward over the entire trajectory**
@@ -143,18 +145,26 @@ where:
 
 **Detailed Gradient Derivation:** Since both the policy and rewards depend on \(\theta\), we apply the chain rule:
 
-$$\nabla_\theta \mathcal{J}(\theta) = \nabla_\theta \mathbb{E}_{\tau \sim \pi_\theta} \left[ \bar{R}(\tau) \right]$$
+$$
+\nabla_\theta \mathcal{J}(\theta) = \nabla_\theta \mathbb{E}_{\tau \sim \pi_\theta} \left[ \bar{R}(\tau) \right]
+$$
 
 **Step 1: Expand $\bar{R}(\tau)$**
-$$\mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \frac{1}{T} \sum_{t=1}^T r_{\theta,t} \right]$$
+$$
+\mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \frac{1}{T} \sum_{t=1}^T r_{\theta,t} \right]
+$$
 
 **Step 2: Apply chain rule for θ-dependent rewards and policy**
-$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \frac{1}{T} \sum_{t=1}^T \nabla_\theta r_{\theta,t} \right] + \mathbb{E}_{\tau \sim \pi_\theta} \left[ \nabla_\theta \log \pi_\theta(\tau) \cdot \bar{R}(\tau) \right]$$
+$$
+\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \frac{1}{T} \sum_{t=1}^T \nabla_\theta r_{\theta,t} \right] + \mathbb{E}_{\tau \sim \pi_\theta} \left[ \nabla_\theta \log \pi_\theta(\tau) \cdot \bar{R}(\tau) \right]
+$$
 
 **Step 3: Expand trajectory log-probability**
 Since $\nabla_\theta \log \pi_\theta(\tau) = \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t)$:
 
-$$\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \frac{1}{T} \sum_{t=1}^T \nabla_\theta r_{\theta,t} + \bar{R}(\tau) \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t) \right]$$
+$$
+\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \frac{1}{T} \sum_{t=1}^T \nabla_\theta r_{\theta,t} + \bar{R}(\tau) \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t) \right]
+$$
 
 **Key Insight:** This exact derivation shows that each action $a_t$ should be weighted by the **same trajectory average** $\bar{R}(\tau)$. This is much simpler than step-specific advantages and matches our implementation exactly!
 
