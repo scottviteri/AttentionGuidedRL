@@ -58,7 +58,7 @@ class TrainingConfig:
     subtract_base_model_logprobs: bool = False
     grpo_batching: bool = True  # GRPO-style batching
     gae_lambda: float = 0.95
-    kl_penalty_coefficient: float = 0.1
+    kl_penalty_coefficient: float = 0.0
     use_ppo: bool = False
     ppo_clip_epsilon: float = 0.2
     

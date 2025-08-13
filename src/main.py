@@ -17,16 +17,15 @@ from tqdm import tqdm
 from datetime import datetime
 from typing import List, Any, Iterator, Dict, Tuple, Optional
 import sys
-import time # Import time for overall timing
+import time 
 
-# Import configuration management - clean pattern!
 from src.config import CONFIG, TrainingConfig, create_training_config_from_args, log_training_config, training_config_to_dict
 from src.model import setup_model_and_tokenizer, save_checkpoint, load_checkpoint, create_model_copy, get_checkpoint_path, update_model_ema
 from src.data import KVPair, QKVSelection
 from src.embeddings import register_embedding_hook, compute_similarity, sample_key_value, extract_embeddings, get_attention_params
 from src.training import (
     RawTrajectory,
-    Trajectory,  # for type hints
+    Trajectory,  
     compute_trajectory_rewards,
     update_reward_stats,
     compute_advantages,
@@ -42,15 +41,13 @@ from src.metrics import (
     compute_similarity_score_stats,
 )
 
-# Simple policy gradient training using LoRA adapters
-
 import wandb
 
 
 def policy_gradient_train_step(
     trajectory: Trajectory,
     adapter_model: torch.nn.Module,
-    ref_model: torch.nn.Module,  # Kept for compatibility but not used
+    ref_model: torch.nn.Module,  
     optimizer: torch.optim.Optimizer,
     reward_stats: Dict[str, float],
     verbose: bool = False,
@@ -65,7 +62,7 @@ def policy_gradient_train_step(
     Args:
         trajectory: The trajectory to train on
         adapter_model: The language model with LoRA adapter (trainable)
-        ref_model: Kept for compatibility (not used in chain rule approach)
+        ref_model: Kept for logging purposes
         optimizer: The optimizer
         reward_stats: Reward statistics (for logging only with GRPO)
         verbose: Flag to enable verbose logging
@@ -878,6 +875,7 @@ def main():
         weight_changes = []  # Track weight changes over time
         policy_gradients = []  # Track policy gradients (before negation) for conceptual clarity
         kl_from_ref = []  # Track KL divergence from reference model (for diagnostics only)
+
         
         for episode in progress_bar:
             if args.verbose:
@@ -979,8 +977,7 @@ def main():
                 total_returns_std_val = policy_term_variance_val = reward_term_variance_val = 0.0
                 reward_gradient_norm_val = policy_reward_ratio_val = 0.0
             
-            # Track clipping ratio
-            clipping_ratios.append(avg_clipping_ratio)
+            # Note: clipping ratio not used in chain rule training (always 1.0)
             
             # Simple weight change tracking (gradient norm as proxy)
             weight_change = 0.0  # Simplified for policy gradient
@@ -1213,7 +1210,7 @@ def main():
                 reward_variance=reward_var,
                 gradient_magnitude=gradient_magnitude,
                 step_log_probs_episode=step_log_probs_episode,
-                clipping_ratio=avg_clipping_ratio,
+                clipping_ratio=1.0,  # Chain rule training doesn't use clipping
                 batch_selection_entropy=selection_entropy,
                 kl_from_ref_value=kl_from_ref_value,
                 kl_keys_from_ref_value=kl_keys_from_ref_value,
@@ -1346,8 +1343,8 @@ def plot_metrics(log_dir, policy_gradients_data=None):
         logging.warning(f"No plot data found at {latest_pickle}")
         return
     
-    # Get the absolute path to generate_plots.py
-    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Get the absolute path to generate_plots.py (now in src directory)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     generate_plots_script = os.path.join(script_dir, "generate_plots.py")
     
     if not os.path.exists(generate_plots_script):

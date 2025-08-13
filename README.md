@@ -151,7 +151,7 @@ The system uses LoRA (Low-Rank Adaptation) for efficient training:
 Comprehensive plotting and analysis tools:
 ```bash
 # Generate plots from saved training data
-python scripts/generate_plots.py logs/*/plots/plot_data.pkl
+python src/generate_plots.py logs/*/plots/plot_data.pkl
 
 # Generate text analysis for LLM consumption
 python scripts/generate_text_analysis.py logs/*/plots/plot_data.pkl
@@ -192,7 +192,7 @@ Training automatically generates comprehensive visualizations:
 
 ```bash
 # Generate plots from saved training data
-python scripts/generate_plots.py logs/*/plots/plot_data.pkl
+python src/generate_plots.py logs/*/plots/plot_data.pkl
 
 # Generate text analysis for LLM consumption  
 python scripts/generate_text_analysis.py logs/*/plots/plot_data.pkl
