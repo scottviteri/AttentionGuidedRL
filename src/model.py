@@ -221,9 +221,8 @@ def setup_model_and_tokenizer():
     # Load the base model
     base_model = load_base_model()
     
-    # Apply LoRA adapter
-    adapter_model = apply_lora_adapter(base_model)
-    
+    # Apply LoRA adapter to a deepcopy of the base model
+    adapter_model = apply_lora_adapter(copy.deepcopy(base_model))
     # Load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(CONFIG.tokenizer_name)
     tokenizer.pad_token = tokenizer.eos_token

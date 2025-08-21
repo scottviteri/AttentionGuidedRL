@@ -36,7 +36,7 @@
 This document provides a mathematical formulation of the Attention-Guided Reinforcement Learning system, where a language model (Llama-3.2-3B or GPT-2) learns to autonomously sequence its own training data. The key innovation is a \textbf{chain rule policy gradient} approach that combines:
 
 \begin{enumerate}
-    \item \textbf{Direct reward optimization}: $\nabla_\theta r_t$ - optimizing the reward function itself
+    \item \textbf{Direct reward optimization}: $\nabla_\theta r_\theta^t$ - optimizing the reward function itself
     \item \textbf{Trajectory-average policy gradients}: $\bar{R}(\tau) \nabla_\theta \log \pi_\theta(a_t | s_t)$ - uniform credit assignment
 \end{enumerate}
 
@@ -140,7 +140,7 @@ This preserves the probability distribution property: $\sum_{k \in \mathcal{K}_t
 \begin{definition}[Step Reward]
 The reward at step $t$ is the per-token average log probability:
 \begin{align}
-r_t = \frac{1}{|v_t|} \sum_{i=1}^{|v_t|} \log p_\theta\big(v_{t,i} \mid c_t, k_t, v_{t,<i}\big)
+r_\theta^t = \frac{1}{|v_t|} \sum_{i=1}^{|v_t|} \log p_\theta\big(v_{t,i} \mid c_t, k_t, v_{t,<i}\big)
 \end{align}
 where:
 \begin{itemize}
@@ -158,7 +158,7 @@ where:
 \end{itemize}
 
 \begin{align}
-r_t = \frac{1}{|v_t|} \sum_{i=1}^{|v_t|} \Big( \log p_\theta(v_{t,i} \mid \cdot) - \log p_{\text{ref}}(v_{t,i} \mid \cdot) \Big)
+r_\theta^t = \frac{1}{|v_t|} \sum_{i=1}^{|v_t|} \Big( \log p_\theta(v_{t,i} \mid \cdot) - \log p_{\text{ref}}(v_{t,i} \mid \cdot) \Big)
 \end{align}
 
 
@@ -171,16 +171,16 @@ The system maximizes:
 \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \bar{R}(\tau) \right]
 \end{align}
 
-where $\bar{R}(\tau) = \frac{1}{T} \sum_{t=1}^T r_t$ is the trajectory average reward.
+where $\bar{R}(\tau) = \frac{1}{T} \sum_{t=1}^T r_\theta^t$ is the trajectory average reward.
 
 \textbf{Chain Rule Gradient Derivation:} Since both policy and rewards depend on $\theta$, the gradient is:
 \begin{align}
-\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \frac{1}{T} \sum_{t=1}^T \nabla_\theta r_t + \bar{R}(\tau) \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t) \right]
+\nabla_\theta \mathcal{J}(\theta) = \mathbb{E}_{\tau \sim \pi_\theta} \left[ \frac{1}{T} \sum_{t=1}^T \nabla_\theta r_\theta^t + \bar{R}(\tau) \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t) \right]
 \end{align}
 
 This gives two terms:
 \begin{enumerate}
-    \item \textbf{Reward gradient term}: $\frac{1}{T} \sum_{t=1}^T \nabla_\theta r_t$ - direct optimization of reward function
+    \item \textbf{Reward gradient term}: $\frac{1}{T} \sum_{t=1}^T \nabla_\theta r_\theta^t$ - direct optimization of reward function
     \item \textbf{Policy gradient term}: $\bar{R}(\tau) \sum_{t=1}^T \nabla_\theta \log \pi_\theta(a_t | s_t)$ - trajectory-average weighted policy gradient
 \end{enumerate}
 
@@ -192,13 +192,13 @@ Each action receives uniform credit: the trajectory average reward $\bar{R}(\tau
 \textbf{Loss Function:} The training implements the full chain rule gradient:
 
 \begin{align}
-\mathcal{L}(\theta) = \mathbb{E}_{\text{batch}} \left[ -\frac{1}{T} \sum_{t=1}^T r_t - \bar{R}(\tau) \sum_{t=1}^T \log \pi_\theta(a_t | s_t) \right]
+\mathcal{L}(\theta) = \mathbb{E}_{\text{batch}} \left[ -\frac{1}{T} \sum_{t=1}^T r_\theta^t - \operatorname{sg}\!\left[\bar{R}(\tau)\right] \sum_{t=1}^T \log \pi_\theta(a_t | s_t) \right]
 \end{align}
 
 where:
 \begin{itemize}
-    \item $\bar{R}(\tau) = \frac{1}{T} \sum_{t=1}^T r_t$ is the trajectory average reward
-    \item The first term optimizes rewards directly via $\nabla_\theta r_t$
+    \item $\bar{R}(\tau) = \frac{1}{T} \sum_{t=1}^T r_\theta^t$ is the trajectory average reward
+    \item The first term optimizes rewards directly via $\nabla_\theta r_\theta^t$
     \item The second term is the trajectory-average weighted policy gradient
 \end{itemize}
 
@@ -266,7 +266,7 @@ This mathematical formulation describes a reinforcement learning system where a 
     \item \textbf{Differentiable reward computation}: Enabling direct reward optimization
 \end{enumerate}
 
-The key innovation is the \textbf{chain rule approach} that goes beyond standard REINFORCE \cite{williams1992simple} by optimizing the reward function directly ($\nabla_\theta r_t$) while using trajectory-average rewards for policy gradients ($\bar{R}(\tau) \nabla_\theta \log \pi_\theta$). This creates a sophisticated learning dynamic where the model simultaneously improves its policy and the rewards it receives.
+The key innovation is the \textbf{chain rule approach} that goes beyond standard REINFORCE \cite{williams1992simple} by optimizing the reward function directly ($\nabla_\theta r_\theta^t$) while using trajectory-average rewards for policy gradients ($\operatorname{sg}[\bar{R}(\tau)] \nabla_\theta \log \pi_\theta$). This creates a sophisticated learning dynamic where the model simultaneously improves its policy and the rewards it receives.
 
 \bibliographystyle{plain}
 \begin{thebibliography}{9}
