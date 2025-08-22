@@ -227,17 +227,15 @@ def compute_trajectory_rewards(
         # Update context for next iteration
         # Append query, key and value tokens to context, all on the same device
         if tokenizer:
-            # Add prefixes if tokenizer is available
+            # Add separators between key and value (no textual prefixes)
             batch_size = current_context.shape[0]
-            key_prefix_tokens = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-            value_prefix_tokens = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+            kv_sep_tokens = tokenizer([CONFIG.kv_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
             
-            # Vector queries - no query tokens to add to context
+            # Vector queries - no query tokens; use separators
             current_context = torch.cat([
                 current_context,
-                key_prefix_tokens,
-                key_tokens, 
-                value_prefix_tokens,
+                key_tokens,
+                kv_sep_tokens,
                 value_tokens
             ], dim=1)
             

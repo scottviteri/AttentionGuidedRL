@@ -62,11 +62,16 @@ class TrainingConfig:
     use_ppo: bool = False
     ppo_clip_epsilon: float = 0.2
     
+    # Ablations / deterministic baselines
+    force_linear_action_order: bool = False  # If True, pick keys in linear order instead of sampling
+    freeze_policy: bool = False              # If True, do not train the policy (skip backward/step)
+    
     # Training infrastructure
     checkpoint_interval: int = 100
     checkpoint_dir: str = "checkpoints"
     log_interval: int = 10
     enable_wandb: bool = False
+    debug_print_context: bool = False
     
     # Token configuration (computed - will be filled by create_training_config_from_args)
     prefix_tokens_per_key: int = 0
@@ -86,7 +91,9 @@ class TrainingConfig:
     initial_prompt: str = "Search for relevant information using learned vector queries."
     key_prefix: str = "Key: "
     value_prefix: str = "Value: "
-    query_vec_token: str = 'Query'  # Hardcoded to 'Query'
+    # Always use separators for both query triggering and KV boundaries
+    chunk_separator: str = '<SEP>'   # Between KV pairs and as query trigger
+    kv_separator: str = '<KV>'       # Between key and value within a pair
     dtype: str = "bfloat16"  # Will be converted to torch.dtype
     gradient_clip_norm: float = 1.0
 
@@ -172,12 +179,15 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
         kl_penalty_coefficient=getattr(args, 'kl_penalty_coefficient', None) or base_config.kl_penalty_coefficient,
         use_ppo=getattr(args, 'use_ppo', False) or base_config.use_ppo,
         ppo_clip_epsilon=getattr(args, 'ppo_clip_epsilon', 0.2) or base_config.ppo_clip_epsilon,
+        force_linear_action_order=getattr(args, 'force_linear_order', False) or base_config.force_linear_action_order,
+        freeze_policy=getattr(args, 'freeze_policy', False) or base_config.freeze_policy,
         
         # Infrastructure
         checkpoint_interval=base_config.checkpoint_interval,
         checkpoint_dir=base_config.checkpoint_dir,
         log_interval=getattr(args, 'log_interval', None) or base_config.log_interval,
         enable_wandb=getattr(args, 'enable_wandb', False) or base_config.enable_wandb,
+        debug_print_context=getattr(args, 'debug_print_context', False) or base_config.debug_print_context,
         
         # Computed token configuration
         prefix_tokens_per_key=prefix_tokens_per_key,

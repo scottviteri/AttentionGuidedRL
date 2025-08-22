@@ -144,15 +144,15 @@ def policy_gradient_train_step(
         
         # === REWARD GRADIENT TERM: ∇_θ r_{θ,t} ===
         # Prepare context for reward computation
-        key_prefix_tokens = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-        value_prefix_tokens = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        sep_tokens = tokenizer([CONFIG.chunk_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        kv_sep_tokens = tokenizer([CONFIG.kv_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
         
         # Context for reward: includes key prefix + selected key + value prefix
         reward_context = torch.cat([
             current_context,
-            key_prefix_tokens,
+            sep_tokens,
             qkv_step.key_tokens.to(device),
-            value_prefix_tokens
+            kv_sep_tokens
         ], dim=1)
         
         # Recompute reward differentiably if enabled; otherwise fall back to cached rewards
@@ -173,9 +173,8 @@ def policy_gradient_train_step(
         # Update context for next iteration
         current_context = torch.cat([
             current_context,
-            key_prefix_tokens,
             qkv_step.key_tokens.to(device),
-            value_prefix_tokens,
+            kv_sep_tokens,
             qkv_step.value_tokens.to(device)
         ], dim=1)
         
@@ -194,7 +193,11 @@ def policy_gradient_train_step(
         print(f"Reward term: {reward_term.item():.4f}")
         print(f"Total loss (negated): {total_loss.item():.4f}")
     
-    # Backpropagate
+    # Backpropagate; optionally drop policy term but still update reward model
+    if CONFIG.freeze_policy:
+        # Only train reward model: drop policy gradient contribution
+        total_loss = -(reward_term)
+    # else keep existing total_loss as -(policy_term + reward_term)
     total_loss.backward()
     
     # Clip gradients
@@ -203,7 +206,7 @@ def policy_gradient_train_step(
     if verbose:
         print(f"Gradient norm: {grad_norm:.4f}")
     
-    # Update parameters
+    # Update parameters (always step so reward model can train even if policy is frozen)
     optimizer.step()
     
     if verbose:
@@ -282,13 +285,11 @@ def _append_step(raw_traj: RawTrajectory, step: QKVSelection) -> RawTrajectory:
 
 def _update_context(context: torch.Tensor, step: QKVSelection, tokenizer, batch_size: int, device: torch.device) -> torch.Tensor:
     """Grow the autoregressive context by concatenating key/value tokens (no query tokens in vector mode)."""
-    key_prefix_tokens = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-    value_prefix_tokens = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+    kv_sep_tokens = tokenizer([CONFIG.kv_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
     return torch.cat([
         context,
-        key_prefix_tokens,
         step.key_tokens.to(device),
-        value_prefix_tokens,
+        kv_sep_tokens,
         step.value_tokens.to(device),
     ], dim=1)
 # === End helpers ===
@@ -335,8 +336,10 @@ def generate_trajectory(
 
     # === Autoregressive selection loop =======================================
     for _ in range(config.num_kv_pairs):
-        # 1) Build query embedding
-        query_emb = generate_query_vector(adapter_model, tokenizer, current_context)
+        # 1) Build query embedding using separator as the trigger
+        sep_tokens = tokenizer([CONFIG.chunk_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        query_context = torch.cat([current_context, sep_tokens], dim=1)
+        query_emb = generate_query_vector(adapter_model, tokenizer, query_context)
 
         # 2) Compute similarities
         # Get attention parameters from the adapter model
@@ -346,8 +349,13 @@ def generate_trajectory(
         similarity_scores = compute_similarity(query_emb, traj.all_key_embeddings, num_heads, num_groups, head_dim, 
                                              availability_mask=available_mask)
 
-        # 4) Sample an index per batch item, respecting already-used keys
-        selected_indices, _ = sample_key_value(similarity_scores, available_indices_per_batch, batch_size, rng=rng)
+        # 4) Select an index per batch item
+        if CONFIG.force_linear_action_order:
+            # Deterministic: pick the smallest available index for each batch (linear order)
+            selected_indices = [avail[0] for avail in available_indices_per_batch]
+        else:
+            # Stochastic: sample from policy distribution over available keys
+            selected_indices, _ = sample_key_value(similarity_scores, available_indices_per_batch, batch_size, rng=rng)
 
         # 5) Assemble tensors for the chosen KV pair
         selected_key_tokens = []
@@ -402,7 +410,15 @@ def generate_trajectory(
             if idx in available_indices_per_batch[b]:
                 available_indices_per_batch[b].remove(idx)
 
-        current_context = _update_context(current_context, qkv_step, tokenizer, batch_size, device)
+        # Insert a separator before appending the next KV chunk to context
+        sep_tokens = tokenizer([CONFIG.chunk_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        current_context = torch.cat([_update_context(current_context, qkv_step, tokenizer, batch_size, device), sep_tokens], dim=1)
+
+        # Optional debug: print the full context verbatim
+        if CONFIG.debug_print_context and (verbose or True):
+            decoded_ctx = tokenizer.batch_decode(current_context, skip_special_tokens=False)
+            print("\n[DEBUG] Full context after step:")
+            print(decoded_ctx[0])
 
     if verbose:
         full_ctx = tokenizer.batch_decode(current_context, skip_special_tokens=True)[0]
@@ -429,6 +445,9 @@ def parse_args():
     
     # Configuration parameters
     parser.add_argument('--enable-wandb', action='store_true', help='Enable Weights & Biases logging')
+    parser.add_argument('--force-linear-order', action='store_true', help='Always pick keys in linear order (disable sampling)')
+    parser.add_argument('--freeze-policy', action='store_true', help='Do not update policy parameters (freeze policy gradient)')
+    parser.add_argument('--debug-print-context', action='store_true', help='Print full context verbatim during trajectory and reward computation')
     parser.add_argument('--subtract-base-logprobs', action='store_true', help='Subtract base model logprobs in reward computation')
     parser.add_argument('--debug-generators', action='store_true', help='Enable detailed debugging of generator pipelines')
     
@@ -640,9 +659,10 @@ def compute_value_kl_from_reference(
     for step in trajectory.qkv_steps:
         key_tokens = step.key_tokens.to(device)
         value_tokens = step.value_tokens.to(device)
+        sep = tokenizer([CONFIG.chunk_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
         kp = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
         vp = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-        reward_context = torch.cat([context_tokens, kp, key_tokens, vp], dim=1)
+        reward_context = torch.cat([context_tokens, sep, kp, key_tokens, vp], dim=1)
         
         # Adapter logits (no grad for diagnostic)
         with torch.no_grad():
@@ -663,7 +683,7 @@ def compute_value_kl_from_reference(
             kl_vals.append(kl_step.item())
         
         # Advance context by appending key/value
-        context_tokens = torch.cat([reward_context, value_tokens], dim=1)
+        context_tokens = torch.cat([reward_context, value_tokens, sep], dim=1)
     
     if not kl_vals:
         return 0.0
@@ -1172,6 +1192,7 @@ def main():
             # Track log probabilities by step index (for the new plot)
             # Compute log probabilities of selected actions at each step
             step_log_probs_episode = []
+            step_selected_indices_episode = []
             for step in trajectory.qkv_steps:
                 if hasattr(step, 'similarity_scores') and step.similarity_scores is not None:
                     # TEMPERATURE and F are already in global scope
@@ -1191,6 +1212,8 @@ def main():
                     selected_idx = step.selected_idx
                     selected_log_prob = log_probs[torch.arange(log_probs.shape[0]), selected_idx].mean().item()
                     step_log_probs_episode.append(selected_log_prob)
+                    # Average selected key index across batch for this step
+                    step_selected_indices_episode.append(selected_idx.float().mean().item())
             # Add episode data to plot_data using the clean functional approach
             trajectory_sample = trajectory_info if (episode % 50 == 0 or episode < 5) and 'trajectory_info' in locals() else None
             plot_data = plot_data.add_episode_data(
@@ -1210,6 +1233,7 @@ def main():
                 reward_variance=reward_var,
                 gradient_magnitude=gradient_magnitude,
                 step_log_probs_episode=step_log_probs_episode,
+                step_selected_indices_episode=step_selected_indices_episode,
                 clipping_ratio=1.0,  # Chain rule training doesn't use clipping
                 batch_selection_entropy=selection_entropy,
                 kl_from_ref_value=kl_from_ref_value,

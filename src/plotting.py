@@ -41,6 +41,8 @@ class PlotData:
     reward_variance: List[float] = field(default_factory=list)
     gradient_magnitudes: List[float] = field(default_factory=list)
     step_log_probs: List[List[float]] = field(default_factory=list)  # List of lists
+    # New: average selected key indices per step per episode (list of lists)
+    step_selected_indices: List[List[float]] = field(default_factory=list)
     clipping_ratios: List[float] = field(default_factory=list)
     batch_selection_entropy: List[float] = field(default_factory=list)
     trajectory_samples: List[Dict[str, Any]] = field(default_factory=list)
@@ -85,6 +87,7 @@ class PlotData:
         reward_variance: float,
         gradient_magnitude: float,
         step_log_probs_episode: List[float],
+        step_selected_indices_episode: List[float],
         clipping_ratio: float,
         batch_selection_entropy: float,
         kl_from_ref_value: float,
@@ -142,6 +145,7 @@ class PlotData:
         new_reward_variance = self.reward_variance + [reward_variance]
         new_gradient_magnitudes = self.gradient_magnitudes + [gradient_magnitude]
         new_step_log_probs = self.step_log_probs + [step_log_probs_episode]
+        new_step_selected_indices = self.step_selected_indices + [step_selected_indices_episode]
         new_clipping_ratios = self.clipping_ratios + [clipping_ratio]
         new_batch_selection_entropy = self.batch_selection_entropy + [batch_selection_entropy]
         new_kl_from_ref = self.kl_from_ref + [kl_from_ref_value]
@@ -194,6 +198,7 @@ class PlotData:
             reward_variance=new_reward_variance,
             gradient_magnitudes=new_gradient_magnitudes,
             step_log_probs=new_step_log_probs,
+            step_selected_indices=new_step_selected_indices,
             clipping_ratios=new_clipping_ratios,
             batch_selection_entropy=new_batch_selection_entropy,
             trajectory_samples=new_trajectory_samples,
@@ -271,6 +276,7 @@ class PlotData:
             'reward_variance': self.reward_variance,
             'gradient_magnitudes': self.gradient_magnitudes,
             'step_log_probs': self.step_log_probs,
+            'step_selected_indices': self.step_selected_indices,
             'clipping_ratios': self.clipping_ratios,
             'batch_selection_entropy': self.batch_selection_entropy,
             'trajectory_samples': self.trajectory_samples,
@@ -306,6 +312,7 @@ class PlotData:
             reward_variance=data.get('reward_variance', []),
             gradient_magnitudes=data.get('gradient_magnitudes', []),
             step_log_probs=data.get('step_log_probs', []),
+            step_selected_indices=data.get('step_selected_indices', []),
             clipping_ratios=data.get('clipping_ratios', []),
             batch_selection_entropy=data.get('batch_selection_entropy', []),
             trajectory_samples=data.get('trajectory_samples', []),

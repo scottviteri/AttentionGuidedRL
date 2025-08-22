@@ -27,6 +27,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend (same as main training)
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
 from typing import Dict, List, Any, Optional
 import glob
 from datetime import datetime
@@ -212,7 +213,8 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     kl_penalty_terms = smooth_data(data['kl_penalty_terms'][:min_length], smooth_window)
     reward_variance = smooth_data(data['reward_variance'][:min_length], smooth_window)
     gradient_magnitudes = smooth_data(data['gradient_magnitudes'][:min_length], smooth_window)
-    step_log_probs = data['step_log_probs']
+    step_log_probs = data.get('step_log_probs', [])
+    step_selected_indices = data.get('step_selected_indices', [])
     policy_gradients = smooth_data(data['policy_gradients'][:min_length], smooth_window)
     clipping_ratios = smooth_data(data['clipping_ratios'][:min_length], smooth_window)
     kl_from_ref = smooth_data(data['kl_from_ref'][:min_length], smooth_window)
@@ -296,6 +298,11 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[4].set_title(f'Gradient Norm Over Time{title_suffix}')
     axes[4].grid(True, alpha=0.3)
     axes[4].set_yscale('log')
+    # Format log ticks to avoid confusing offset text like "10×10^{-1}"
+    axes[4].yaxis.set_major_locator(mtick.LogLocator(base=10.0, numticks=10))
+    axes[4].yaxis.set_major_formatter(mtick.LogFormatterSciNotation(base=10.0))
+    axes[4].yaxis.set_minor_locator(mtick.LogLocator(base=10.0, subs=(0.2, 0.4, 0.6, 0.8), numticks=10))
+    axes[4].yaxis.set_minor_formatter(mtick.NullFormatter())
     
     # Plot 6: Wikipedia Order Consistency
     axes[5].plot(training_steps, wikipedia_order_consistency, 'teal', linewidth=2)
@@ -386,11 +393,45 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
                      ha='center', va='center', transform=axes[8].transAxes, fontsize=10)
         axes[8].set_title('Log Prob by Step Index')
     
-    # Plot 10: (unused placeholder in chain-rule setup)
-    axes[9].plot(training_steps, [0.0]*len(training_steps), label='N/A', color='gray', linestyle='--')
-    axes[9].set_ylabel('N/A')
-    axes[9].set_title('Unused (Chain-rule setup)')
-    axes[9].legend()
+    # Plot 10: Average selected key index by step (early/mid/late)
+    if step_selected_indices and len(step_selected_indices) > 0:
+        max_steps_sel = max(len(episode_steps) for episode_steps in step_selected_indices if episode_steps)
+        if max_steps_sel > 0:
+            step_indices = list(range(max_steps_sel))
+            def avg_selected_index_for_period(start_ep, end_ep):
+                relevant = step_selected_indices[start_ep:end_ep]
+                avgs = []
+                for s in range(max_steps_sel):
+                    vals = [episode[s] for episode in relevant if s < len(episode)]
+                    avgs.append(float(np.mean(vals)) if vals else 0.0)
+                return avgs
+            total_eps = len(step_selected_indices)
+            first_end = total_eps // 3
+            second_end = 2 * total_eps // 3
+            if total_eps >= 9:
+                early = avg_selected_index_for_period(0, first_end)
+                mid = avg_selected_index_for_period(first_end, second_end)
+                late = avg_selected_index_for_period(second_end, total_eps)
+                axes[9].plot(step_indices, early, 'lightcoral', linewidth=2, marker='o', markersize=3, label=f'Early (eps 0-{first_end})', alpha=0.8)
+                axes[9].plot(step_indices, mid, 'gold', linewidth=2, marker='s', markersize=3, label=f'Mid (eps {first_end}-{second_end})', alpha=0.8)
+                axes[9].plot(step_indices, late, 'mediumseagreen', linewidth=2, marker='^', markersize=3, label=f'Late (eps {second_end}+)', alpha=0.8)
+            else:
+                overall = avg_selected_index_for_period(0, total_eps)
+                axes[9].plot(step_indices, overall, 'darkviolet', linewidth=2, marker='o', markersize=4, label='Overall Average')
+            axes[9].set_xlabel('Step Index')
+            axes[9].set_ylabel('Avg Selected Key Index')
+            axes[9].set_title(f'Avg Selected Key Index by Step{title_suffix}')
+            axes[9].grid(True, alpha=0.3)
+            axes[9].set_xticks(step_indices)
+            axes[9].legend(fontsize=8)
+        else:
+            axes[9].text(0.5, 0.5, 'No selected index data\navailable yet', 
+                         ha='center', va='center', transform=axes[9].transAxes, fontsize=10)
+            axes[9].set_title('Avg Selected Key Index by Step')
+    else:
+        axes[9].text(0.5, 0.5, 'No selected index data\navailable yet', 
+                     ha='center', va='center', transform=axes[9].transAxes, fontsize=10)
+        axes[9].set_title('Avg Selected Key Index by Step')
     
     # Plot 11: LoRA Layer Gradient Flow
     if lora_layer_gradients:
@@ -667,8 +708,8 @@ def main():
                        help='Directory to save plots (default: same directory as input file)')
     parser.add_argument('--kl-coef', type=float, default=None,
                        help='(Deprecated) Override KL penalty coefficient for labels')
-    parser.add_argument('--smooth-window', '-s', type=int, default=1,
-                       help='Smoothing window size (default: 1, no smoothing)')
+    parser.add_argument('--smooth-window', '-s', type=int, default=None,
+                       help='Smoothing window size (default: floor(current_training_step/50))')
     parser.add_argument('--recent', type=int, metavar='N',
                        help='Select the nth most recent log folder (0=most recent, 1=second most recent, etc.)')
     parser.add_argument('--logs-dir', default='logs',
@@ -676,8 +717,8 @@ def main():
     
     args = parser.parse_args()
     
-    # Validate smoothing window
-    if args.smooth_window < 1:
+    # Validate smoothing window only if explicitly provided
+    if args.smooth_window is not None and args.smooth_window < 1:
         print("Error: Smoothing window size must be at least 1")
         return
     
@@ -719,8 +760,16 @@ def main():
     if args.kl_coef is not None:
         custom_config['KL_PENALTY_COEFFICIENT'] = args.kl_coef
     
+    # Determine effective smoothing window (dynamic default)
+    if args.smooth_window is None:
+        training_steps = data.get('training_steps', [])
+        current_step = training_steps[-1] if training_steps else 0
+        effective_window = max(1, int(current_step // 50))
+    else:
+        effective_window = args.smooth_window
+
     # Generate plots
-    generate_plots(data, args.output_dir, custom_config, args.smooth_window)
+    generate_plots(data, args.output_dir, custom_config, effective_window)
 
 
 if __name__ == "__main__":
