@@ -105,11 +105,13 @@ def policy_gradient_train_step(
     
     # Compute average reward over entire trajectory: R̄ = (1/T) * Σ_{s=1}^T r_s
     avg_trajectory_reward = trajectory.rewards.mean(dim=1, keepdim=True)  # [batch_size, 1]
-    
-    # Use the same average reward for all time steps (no baseline subtraction)
-    advantages = avg_trajectory_reward.expand(-1, T)  # [batch_size, T]
-    
-    # No normalization needed since we're using raw average rewards
+    if CONFIG.use_grpo:
+        # Center with batch mean baseline (stop-grad in policy term)
+        batch_mean = avg_trajectory_reward.mean().detach()
+        advantages = (avg_trajectory_reward - batch_mean).detach().expand(-1, T)  # [batch_size, T]
+    else:
+        # Uncentered uniform credit assignment
+        advantages = avg_trajectory_reward.detach().expand(-1, T)
     
     for t, qkv_step in enumerate(trajectory.qkv_steps):
         # === POLICY GRADIENT TERM: A_t * ∇log π_θ(a_t|s_t) ===
@@ -445,6 +447,7 @@ def parse_args():
     
     # Configuration parameters
     parser.add_argument('--enable-wandb', action='store_true', help='Enable Weights & Biases logging')
+    parser.add_argument('--disable-grpo', action='store_true', help='Disable GRPO-style centered baseline (use uncentered rewards)')
     parser.add_argument('--force-linear-order', action='store_true', help='Always pick keys in linear order (disable sampling)')
     parser.add_argument('--freeze-policy', action='store_true', help='Do not update policy parameters (freeze policy gradient)')
     parser.add_argument('--debug-print-context', action='store_true', help='Print full context verbatim during trajectory and reward computation')
@@ -920,6 +923,13 @@ def main():
                 padding=True,
                 add_special_tokens=False
             ).input_ids.to(device)
+            # Assert same prompt across batch
+            try:
+                first_row = initial_tokens[0].unsqueeze(0).expand_as(initial_tokens)
+                if not torch.equal(first_row, initial_tokens):
+                    raise AssertionError("Initial prompt tokens differ across batch elements")
+            except Exception as e:
+                raise
             
             # Policy gradient: always sample with current model
             if args.verbose:

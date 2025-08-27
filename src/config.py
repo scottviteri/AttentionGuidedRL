@@ -46,7 +46,7 @@ class TrainingConfig:
     # Training hyperparameters
     learning_rate: float = 5e-4
     num_episodes: int = 10000
-    batch_size: int = 4
+    batch_size: int = 64
     
     # RL-specific parameters
     gamma: float = 0.99
@@ -55,7 +55,8 @@ class TrainingConfig:
     differentiable_rewards: bool = True   # Enable chain-rule reward gradients
     
     # Training behavior
-    subtract_base_model_logprobs: bool = False
+    subtract_base_model_logprobs: bool = True
+    use_grpo: bool = True  # Enable GRPO-style centered baseline by default
     grpo_batching: bool = True  # GRPO-style batching
     gae_lambda: float = 0.95
     kl_penalty_coefficient: float = 0.0
@@ -155,6 +156,9 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
     num_kv_pairs = min(num_kv_pairs, 10)  # Cap for reasonable trajectory length
     
     # Apply CLI overrides with fallback to defaults
+    # Resolve GRPO usage from CLI (default: True; disable with --disable-grpo)
+    use_grpo = False if getattr(args, 'disable_grpo', False) else True
+
     return TrainingConfig(
         # Model configuration
         model_name=model_name,
@@ -176,6 +180,7 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
         # Training behavior (CLI overrides or defaults)
         subtract_base_model_logprobs=getattr(args, 'subtract_base_logprobs', False) or base_config.subtract_base_model_logprobs,
         grpo_batching=getattr(args, 'grpo_batching', False) or base_config.grpo_batching,
+        use_grpo=use_grpo,
         gae_lambda=getattr(args, 'gae_lambda', None) or base_config.gae_lambda,
         kl_penalty_coefficient=getattr(args, 'kl_penalty_coefficient', None) or base_config.kl_penalty_coefficient,
         use_ppo=getattr(args, 'use_ppo', False) or base_config.use_ppo,
@@ -223,6 +228,7 @@ def training_config_to_dict(config: TrainingConfig) -> Dict[str, Any]:
         'gamma': config.gamma,
         'temperature': config.temperature,
         'subtract_base_model_logprobs': config.subtract_base_model_logprobs,
+        'use_grpo': config.use_grpo,
         'enable_wandb': config.enable_wandb,
         'num_kv_pairs': config.num_kv_pairs,
         'max_context_length': config.max_context_length,
@@ -240,7 +246,10 @@ def log_training_config(config: TrainingConfig, logger) -> None:
     
     logger.info(f"RL: gamma={config.gamma}, temperature={config.temperature}")
     
-    logger.info("Baseline: None (trajectory average rewards)")
+    if getattr(config, 'use_grpo', False):
+        logger.info("Baseline: GRPO batch-mean baseline (centered, stop-grad)")
+    else:
+        logger.info("Baseline: None (uncentered trajectory-average rewards)")
         
     logger.info(f"Context: {config.num_kv_pairs} KV pairs, {config.tokens_per_round} tokens/round")
     logger.info(f"         {config.max_context_length} max context, {config.initial_prompt_tokens} prompt tokens")

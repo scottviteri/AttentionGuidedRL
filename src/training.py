@@ -342,12 +342,15 @@ def compute_advantages(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: (advantages, returns)
     """
-    # Simple trajectory average approach - each action gets same credit
+    # Compute per-trajectory average reward
     trajectory_avg = rewards.mean(dim=1, keepdim=True)  # [batch_size, 1]
-    advantages = trajectory_avg.expand_as(rewards)  # [batch_size, num_steps]
+    # Broadcast to all steps
+    avg_expanded = trajectory_avg.expand_as(rewards)  # [batch_size, num_steps]
     
-    # For compatibility, also return the trajectory averages as "returns"
-    returns = advantages.clone()
+    # Centering decision deferred to training loop via CONFIG.use_grpo
+    # Here we return uncentered returns and uncentered "advantages" by default
+    advantages = avg_expanded
+    returns = avg_expanded.clone()
 
     return advantages, returns
 
@@ -429,6 +432,10 @@ def compute_policy_loss(
         padding=True,
         add_special_tokens=False
     ).input_ids.to(device)
+    # Assert same prompt across batch
+    first_row = context_tokens[0].unsqueeze(0).expand_as(context_tokens)
+    if not torch.equal(first_row, context_tokens):
+        raise AssertionError("Initial prompt tokens differ across batch elements")
     
     # Reconstruct context and generate old model means for each step
     for t, qkv_step in enumerate(trajectory.qkv_steps):
@@ -470,6 +477,10 @@ def compute_policy_loss(
             padding=True,
             add_special_tokens=False
         ).input_ids.to(device)
+        # Assert same prompt across batch
+        first_row = context_tokens[0].unsqueeze(0).expand_as(context_tokens)
+        if not torch.equal(first_row, context_tokens):
+            raise AssertionError("Initial prompt tokens differ across batch elements")
         
         # Add all previous steps to context
         for prev_t in range(t):
@@ -545,7 +556,8 @@ def compute_policy_loss(
         # Compute KL divergence between current and reference policies over available keys (masked)
         kl_step = F.kl_div(current_log_probs_full, ref_log_probs_full, reduction="batchmean", log_target=True)
 
-        step_advantages = advantages[:, t].to(device)
+        # Detach advantage weights for the policy term (baseline acts as a constant)
+        step_advantages = advantages[:, t].detach().to(device)
 
         # Import config dynamically to get the current USE_PPO setting
         import src.config as config
