@@ -815,8 +815,8 @@ def main():
         if args.debug_generators:
             kv_pair_generator = cast(Iterator[KVPair], debug_stream(kv_pair_generator, "repeated_kv_pairs", max_items=CONFIG.batch_size + 1))
         
-        # Get reference to the base model (pi_ref)
-        ref_model = base_model
+        # Reference model for diagnostics only (avoid duplicating memory)
+        ref_model = base_model if CONFIG.enable_reference_diagnostics else None
         
         # Log model setup
         logging.info("Model setup complete:")
@@ -950,19 +950,24 @@ def main():
             old_log_probs_batch = adapter_log_probs_batch
 
             # KL(adapter || reference) over key-selection distribution (for diagnostics)
-            kl_from_ref_value = compute_kl_from_reference(
-                trajectory,
-                adapter_model,
-                base_model,
-                tokenizer,
-            )
-            kl_keys_from_ref_value = kl_from_ref_value
-            kl_values_from_ref_value = compute_value_kl_from_reference(
-                trajectory,
-                adapter_model,
-                base_model,
-                tokenizer,
-            )
+            if CONFIG.enable_reference_diagnostics:
+                kl_from_ref_value = compute_kl_from_reference(
+                    trajectory,
+                    adapter_model,
+                    base_model,
+                    tokenizer,
+                )
+                kl_keys_from_ref_value = kl_from_ref_value
+                kl_values_from_ref_value = compute_value_kl_from_reference(
+                    trajectory,
+                    adapter_model,
+                    base_model,
+                    tokenizer,
+                )
+            else:
+                kl_from_ref_value = 0.0
+                kl_keys_from_ref_value = 0.0
+                kl_values_from_ref_value = 0.0
             
             # Update reward stats
             reward_stats = update_reward_stats(reward_stats, trajectory.avg_reward)

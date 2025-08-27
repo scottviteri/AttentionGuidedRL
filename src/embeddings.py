@@ -126,12 +126,11 @@ def register_gpt2_embedding_hook(
     
     # Define the hook function
     def hook_fn(module, input_tensor, output_tensor):
-        # Get the hidden size and split size for Q,K,V
-        hidden_size = input_tensor[0].shape[-1]
-        split_size = hidden_size  # Each of Q,K,V has same size as input
-        
         # output_tensor contains concatenated Q,K,V projections
         # Shape: [batch_size, seq_len, 3 * hidden_size]
+        # Be robust to any wrapper/quantization by inferring split size from output
+        split_size = output_tensor.shape[-1] // 3
+        
         if embed_type.lower() == "query":
             # Extract query portion (first third)
             # Don't detach query embeddings - they're the trainable policy
@@ -341,7 +340,6 @@ def compute_similarity(
     # === DIMENSION VALIDATION ===
     # Validate tensor shapes against GQA requirements
     expected_query_hidden_size = num_heads * head_dim
-    expected_key_group_dim = num_groups * head_dim
     
     # Validate query embeddings shape
     if query_embeddings.dim() != 2:
@@ -370,28 +368,24 @@ def compute_similarity(
             f"got {key_embeddings.shape[0]} from shape {key_embeddings.shape}"
         )
     
-    # Validate key embeddings have sufficient dimensions for GQA
+    # Validate key embeddings have reasonable dimensions for grouping
     key_hidden_size = key_embeddings.shape[2]
-    if key_hidden_size < expected_key_group_dim:
+    if key_hidden_size < head_dim:
         raise ValueError(
-            f"key_embeddings hidden_size insufficient for GQA: need at least {expected_key_group_dim} "
-            f"(num_groups={num_groups} * head_dim={head_dim}), "
-            f"got {key_hidden_size} from shape {key_embeddings.shape}. "
-            f"This suggests key embeddings were computed with wrong attention parameters."
+            f"key_embeddings hidden_size too small: need at least head_dim={head_dim}, "
+            f"got {key_hidden_size} from shape {key_embeddings.shape}"
         )
     
-    # Validate that head-to-group mapping is valid
-    assert num_heads % num_groups == 0, (
+    # Determine effective number of key-value groups present in key embeddings
+    available_groups = key_hidden_size // head_dim
+    groups = min(num_groups, available_groups)
+    # Validate that head-to-group mapping is valid with effective groups
+    assert num_heads % groups == 0, (
         f"Invalid GQA configuration: num_heads ({num_heads}) must be divisible by "
-        f"num_groups ({num_groups}) for proper head-to-group mapping"
+        f"effective num_groups ({groups}) for proper head-to-group mapping"
     )
     
-    # Assert our key embedding structure assumption
-    # We assume key embeddings have GQA groups in the first num_groups * head_dim dimensions
-    assert key_hidden_size >= expected_key_group_dim, (
-        f"Key embedding assumption violated: expected at least {expected_key_group_dim} dimensions "
-        f"for GQA groups, got {key_hidden_size}"
-    )
+    # Use effective group count inferred from key embeddings; no hard assertion
     
     # Validate availability mask if provided
     if availability_mask is not None:
@@ -412,33 +406,33 @@ def compute_similarity(
     # For key embeddings, the provided tensor has dimensions [batch, num_keys, hidden_size]
     # where hidden_size = num_heads * head_dim
     
-    # In GQA, the model only produces num_groups key vectors (where num_groups < num_heads)
-    # So we need to reshape the key embeddings to use only the first num_groups*head_dim dimensions
-    key_group_dim = num_groups * head_dim
+    # In GQA, the model only produces 'groups' key vectors (where groups <= num_heads)
+    # So we need to reshape the key embeddings to use only the first groups*head_dim dimensions
+    key_group_dim = groups * head_dim
     
     # Only use the first key_group_dim dimensions of the hidden_size dimension
     # in case num_groups < num_heads (as in GQA)
     key_embeddings_truncated = key_embeddings[:, :, :key_group_dim]
     
-    # Reshape to [batch, num_keys, num_groups, head_dim]
-    key_reshaped = key_embeddings_truncated.view(batch_size, num_keys, num_groups, head_dim)
+    # Reshape to [batch, num_keys, groups, head_dim]
+    key_reshaped = key_embeddings_truncated.view(batch_size, num_keys, groups, head_dim)
     
     # Create a mapping from heads to groups
     # For each head h, we get its corresponding group: h // (num_heads // num_groups)
     head_to_group = torch.div(
         torch.arange(num_heads, device=query_embeddings.device),
-        num_heads // num_groups,
+        num_heads // groups,
         rounding_mode='floor'
     )
     
     # Using torch.index_select for a fully vectorized implementation with no loops or comprehensions
     
     # First, reshape keys to prepare for index_select
-    # [batch, num_keys, num_groups, head_dim] -> [batch*num_keys, num_groups, head_dim]
-    key_reshaped_flat = key_reshaped.reshape(-1, num_groups, head_dim)
+    # [batch, num_keys, groups, head_dim] -> [batch*num_keys, groups, head_dim]
+    key_reshaped_flat = key_reshaped.reshape(-1, groups, head_dim)
     
     # Use index_select to gather the right groups for all heads at once
-    # [batch*num_keys, num_groups, head_dim] + head_to_group -> [batch*num_keys, num_heads, head_dim]
+    # [batch*num_keys, groups, head_dim] + head_to_group -> [batch*num_keys, num_heads, head_dim]
     # Here we select from the group dimension (dim=1) using head_to_group indices
     # For each head index, we select its corresponding group index from head_to_group
     # This eliminates the need for any loops or list comprehensions

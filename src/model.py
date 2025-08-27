@@ -26,17 +26,32 @@ def load_base_model():
     # Configure quantization for reduced memory usage
     # Assumes CUDA is available as an explicit dependency
     quantization_config = BitsAndBytesConfig(
-        load_in_8bit=True,
-        llm_int8_threshold=6.0,
-        llm_int8_has_fp16_weight=False,
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
     )
     
     # Load the model with appropriate configurations
     # Assumes CUDA is available as an explicit dependency
+    # Resolve dtype (config stores a string by default)
+    dtype_cfg = CONFIG.dtype
+    if isinstance(dtype_cfg, str):
+        if dtype_cfg.lower() in ("bfloat16", "bf16"):
+            resolved_dtype = torch.bfloat16
+        elif dtype_cfg.lower() in ("float16", "fp16", "half"):
+            resolved_dtype = torch.float16
+        elif dtype_cfg.lower() in ("float32", "fp32", "full"):
+            resolved_dtype = torch.float32
+        else:
+            resolved_dtype = torch.bfloat16
+    else:
+        resolved_dtype = dtype_cfg
+
     model = AutoModelForCausalLM.from_pretrained(
         CONFIG.model_name,
-        device_map=CONFIG.device,
-        torch_dtype=CONFIG.dtype,
+        device_map="auto",
+        torch_dtype=resolved_dtype,
         quantization_config=quantization_config,
     )
     
@@ -228,13 +243,17 @@ def setup_model_and_tokenizer():
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'  # Set padding side to left for decoder-only models
     
-    # Verify the token exists in the vocabulary
-    token_ids = tokenizer.encode(CONFIG.query_vec_token, add_special_tokens=False)
-    if len(token_ids) != 1:
-        logging.warning(f"Query token '{CONFIG.query_vec_token}' tokenizes to {len(token_ids)} tokens: {token_ids}")
-        logging.warning("This may affect embedding extraction. Consider using a single-token word.")
+    # Verify separator tokens in the vocabulary (informational)
+    sep_ids = tokenizer.encode(CONFIG.chunk_separator, add_special_tokens=False)
+    kv_ids = tokenizer.encode(CONFIG.kv_separator, add_special_tokens=False)
+    if len(sep_ids) != 1:
+        logging.warning(f"Separator '{CONFIG.chunk_separator}' tokenizes to {len(sep_ids)} tokens: {sep_ids}")
     else:
-        logging.info(f"Query token '{CONFIG.query_vec_token}' has token ID: {token_ids[0]}")
+        logging.info(f"Separator '{CONFIG.chunk_separator}' has token ID: {sep_ids[0]}")
+    if len(kv_ids) != 1:
+        logging.warning(f"KV separator '{CONFIG.kv_separator}' tokenizes to {len(kv_ids)} tokens: {kv_ids}")
+    else:
+        logging.info(f"KV separator '{CONFIG.kv_separator}' has token ID: {kv_ids[0]}")
         
     return base_model, adapter_model, tokenizer
 

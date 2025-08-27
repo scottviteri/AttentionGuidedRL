@@ -65,6 +65,7 @@ class TrainingConfig:
     # Ablations / deterministic baselines
     force_linear_action_order: bool = False  # If True, pick keys in linear order instead of sampling
     freeze_policy: bool = False              # If True, do not train the policy (skip backward/step)
+    enable_reference_diagnostics: bool = False  # If True, compute ref-model diagnostics & KL
     
     # Training infrastructure
     checkpoint_interval: int = 100
@@ -181,6 +182,7 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
         ppo_clip_epsilon=getattr(args, 'ppo_clip_epsilon', 0.2) or base_config.ppo_clip_epsilon,
         force_linear_action_order=getattr(args, 'force_linear_order', False) or base_config.force_linear_action_order,
         freeze_policy=getattr(args, 'freeze_policy', False) or base_config.freeze_policy,
+        enable_reference_diagnostics=getattr(args, 'enable_reference_diagnostics', False) or base_config.enable_reference_diagnostics,
         
         # Infrastructure
         checkpoint_interval=base_config.checkpoint_interval,

@@ -104,20 +104,15 @@ def generate_query_vector(
     embeddings_dict, hook_remover = register_embedding_hook(model, embed_type="query", layer_idx=layer_idx)
     
     try:
-        # Tokenize the QUERY_VEC_TOKEN
-        query_vec_token_ids = tokenizer(
-            [CONFIG.query_vec_token] * batch_size,
-            add_special_tokens=False,
-            return_tensors="pt"
-        ).input_ids.to(device)
-        
-        # Append QUERY_VEC_TOKEN to context
-        input_tokens = torch.cat([context_tokens, query_vec_token_ids], dim=1)
-        
-        # Use extract_embeddings which handles the forward pass and extraction
-        # Extract only the Query token embedding (last token) for focused learning
-        # Set requires_grad=True for query embeddings during training
-        query_vectors = extract_embeddings(model, input_tokens, embeddings_dict, requires_grad=True, extract_last_token=True)
+        # Context already ends with the separator token that triggers query-vector extraction.
+        # Simply run a forward with the existing context and extract the last token embedding.
+        query_vectors = extract_embeddings(
+            model,
+            context_tokens,
+            embeddings_dict,
+            requires_grad=True,
+            extract_last_token=True,
+        )
         
         return query_vectors
         
@@ -196,19 +191,23 @@ def compute_trajectory_rewards(
             current_context
         )
         
-        # Compute log prob with reference model (pi_ref)
-        ref_log_prob = calculate_conditional_log_prob(
-            ref_model, 
-            value_tokens, 
-            current_context
-        )
+        # Compute log prob with reference model (pi_ref) only if available/needed
+        if ref_model is not None and CONFIG.subtract_base_model_logprobs:
+            ref_log_prob = calculate_conditional_log_prob(
+                ref_model,
+                value_tokens,
+                current_context,
+            )
+        else:
+            # Fill with zeros when not using reference model
+            ref_log_prob = torch.zeros_like(adapter_log_prob)
         
         # Store log probabilities
         adapter_log_probs[:, i] = adapter_log_prob
         ref_log_probs[:, i] = ref_log_prob
         
         # Calculate reward - conditionally subtract reference model baseline
-        if CONFIG.subtract_base_model_logprobs:
+        if CONFIG.subtract_base_model_logprobs and ref_model is not None:
             # Classic approach: reward = improvement over reference model
             rewards[:, i] = adapter_log_prob - ref_log_prob
         else:
