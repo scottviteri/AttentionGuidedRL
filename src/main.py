@@ -148,10 +148,12 @@ def policy_gradient_train_step(
         if CONFIG.kl_penalty_coefficient > 0.0:
             # Compute reference distribution over keys using the same context and mask (no gradient)
             with torch.no_grad():
+                sep_for_ref = tokenizer([CONFIG.chunk_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+                ref_query_context = torch.cat([current_context, sep_for_ref], dim=1)
                 ref_query_emb = generate_query_vector(
                     ref_model,
                     tokenizer,
-                    current_context,
+                    ref_query_context,
                     layer_idx=-2
                 )
                 ref_num_heads, ref_num_groups, ref_head_dim = get_attention_params(ref_model)
@@ -625,7 +627,9 @@ def compute_kl_from_reference(
 
         # 2) Reference distribution – build a query vector, compute similarities, apply mask
         with torch.no_grad():
-            ref_query = generate_query_vector(ref_model, tokenizer, context_tokens, layer_idx=-2)
+            sep_for_ref = tokenizer([CONFIG.chunk_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+            ref_query_context = torch.cat([context_tokens, sep_for_ref], dim=1)
+            ref_query = generate_query_vector(ref_model, tokenizer, ref_query_context, layer_idx=-2)
             key_embs_full = all_key_embs.to(device)
             # Get attention parameters from the reference model
             num_heads, num_groups, head_dim = get_attention_params(ref_model)
