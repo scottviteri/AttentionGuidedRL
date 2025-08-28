@@ -24,11 +24,7 @@ class TrainingConfig:
     
     def __post_init__(self):
         """Validate configuration parameters after initialization."""
-        # Validate temperature is positive
-        if self.temperature <= 0:
-            raise ValueError(f"temperature must be positive, got {self.temperature}")
-        
-        # Validate other critical parameters
+        # Validate critical parameters
         if self.learning_rate <= 0:
             raise ValueError(f"learning_rate must be positive, got {self.learning_rate}")
         
@@ -48,25 +44,19 @@ class TrainingConfig:
     num_episodes: int = 10000
     batch_size: int = 64
     
-    # RL-specific parameters
-    gamma: float = 0.99
-    temperature: float = 1.0
-    reward_aggregation: str = "average"  # "average" or "discounted"
+    # RL-specific parameters (minimal)
     differentiable_rewards: bool = True   # Enable chain-rule reward gradients
     
     # Training behavior
     subtract_base_model_logprobs: bool = True
     use_grpo: bool = True  # Enable GRPO-style centered baseline by default
-    grpo_batching: bool = True  # GRPO-style batching
-    gae_lambda: float = 0.95
     kl_penalty_coefficient: float = 0.0
-    use_ppo: bool = False
-    ppo_clip_epsilon: float = 0.2
+    # PPO/GAE removed (not used)
     
     # Ablations / deterministic baselines
     force_linear_action_order: bool = False  # If True, pick keys in linear order instead of sampling
     freeze_policy: bool = False              # If True, do not train the policy (skip backward/step)
-    enable_reference_diagnostics: bool = False  # If True, compute ref-model diagnostics & KL
+    # Reference diagnostics are always enabled (no config flag)
     
     # Training infrastructure
     checkpoint_interval: int = 100
@@ -76,10 +66,7 @@ class TrainingConfig:
     debug_print_context: bool = False
     
     # Token configuration (computed - will be filled by create_training_config_from_args)
-    prefix_tokens_per_key: int = 0
-    prefix_tokens_per_value: int = 0
     tokens_per_round: int = 0
-    initial_prompt_tokens: int = 0
     num_kv_pairs: int = 0
     max_context_length: int = 0
     
@@ -90,9 +77,6 @@ class TrainingConfig:
     lora_alpha: int = 16
     lora_dropout: float = 0.0  # Set to 0 per user request
     kv_every_n: int = 4  # Skip 4 chunks between each extraction for diversity
-    initial_prompt: str = "Search for relevant information using learned vector queries."
-    key_prefix: str = "Key: "
-    value_prefix: str = "Value: "
     # Always use separators for both query triggering and KV boundaries
     chunk_separator: str = '<SEP>'   # Between KV pairs and as query trigger
     kv_separator: str = '<KV>'       # Between key and value within a pair
@@ -135,13 +119,13 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
         tokenizer.pad_token = tokenizer.eos_token
     
     # Calculate token counts
-    prefix_tokens_per_key = len(tokenizer.encode(base_config.key_prefix, add_special_tokens=False))
-    prefix_tokens_per_value = len(tokenizer.encode(base_config.value_prefix, add_special_tokens=False))
+    sep_tokens = len(tokenizer.encode(base_config.chunk_separator, add_special_tokens=False))
+    kv_tokens = len(tokenizer.encode(base_config.kv_separator, add_special_tokens=False))
+    # One round consists of: SEP (query trigger) + key tokens + KV separator + value tokens
     tokens_per_round = (
-        prefix_tokens_per_key + base_config.tokens_per_key +
-        prefix_tokens_per_value + base_config.tokens_per_value
+        sep_tokens + base_config.tokens_per_key +
+        kv_tokens + base_config.tokens_per_value
     )
-    initial_prompt_tokens = len(tokenizer.encode(base_config.initial_prompt, add_special_tokens=False))
     
     # Context window calculation
     model_config = AutoConfig.from_pretrained(model_name)
@@ -151,13 +135,18 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
         max_context_length = model_config.n_positions
         
     # Number of KV pairs
-    available_context = max_context_length - initial_prompt_tokens
+    # No initial prompt; context starts empty and we insert SEP before each key selection
+    available_context = max_context_length
     num_kv_pairs = available_context // tokens_per_round
     num_kv_pairs = min(num_kv_pairs, 10)  # Cap for reasonable trajectory length
     
     # Apply CLI overrides with fallback to defaults
     # Resolve GRPO usage from CLI (default: True; disable with --disable-grpo)
     use_grpo = False if getattr(args, 'disable_grpo', False) else True
+    # Resolve subtract_base_model_logprobs with explicit disable flag
+    subtract_base = False if getattr(args, 'no_subtract_base_logprobs', False) else True
+    # Resolve differentiable rewards with explicit disable flag
+    differentiable_rewards = False if getattr(args, 'disable_differentiable_rewards', False) else True
 
     return TrainingConfig(
         # Model configuration
@@ -172,22 +161,15 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
         batch_size=getattr(args, 'batch_size', None) or base_config.batch_size,
         
         # RL parameters (CLI overrides or defaults)
-        gamma=base_config.gamma,
-        temperature=base_config.temperature,
-        reward_aggregation=getattr(args, 'reward_aggregation', None) or base_config.reward_aggregation,
-        differentiable_rewards=getattr(args, 'differentiable_rewards', False) or base_config.differentiable_rewards,
+        differentiable_rewards=differentiable_rewards,
+        kl_penalty_coefficient=getattr(args, 'kl_penalty_coefficient', None) if getattr(args, 'kl_penalty_coefficient', None) is not None else base_config.kl_penalty_coefficient,
         
         # Training behavior (CLI overrides or defaults)
-        subtract_base_model_logprobs=getattr(args, 'subtract_base_logprobs', False) or base_config.subtract_base_model_logprobs,
-        grpo_batching=getattr(args, 'grpo_batching', False) or base_config.grpo_batching,
+        subtract_base_model_logprobs=subtract_base,
         use_grpo=use_grpo,
-        gae_lambda=getattr(args, 'gae_lambda', None) or base_config.gae_lambda,
-        kl_penalty_coefficient=getattr(args, 'kl_penalty_coefficient', None) or base_config.kl_penalty_coefficient,
-        use_ppo=getattr(args, 'use_ppo', False) or base_config.use_ppo,
-        ppo_clip_epsilon=getattr(args, 'ppo_clip_epsilon', 0.2) or base_config.ppo_clip_epsilon,
         force_linear_action_order=getattr(args, 'force_linear_order', False) or base_config.force_linear_action_order,
         freeze_policy=getattr(args, 'freeze_policy', False) or base_config.freeze_policy,
-        enable_reference_diagnostics=getattr(args, 'enable_reference_diagnostics', False) or base_config.enable_reference_diagnostics,
+        # enable_reference_diagnostics removed (always on)
         
         # Infrastructure
         checkpoint_interval=base_config.checkpoint_interval,
@@ -197,10 +179,7 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
         debug_print_context=getattr(args, 'debug_print_context', False) or base_config.debug_print_context,
         
         # Computed token configuration
-        prefix_tokens_per_key=prefix_tokens_per_key,
-        prefix_tokens_per_value=prefix_tokens_per_value,
         tokens_per_round=tokens_per_round,
-        initial_prompt_tokens=initial_prompt_tokens,
         num_kv_pairs=num_kv_pairs,
         max_context_length=max_context_length,
         
@@ -211,9 +190,6 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
         lora_alpha=base_config.lora_alpha,
         lora_dropout=base_config.lora_dropout,
         kv_every_n=base_config.kv_every_n,
-        initial_prompt=base_config.initial_prompt,
-        key_prefix=base_config.key_prefix,
-        value_prefix=base_config.value_prefix,
     )
 
 
@@ -225,8 +201,6 @@ def training_config_to_dict(config: TrainingConfig) -> Dict[str, Any]:
         'learning_rate': config.learning_rate,
         'num_episodes': config.num_episodes,
         'batch_size': config.batch_size,
-        'gamma': config.gamma,
-        'temperature': config.temperature,
         'subtract_base_model_logprobs': config.subtract_base_model_logprobs,
         'use_grpo': config.use_grpo,
         'enable_wandb': config.enable_wandb,
@@ -244,7 +218,7 @@ def log_training_config(config: TrainingConfig, logger) -> None:
     
     logger.info(f"Training: {config.num_episodes} episodes, batch_size={config.batch_size}, lr={config.learning_rate}")
     
-    logger.info(f"RL: gamma={config.gamma}, temperature={config.temperature}")
+    # RL hyperparameters (gamma/temperature) not in use; skipping log
     
     if getattr(config, 'use_grpo', False):
         logger.info("Baseline: GRPO batch-mean baseline (centered, stop-grad)")
@@ -252,7 +226,7 @@ def log_training_config(config: TrainingConfig, logger) -> None:
         logger.info("Baseline: None (uncentered trajectory-average rewards)")
         
     logger.info(f"Context: {config.num_kv_pairs} KV pairs, {config.tokens_per_round} tokens/round")
-    logger.info(f"         {config.max_context_length} max context, {config.initial_prompt_tokens} prompt tokens")
+    logger.info(f"         {config.max_context_length} max context")
     logger.info("=" * 45)
 
 

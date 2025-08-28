@@ -184,34 +184,44 @@ def compute_trajectory_rewards(
         key_tokens = qkv_step.key_tokens.to(device)
         value_tokens = qkv_step.value_tokens.to(device)
         
-        # Compute log prob with adapter model
+        # Build reward context: [current_context, SEP, key, KV]
+        if tokenizer is None:
+            raise ValueError("tokenizer is required for reward computation context")
+        sep_tokens = tokenizer([CONFIG.chunk_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        kv_sep_tokens = tokenizer([CONFIG.kv_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        reward_context = torch.cat([
+            current_context,
+            sep_tokens,
+            key_tokens,
+            kv_sep_tokens,
+        ], dim=1)
+
+        # Compute log prob with adapter model given reward context
         adapter_log_prob = calculate_conditional_log_prob(
             adapter_model, 
             value_tokens, 
-            current_context
+            reward_context
         )
         
-        # Compute log prob with reference model (pi_ref) only if available/needed
-        if ref_model is not None and CONFIG.subtract_base_model_logprobs:
-            ref_log_prob = calculate_conditional_log_prob(
-                ref_model,
-                value_tokens,
-                current_context,
-            )
-        else:
-            # Fill with zeros when not using reference model
-            ref_log_prob = torch.zeros_like(adapter_log_prob)
+        # Compute log prob with reference model (pi_ref)
+        if ref_model is None:
+            raise AssertionError("ref_model (base/reference) must not be None")
+        ref_log_prob = calculate_conditional_log_prob(
+            ref_model,
+            value_tokens,
+            reward_context,
+        )
         
         # Store log probabilities
         adapter_log_probs[:, i] = adapter_log_prob
         ref_log_probs[:, i] = ref_log_prob
         
-        # Calculate reward - conditionally subtract reference model baseline
-        if CONFIG.subtract_base_model_logprobs and ref_model is not None:
+        # Calculate reward - optional subtraction of reference model baseline
+        if CONFIG.subtract_base_model_logprobs:
             # Classic approach: reward = improvement over reference model
             rewards[:, i] = adapter_log_prob - ref_log_prob
         else:
-            # Simplified approach: use raw adapter performance with trajectory averages
+            # Simplified approach: use raw adapter performance
             rewards[:, i] = adapter_log_prob
         
         if verbose:
@@ -223,31 +233,14 @@ def compute_trajectory_rewards(
                 print(f"Reward (raw adapter): {rewards[0, i].item():.4f}")
                 print(f"Note: Using raw adapter log probs as rewards (SUBTRACT_BASE_MODEL_LOGPROBS=False)")
         
-        # Update context for next iteration
-        # Append query, key and value tokens to context, all on the same device
-        if tokenizer:
-            # Add separators between key and value (no textual prefixes)
-            batch_size = current_context.shape[0]
-            kv_sep_tokens = tokenizer([CONFIG.kv_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-            
-            # Vector queries - no query tokens; use separators
-            current_context = torch.cat([
-                current_context,
-                key_tokens,
-                kv_sep_tokens,
-                value_tokens
-            ], dim=1)
-            
-            # Display vector query indicator (all steps are vector queries)
-            if verbose:
-                print("Using vector query")
-        else:
-            # Fallback for tests or when tokenizer is not available
-            current_context = torch.cat([
-                current_context, 
-                key_tokens, 
-                value_tokens
-            ], dim=1)
+        # Update context for next iteration: append [key, KV, value]
+        kv_sep_tokens_next = kv_sep_tokens  # already computed above
+        current_context = torch.cat([
+            current_context,
+            key_tokens,
+            kv_sep_tokens_next,
+            value_tokens
+        ], dim=1)
     
     # Compute average reward
     avg_reward = rewards.mean(dim=1)
@@ -304,40 +297,21 @@ def update_reward_stats(
 
 
 
-def compute_returns(rewards: torch.Tensor, gamma: float = 0.99) -> torch.Tensor:
+def compute_returns(rewards: torch.Tensor) -> torch.Tensor:
     """
-    Compute discounted returns (rewards-to-go) for each timestep.
-    
-    Args:
-        rewards: Tensor of rewards [batch_size, num_steps]
-        gamma: Discount factor
-        
-    Returns:
-        torch.Tensor: Returns for each timestep [batch_size, num_steps]
+    Placeholder for compatibility; returns are equal to rewards here.
     """
-    batch_size, num_steps = rewards.shape
-    returns = torch.zeros_like(rewards)
-    
-    # Compute returns backwards
-    returns[:, -1] = rewards[:, -1]
-    for t in reversed(range(num_steps - 1)):
-        returns[:, t] = rewards[:, t] + gamma * returns[:, t + 1]
-    
-    return returns
+    return rewards.clone()
 
 
 def compute_advantages(
     rewards: torch.Tensor,
-    gamma: float = 0.99,
-    gae_lambda: float = 0.95
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Compute advantages using trajectory average (simple baseline).
     
     Args:
         rewards: Tensor of rewards [batch_size, num_steps]
-        gamma: Discount factor (unused in current implementation)
-        gae_lambda: GAE lambda parameter (unused in current implementation)
         
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: (advantages, returns)
@@ -365,7 +339,6 @@ def compute_policy_loss(
     old_model: torch.nn.Module,
     kl_penalty_coef: float,
     verbose: bool = False,
-    gamma: float = 0.99,
     tokenizer: Any = None,
     embeddings_dict: Optional[Dict] = None
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
@@ -409,12 +382,7 @@ def compute_policy_loss(
     # Removed redundant local config import (constants available module-wide)
     
     # Compute returns and advantages
-    advantages, _ = compute_advantages(
-        trajectory.rewards, 
-        gamma=gamma,
-        gae_lambda=CONFIG.gae_lambda,
-        
-    )
+    advantages, _ = compute_advantages(trajectory.rewards)
     
 
     
@@ -425,17 +393,8 @@ def compute_policy_loss(
     # Get batch size from first step
     batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
     
-    # Initialize context with the initial prompt
-    context_tokens = tokenizer(
-        [CONFIG.initial_prompt] * batch_size,
-        return_tensors="pt",
-        padding=True,
-        add_special_tokens=False
-    ).input_ids.to(device)
-    # Assert same prompt across batch
-    first_row = context_tokens[0].unsqueeze(0).expand_as(context_tokens)
-    if not torch.equal(first_row, context_tokens):
-        raise AssertionError("Initial prompt tokens differ across batch elements")
+    # Initialize empty context; first query will be triggered by appending SEP
+    context_tokens = torch.zeros((batch_size, 0), dtype=torch.long, device=device)
     
     # Reconstruct context and generate old model means for each step
     for t, qkv_step in enumerate(trajectory.qkv_steps):
@@ -449,16 +408,16 @@ def compute_policy_loss(
             )
             old_query_means.append(prev_query_mean)
         
-        # Update context for next iteration (add key and value tokens)
-        key_prefix_tokens = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-        value_prefix_tokens = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        # Update context for next iteration (add key and value tokens) using only separators
+        kv_sep_tokens = tokenizer([CONFIG.kv_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        sep_tokens = tokenizer([CONFIG.chunk_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
         
         context_tokens = torch.cat([
             context_tokens,
-            key_prefix_tokens,
             qkv_step.key_tokens.to(device),
-            value_prefix_tokens,
-            qkv_step.value_tokens.to(device)
+            kv_sep_tokens,
+            qkv_step.value_tokens.to(device),
+            sep_tokens
         ], dim=1)
     
     # Process each step in the trajectory
@@ -469,31 +428,19 @@ def compute_policy_loss(
                 print(f"Warning: Skipping step {t} - no similarity scores")
             continue
         
-        # Reconstruct context up to this step
+        # Reconstruct context up to this step, starting empty and appending previous [key, KV, value, SEP]
         batch_size = qkv_step.key_tokens.shape[0]
-        context_tokens = tokenizer(
-            [CONFIG.initial_prompt] * batch_size,
-            return_tensors="pt",
-            padding=True,
-            add_special_tokens=False
-        ).input_ids.to(device)
-        # Assert same prompt across batch
-        first_row = context_tokens[0].unsqueeze(0).expand_as(context_tokens)
-        if not torch.equal(first_row, context_tokens):
-            raise AssertionError("Initial prompt tokens differ across batch elements")
-        
-        # Add all previous steps to context
+        context_tokens = torch.zeros((batch_size, 0), dtype=torch.long, device=device)
         for prev_t in range(t):
             prev_step = trajectory.qkv_steps[prev_t]
-            key_prefix_tokens = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-            value_prefix_tokens = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-            
+            kv_sep = tokenizer([CONFIG.kv_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+            sep_tok = tokenizer([CONFIG.chunk_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
             context_tokens = torch.cat([
                 context_tokens,
-                key_prefix_tokens,
                 prev_step.key_tokens.to(device),
-                value_prefix_tokens,
-                prev_step.value_tokens.to(device)
+                kv_sep,
+                prev_step.value_tokens.to(device),
+                sep_tok,
             ], dim=1)
         
         # --- Recompute current-policy similarities so gradients flow into adapter_model ---
@@ -562,7 +509,7 @@ def compute_policy_loss(
         # Import config dynamically to get the current USE_PPO setting
         import src.config as config
         
-        if CONFIG.use_ppo:
+        if False and CONFIG.use_ppo:
             # PPO: Use ratio clipping
             # Compute probability ratio: pi_theta(a|s) / pi_old(a|s)
             log_ratio = current_action_log_probs - old_action_log_probs
@@ -627,7 +574,7 @@ def compute_policy_loss(
         if verbose:
             # Import config dynamically for the current USE_PPO setting
             import src.config as config
-            method_name = "PPO" if CONFIG.use_ppo else "Vanilla PG"
+            method_name = "Vanilla PG"
             print(f"\n=== {method_name} Loss Components ===")
             print(f"Policy gradient sum (before negation): {-total_policy_loss.item():.4f}")
             print(f"Policy loss (after negation): {total_policy_loss.item():.4f}")
@@ -635,10 +582,7 @@ def compute_policy_loss(
             print(f"KL penalty coefficient: {kl_penalty_coef:.4f}")
             print(f"Total loss: {total_loss.item():.4f}")
             print(f"  = {total_policy_loss.item():.4f} + {kl_penalty_term.item():.4f}")
-            if CONFIG.use_ppo:
-                print(f"Average clipping ratio: {avg_clipping_ratio:.4f}")
-            else:
-                print(f"Method: Vanilla Policy Gradient (no clipping)")
+            print(f"Method: Vanilla Policy Gradient (no clipping)")
             print(f"=== End {method_name} Loss Components ===\n")
             
         return total_loss, total_policy_loss, total_kl_loss, avg_clipping_ratio
@@ -710,7 +654,6 @@ def train_step(
         old_model,  # Use old_model for PPO probability ratios
         kl_penalty_coef,
         verbose=verbose,
-        gamma=CONFIG.gamma,
         tokenizer=tokenizer,
         embeddings_dict=embeddings_dict
     )

@@ -79,6 +79,9 @@ def policy_gradient_train_step(
         print(f"Input trajectory batch size: {batch_size}")
         print(f"Reward stats: mean={reward_stats['mean']:.4f}, std={reward_stats['std']:.4f}")
 
+    # Sanity check: reference model must always be provided
+    assert ref_model is not None, "ref_model (base/reference) must not be None"
+
     # Zero gradients
     optimizer.zero_grad()
     
@@ -88,16 +91,11 @@ def policy_gradient_train_step(
     
     policy_term = torch.tensor(0.0, device=device, requires_grad=True)
     reward_term = torch.tensor(0.0, device=device, requires_grad=True)
+    kl_loss_term = torch.tensor(0.0, device=device, requires_grad=True)
+    kl_count = 0
     
-    # Initialize context for computing current action probabilities and rewards
-    context_tokens = tokenizer(
-        [CONFIG.initial_prompt] * batch_size,
-        return_tensors="pt",
-        padding=True,
-        add_special_tokens=False
-    ).input_ids.to(device)
-    
-    current_context = context_tokens
+    # Initialize empty context for computing current action probabilities and rewards
+    current_context = torch.zeros((batch_size, 0), dtype=torch.long, device=device)
     
     # Use average reward over the entire trajectory for each action
     batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
@@ -116,11 +114,13 @@ def policy_gradient_train_step(
     for t, qkv_step in enumerate(trajectory.qkv_steps):
         # === POLICY GRADIENT TERM: A_t * ∇log π_θ(a_t|s_t) ===
         
-        # Generate current query embedding
+        # Generate current query embedding (append SEP to trigger query-vector extraction)
+        sep_for_query = tokenizer([CONFIG.chunk_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        query_context_for_emb = torch.cat([current_context, sep_for_query], dim=1)
         current_query_emb = generate_query_vector(
             adapter_model,
             tokenizer,
-            current_context,
+            query_context_for_emb,
             layer_idx=-2
         )
         
@@ -144,6 +144,30 @@ def policy_gradient_train_step(
         policy_gradient_t = step_advantages * current_action_log_probs
         policy_term = policy_term + policy_gradient_t.sum()  # Sum over batch
         
+        # === KL REGULARIZATION TERM: D_KL(π_θ(·|s_t) || π_ref(·|s_t)) ===
+        if CONFIG.kl_penalty_coefficient > 0.0:
+            # Compute reference distribution over keys using the same context and mask (no gradient)
+            with torch.no_grad():
+                ref_query_emb = generate_query_vector(
+                    ref_model,
+                    tokenizer,
+                    current_context,
+                    layer_idx=-2
+                )
+                ref_num_heads, ref_num_groups, ref_head_dim = get_attention_params(ref_model)
+                ref_similarities = compute_similarity(
+                    ref_query_emb,
+                    trajectory.all_key_embeddings,
+                    ref_num_heads,
+                    ref_num_groups,
+                    ref_head_dim,
+                    availability_mask=qkv_step.available_mask if hasattr(qkv_step, 'available_mask') else None
+                )
+            # KL in log-space: both inputs are log-probabilities
+            kl_step = F.kl_div(current_similarities, ref_similarities, reduction="batchmean", log_target=True)
+            kl_loss_term = kl_loss_term + kl_step
+            kl_count += 1
+
         # === REWARD GRADIENT TERM: ∇_θ r_{θ,t} ===
         # Prepare context for reward computation
         sep_tokens = tokenizer([CONFIG.chunk_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
@@ -185,10 +209,13 @@ def policy_gradient_train_step(
             print(f"Step {t}: advantage mean: {step_advantages.mean().item():.4f}")
             print(f"Step {t}: reward_t mean: {step_reward.mean().item():.4f}")
     
-    # === CHAIN RULE LOSS: -(A_t·∇log π_θ(τ) + ∇R_θ(τ)) ===
+    # === CHAIN RULE LOSS: -(A_t·∇log π_θ(τ) + ∇R_θ(τ)) + β·D_KL(π_θ||π_ref) ===
     
     # Negative for gradient ascent -> descent
     total_loss = -(policy_term + reward_term)
+    if CONFIG.kl_penalty_coefficient > 0.0 and kl_count > 0:
+        avg_kl = kl_loss_term / kl_count
+        total_loss = total_loss + CONFIG.kl_penalty_coefficient * avg_kl
     
     if verbose:
         print(f"Policy term: {policy_term.item():.4f}")
@@ -447,12 +474,15 @@ def parse_args():
     
     # Configuration parameters
     parser.add_argument('--enable-wandb', action='store_true', help='Enable Weights & Biases logging')
+    parser.add_argument('--no-subtract-base-logprobs', action='store_true', help='Disable base model logprob subtraction (reward uses raw adapter logprobs)')
     parser.add_argument('--disable-grpo', action='store_true', help='Disable GRPO-style centered baseline (use uncentered rewards)')
     parser.add_argument('--force-linear-order', action='store_true', help='Always pick keys in linear order (disable sampling)')
     parser.add_argument('--freeze-policy', action='store_true', help='Do not update policy parameters (freeze policy gradient)')
     parser.add_argument('--debug-print-context', action='store_true', help='Print full context verbatim during trajectory and reward computation')
-    parser.add_argument('--subtract-base-logprobs', action='store_true', help='Subtract base model logprobs in reward computation')
+    # Note: subtraction defaults to ON; use --no-subtract-base-logprobs to disable
+    parser.add_argument('--disable-differentiable-rewards', action='store_true', help='Disable differentiable reward backprop through value tokens')
     parser.add_argument('--debug-generators', action='store_true', help='Enable detailed debugging of generator pipelines')
+    parser.add_argument('--kl-penalty-coefficient', type=float, help='KL penalty coefficient beta; 0 disables KL regularization')
     
     return parser.parse_args()
 
@@ -583,17 +613,8 @@ def compute_kl_from_reference(
     device = next(adapter_model.parameters()).device
     batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
 
-    context_tokens_obj = tokenizer(
-        [CONFIG.initial_prompt] * batch_size,
-        return_tensors="pt",
-        padding=True,
-        add_special_tokens=False,
-    )
-
-    if not hasattr(context_tokens_obj, "input_ids") or not isinstance(context_tokens_obj.input_ids, torch.Tensor):
-        raise TypeError("Tokenizer must return an object with a tensor 'input_ids' field")
-
-    context_tokens = context_tokens_obj.input_ids.to(device)
+    # Start with empty context; queries are triggered by SEP token appends
+    context_tokens = torch.zeros((batch_size, 0), dtype=torch.long, device=device)
 
     kl_vals = []
 
@@ -619,15 +640,15 @@ def compute_kl_from_reference(
         kl_step = F.kl_div(adapter_log_probs, ref_log_probs, reduction="batchmean", log_target=True)
         kl_vals.append(kl_step.item())
 
-        # 4) Advance context for next timestep
-        kp = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-        vp = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        # 4) Advance context for next timestep using only separators
+        kv = tokenizer([CONFIG.kv_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        sep = tokenizer([CONFIG.chunk_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
         context_tokens = torch.cat([
             context_tokens,
-            kp,
             step.key_tokens.to(device),
-            vp,
+            kv,
             step.value_tokens.to(device),
+            sep,
         ], dim=1)
 
     if not kl_vals:
@@ -650,22 +671,16 @@ def compute_value_kl_from_reference(
     device = next(adapter_model.parameters()).device
     batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
     
-    # Initialize context with initial prompt
-    context_tokens = tokenizer(
-        [CONFIG.initial_prompt] * batch_size,
-        return_tensors="pt",
-        padding=True,
-        add_special_tokens=False,
-    ).input_ids.to(device)
+    # Initialize empty context for value KL diagnostic
+    context_tokens = torch.zeros((batch_size, 0), dtype=torch.long, device=device)
     
     kl_vals = []
     for step in trajectory.qkv_steps:
         key_tokens = step.key_tokens.to(device)
         value_tokens = step.value_tokens.to(device)
         sep = tokenizer([CONFIG.chunk_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-        kp = tokenizer([CONFIG.key_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-        vp = tokenizer([CONFIG.value_prefix] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-        reward_context = torch.cat([context_tokens, sep, kp, key_tokens, vp], dim=1)
+        kv = tokenizer([CONFIG.kv_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        reward_context = torch.cat([context_tokens, sep, key_tokens, kv], dim=1)
         
         # Adapter logits (no grad for diagnostic)
         with torch.no_grad():
@@ -725,7 +740,6 @@ def main():
     
     # Log training algorithm
     logging.info("Training algorithm: Advantage-weighted policy gradient with differentiable reward (chain rule)")
-    logging.info(f"Reward aggregation: {CONFIG.reward_aggregation}")
     
     # Set up models and tokenizer
     logging.info("Setting up models and tokenizer...")
@@ -818,9 +832,6 @@ def main():
         if args.debug_generators:
             kv_pair_generator = cast(Iterator[KVPair], debug_stream(kv_pair_generator, "repeated_kv_pairs", max_items=CONFIG.batch_size + 1))
         
-        # Reference model for diagnostics only (avoid duplicating memory)
-        ref_model = base_model if CONFIG.enable_reference_diagnostics else None
-        
         # Log model setup
         logging.info("Model setup complete:")
         logging.info("- adapter_model: LoRA adapter (trainable)")
@@ -910,26 +921,10 @@ def main():
             if args.verbose:
                 print(f"Generated pool of {len(available_qkv_steps)} query-key-value steps")
             
-            # Create initial context with a prompt explaining the task
-            # Note: The token count of this prompt is accounted for in 
-            # the TrainingConfig calculation to ensure we don't exceed the context window
+            # Initialize empty context; the first query will be triggered by appending SEP
             batch_size = CONFIG.batch_size
-            
-            # Tokenize the initial prompt
             device = next(adapter_model.parameters()).device
-            initial_tokens = tokenizer(
-                [CONFIG.initial_prompt] * batch_size,
-                return_tensors="pt",
-                padding=True,
-                add_special_tokens=False
-            ).input_ids.to(device)
-            # Assert same prompt across batch
-            try:
-                first_row = initial_tokens[0].unsqueeze(0).expand_as(initial_tokens)
-                if not torch.equal(first_row, initial_tokens):
-                    raise AssertionError("Initial prompt tokens differ across batch elements")
-            except Exception as e:
-                raise
+            initial_tokens = torch.zeros((batch_size, 0), dtype=torch.long, device=device)
             
             # Policy gradient: always sample with current model
             if args.verbose:
@@ -950,7 +945,7 @@ def main():
             trajectory, adapter_log_probs_batch, ref_log_probs_batch = compute_trajectory_rewards(
                 raw_traj, 
                 adapter_model, 
-                ref_model, 
+                base_model, 
                 initial_tokens,
                 tokenizer=tokenizer,
                 verbose=args.verbose
@@ -959,25 +954,20 @@ def main():
             # Policy gradient doesn't need old model log probs
             old_log_probs_batch = adapter_log_probs_batch
 
-            # KL(adapter || reference) over key-selection distribution (for diagnostics)
-            if CONFIG.enable_reference_diagnostics:
-                kl_from_ref_value = compute_kl_from_reference(
-                    trajectory,
-                    adapter_model,
-                    base_model,
-                    tokenizer,
-                )
-                kl_keys_from_ref_value = kl_from_ref_value
-                kl_values_from_ref_value = compute_value_kl_from_reference(
-                    trajectory,
-                    adapter_model,
-                    base_model,
-                    tokenizer,
-                )
-            else:
-                kl_from_ref_value = 0.0
-                kl_keys_from_ref_value = 0.0
-                kl_values_from_ref_value = 0.0
+            # KL(adapter || reference) over key-selection distribution (diagnostics always enabled)
+            kl_from_ref_value = compute_kl_from_reference(
+                trajectory,
+                adapter_model,
+                base_model,
+                tokenizer,
+            )
+            kl_keys_from_ref_value = kl_from_ref_value
+            kl_values_from_ref_value = compute_value_kl_from_reference(
+                trajectory,
+                adapter_model,
+                base_model,
+                tokenizer,
+            )
             
             # Update reward stats
             reward_stats = update_reward_stats(reward_stats, trajectory.avg_reward)
@@ -991,7 +981,7 @@ def main():
             train_step_results = policy_gradient_train_step(
                 trajectory,
                 adapter_model,
-                ref_model,  # Kept for compatibility but not used
+                base_model,  # Reference model
                 optimizer,
                 reward_stats,
                 verbose=args.verbose,
@@ -1112,7 +1102,7 @@ def main():
                     unique_sequences = len(set(tuple(seq) for seq in trajectory_info['index_sequences']))
                     print(f"Unique sequences: {unique_sequences}/{batch_size}")
                     
-                    print("\nFirst batch item selections (first 5 steps):")
+                    print("\nSelected indices across batch (first 5 steps):")
                     for info in trajectory_info['selections'][:5]:  # Show first 5
                         print(f"  Step {info['step']}: idx={info['selected_idx']}")
                         if info['key_text']:
@@ -1122,8 +1112,8 @@ def main():
             
             # Calculate derived metrics for plotting
             traj_log_prob = adapter_log_probs_batch.mean().item()
-            # No KL penalty in chain rule approach
-            kl_penalty_term = reward_term.item() if isinstance(reward_term, torch.Tensor) else reward_term  # Use reward term for plotting
+            # KL penalty term (use diagnostic KL if available)
+            kl_penalty_term = CONFIG.kl_penalty_coefficient * kl_from_ref_value if CONFIG.kl_penalty_coefficient > 0.0 else 0.0
             # Compute reward variance (handle single batch case)
             if trajectory.avg_reward.numel() > 1:
                 reward_var = trajectory.avg_reward.var().item()
@@ -1274,9 +1264,6 @@ def main():
             if episode > 0 and episode % 15 == 0:
                 # Add metadata to plot data and save
                 metadata = create_metadata(episode, {
-                    'GAMMA': CONFIG.gamma,
-        
-                    'TEMPERATURE': CONFIG.temperature,
                     'NUM_KV_PAIRS': CONFIG.num_kv_pairs,
                 })
                 plot_data_with_metadata = plot_data.with_metadata(metadata)
@@ -1289,20 +1276,22 @@ def main():
                 policy_term_val = policy_term.item() if isinstance(policy_term, torch.Tensor) else policy_term
                 reward_term_val = reward_term.item() if isinstance(reward_term, torch.Tensor) else reward_term
                 
-                logging.info(
+                base_msg = (
                     f"Episode {episode}/{CONFIG.num_episodes}, "
                     f"Total Loss: {total_loss:.4f}, "
                     f"Policy Term: {policy_term_val:.4f}, "
                     f"Reward Term: {reward_term_val:.4f}, "
-
                     f"Reward: {avg_reward:.4f}, "
                     f"Reward Mean: {reward_stats['mean']:.4f}, "
                     f"Reward Std: {reward_stats['std']:.4f}"
                 )
+                if CONFIG.kl_penalty_coefficient > 0.0:
+                    base_msg += f", KL Penalty (beta*D_KL): {(CONFIG.kl_penalty_coefficient * kl_from_ref_value):.4f}"
+                logging.info(base_msg)
                 
                 # Log to wandb if enabled
                 if CONFIG.enable_wandb:
-                    wandb.log({
+                    log_dict = {
                         "episode": episode,
                         "total_loss": total_loss,
                         "policy_term": policy_term_val,
@@ -1311,8 +1300,14 @@ def main():
                         "reward": avg_reward,
                         "reward_mean": reward_stats["mean"],
                         "reward_std": reward_stats["std"],
-
-                    })
+                    }
+                    if CONFIG.kl_penalty_coefficient > 0.0:
+                        log_dict.update({
+                            "kl_from_ref": kl_from_ref_value,
+                            "kl_penalty_beta": CONFIG.kl_penalty_coefficient,
+                            "kl_penalty_term": CONFIG.kl_penalty_coefficient * kl_from_ref_value,
+                        })
+                    wandb.log(log_dict)
                 
                 # Log gradient diagnostics
                 if len(plot_data.gradient_magnitudes) > 0:
@@ -1336,9 +1331,6 @@ def main():
         
         # Save final plot data and create plots
         final_metadata = create_metadata(episode, {
-            'GAMMA': CONFIG.gamma,
-
-            'TEMPERATURE': CONFIG.temperature,
             'NUM_KV_PAIRS': CONFIG.num_kv_pairs,
         })
         final_plot_data = plot_data.with_metadata(final_metadata)

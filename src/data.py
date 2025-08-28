@@ -103,6 +103,7 @@ class Trajectory(RawTrajectory):
 
 def get_tokenizer() -> PreTrainedTokenizer:
     """Get configured tokenizer."""
+    assert CONFIG.tokenizer_name, "CONFIG.tokenizer_name must be set"
     tokenizer = AutoTokenizer.from_pretrained(CONFIG.tokenizer_name)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'
@@ -111,6 +112,8 @@ def get_tokenizer() -> PreTrainedTokenizer:
 
 def tokenize_text(text: Union[str, List[str]], tokenizer: PreTrainedTokenizer) -> Union[List[int], List[List[int]]]:
     """Tokenize text into token IDs."""
+    if tokenizer is None:
+        raise ValueError("tokenizer must not be None")
     if isinstance(text, str):
         return tokenizer.encode(text, add_special_tokens=False)
     else:
@@ -203,6 +206,8 @@ def wikipedia_articles() -> Iterator[Dict]:
 
 def articles_with_sufficient_length(tokenizer: PreTrainedTokenizer) -> Iterator[Dict]:
     """Filter articles by minimum token length."""
+    if tokenizer is None:
+        raise ValueError("tokenizer must not be None")
     min_length = (CONFIG.tokens_per_key + CONFIG.tokens_per_value) * CONFIG.num_kv_pairs * CONFIG.kv_every_n
     
     def has_sufficient_tokens(article: Dict) -> bool:
@@ -214,6 +219,8 @@ def articles_with_sufficient_length(tokenizer: PreTrainedTokenizer) -> Iterator[
 
 def tokenize_articles(tokenizer: PreTrainedTokenizer, max_len: int):
     """Tokenize a batch of articles."""
+    if tokenizer is None:
+        raise ValueError("tokenizer must not be None")
     def tokenize_batch(articles: List[Dict]) -> torch.Tensor:
         texts = [article["text"] for article in articles]
         tokens = tokenizer(
@@ -230,6 +237,8 @@ def tokenize_articles(tokenizer: PreTrainedTokenizer, max_len: int):
 
 def extract_kv_pairs(tokenizer: PreTrainedTokenizer):
     """Extract key-value pairs from tokenized articles."""
+    if tokenizer is None:
+        raise ValueError("tokenizer must not be None")
     def extract_from_tokens(batch_tokens: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[List[str]], List[List[str]]]:
         chunk_size = CONFIG.tokens_per_key + CONFIG.tokens_per_value
         all_keys, all_values, all_key_texts, all_value_texts = [], [], [], []
@@ -257,6 +266,8 @@ def extract_kv_pairs(tokenizer: PreTrainedTokenizer):
 
 def compute_embeddings(embedding_fn: Callable[[torch.Tensor], torch.Tensor], batch_size: int):
     """Compute embeddings for keys in batches."""
+    if embedding_fn is None:
+        raise ValueError("embedding_fn must not be None")
     def compute_for_keys(all_keys: List[torch.Tensor]) -> List[torch.Tensor]:
         # Start timing and memory tracking for key embedding computation
         start_time = time.time()

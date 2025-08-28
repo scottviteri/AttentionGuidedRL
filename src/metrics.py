@@ -125,20 +125,21 @@ def compute_similarity_score_stats(trajectory) -> Dict[str, float]:
     """
     import torch
     all_similarities = []
-    for step in trajectory.qkv_steps:
-        if hasattr(step, 'similarity_scores') and step.similarity_scores is not None:
-            similarities = step.similarity_scores
-            probs = torch.exp(similarities)
-            all_similarities.append({
-                'mean': probs.mean().item(),
-                'std': probs.std().item(),
-                'entropy': -(probs * similarities).sum(dim=-1).mean().item(),
-                'max': probs.max().item(),
-                'min': probs.min().item()
-            })
+    for idx, step in enumerate(trajectory.qkv_steps):
+        if not hasattr(step, 'similarity_scores') or step.similarity_scores is None:
+            raise ValueError(f"Trajectory step {idx} missing similarity_scores; cannot compute stats")
+        similarities = step.similarity_scores
+        probs = torch.exp(similarities)
+        all_similarities.append({
+            'mean': probs.mean().item(),
+            'std': probs.std().item(),
+            'entropy': -(probs * similarities).sum(dim=-1).mean().item(),
+            'max': probs.max().item(),
+            'min': probs.min().item()
+        })
 
     if not all_similarities:
-        return {'mean': 0.0, 'std': 0.0, 'entropy': 0.0, 'max': 0.0, 'min': 0.0}
+        raise ValueError("No similarity_scores found in trajectory; stats unavailable")
 
     return {
         'mean': sum(s['mean'] for s in all_similarities) / len(all_similarities),

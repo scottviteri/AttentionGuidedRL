@@ -159,16 +159,17 @@ Each action receives uniform credit: the trajectory average reward $\bar{R}(\tau
 
 ## Training Algorithm
 
-**Loss Function:** The training implements the full chain rule gradient:
+**Loss Function:** The training implements the full chain rule gradient with optional KL regularization to a fixed reference policy:
 
 $$
-\mathcal{L}(\theta) = \mathbb{E}_{\text{batch}} \left[ -\frac{1}{T} \sum_{t=1}^T r_t - \bar{R}(\tau) \sum_{t=1}^T \log \pi_\theta(a_t | s_t) \right]
+\mathcal{L}(\theta) = \mathbb{E}_{\text{batch}} \left[ -\frac{1}{T} \sum_{t=1}^T r_t - \bar{R}(\tau) \sum_{t=1}^T \log \pi_\theta(a_t | s_t) + \beta\, \frac{1}{T} \sum_{t=1}^T D_{\mathrm{KL}}\!\left(\pi_\theta(\cdot\mid s_t) \parallel \pi_{\mathrm{ref}}(\cdot\mid s_t)\right) \right]
 $$
 
 where:
 - $\bar{R}(\tau) = \frac{1}{T} \sum_{t=1}^T r_t$ is the trajectory average reward
 - The first term optimizes rewards directly via $\nabla_\theta r_t$
 - The second term is the trajectory-average weighted policy gradient
+- The third term is an optional KL regularizer towards a fixed reference policy with coefficient $\beta \ge 0$
 
 **Algorithm:**
 

@@ -239,6 +239,8 @@ def setup_model_and_tokenizer():
     # Apply LoRA adapter to a deepcopy of the base model
     adapter_model = apply_lora_adapter(copy.deepcopy(base_model))
     # Load the tokenizer
+    if not CONFIG.tokenizer_name:
+        raise ValueError("CONFIG.tokenizer_name must be set")
     tokenizer = AutoTokenizer.from_pretrained(CONFIG.tokenizer_name)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'  # Set padding side to left for decoder-only models
