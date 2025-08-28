@@ -472,6 +472,7 @@ def parse_args():
     # Configuration parameters
     parser.add_argument('--enable-wandb', action='store_true', help='Enable Weights & Biases logging')
     parser.add_argument('--no-subtract-base-logprobs', action='store_true', help='Disable base model logprob subtraction (reward uses raw adapter logprobs)')
+    parser.add_argument('--use-grpo', action='store_true', help='Enable GRPO-style centered baseline (default OFF)')
     parser.add_argument('--disable-grpo', action='store_true', help='Disable GRPO-style centered baseline (use uncentered rewards)')
     parser.add_argument('--force-linear-order', action='store_true', help='Always pick keys in linear order (disable sampling)')
     parser.add_argument('--freeze-policy', action='store_true', help='Do not update policy parameters (freeze policy gradient)')
@@ -767,6 +768,7 @@ def main():
         logging.info("- adapter_model: LoRA adapter (trainable)")
         logging.info("- ref_model: Reference model (pi_ref, for reward computation)")
         logging.info(f"- Batching: Enabled (repeat each data point {CONFIG.batch_size} times)")
+        logging.info(f"- GRPO: {'ON' if CONFIG.use_grpo else 'OFF'} (batch repetition is independent of GRPO)")
         
         # Function to compute gradient statistics
         def get_gradient_stats(model):

@@ -49,7 +49,7 @@ class TrainingConfig:
     
     # Training behavior
     subtract_base_model_logprobs: bool = True
-    use_grpo: bool = True  # Enable GRPO-style centered baseline by default
+    use_grpo: bool = False  # GRPO off by default; enable via --use-grpo
     kl_penalty_coefficient: float = 0.0
     # PPO/GAE removed (not used)
     
@@ -141,8 +141,13 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
     num_kv_pairs = min(num_kv_pairs, 10)  # Cap for reasonable trajectory length
     
     # Apply CLI overrides with fallback to defaults
-    # Resolve GRPO usage from CLI (default: True; disable with --disable-grpo)
-    use_grpo = False if getattr(args, 'disable_grpo', False) else True
+    # Resolve GRPO usage from CLI (default: OFF; enable with --use-grpo)
+    if getattr(args, 'use_grpo', False):
+        use_grpo = True
+    elif getattr(args, 'disable_grpo', False):
+        use_grpo = False
+    else:
+        use_grpo = base_config.use_grpo
     # Resolve subtract_base_model_logprobs with explicit disable flag
     subtract_base = False if getattr(args, 'no_subtract_base_logprobs', False) else True
     # Resolve differentiable rewards with explicit disable flag
