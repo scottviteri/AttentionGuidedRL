@@ -187,7 +187,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         'avg_advantages', 'trajectory_log_probs', 'wikipedia_order_consistency',
         'kl_penalty_terms', 'reward_variance', 'gradient_magnitudes',
         'step_log_probs', 'policy_gradients', 'clipping_ratios',
-        'kl_from_ref', 'batch_selection_entropy',
+        'kl_values_from_ref', 'batch_selection_entropy',
         'lora_layer_gradients', 'advantage_distributions', 'similarity_score_stats'
     ]
     
@@ -204,6 +204,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     policy_losses = smooth_data(data['policy_losses'][:min_length], smooth_window)
     kl_losses = smooth_data(data['kl_losses'][:min_length], smooth_window)
     avg_rewards = smooth_data(data['avg_rewards'][:min_length], smooth_window)
+    avg_centered_rewards = smooth_data(data.get('avg_centered_rewards', [0.0] * min_length)[:min_length], smooth_window)
     adapter_log_probs = smooth_data(data['adapter_log_probs'][:min_length], smooth_window)
     baseline_log_probs = smooth_data(data['baseline_log_probs'][:min_length], smooth_window)
     base_log_probs = smooth_data(data['base_log_probs'][:min_length], smooth_window)
@@ -217,7 +218,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     step_selected_indices = data.get('step_selected_indices', [])
     policy_gradients = smooth_data(data['policy_gradients'][:min_length], smooth_window)
     clipping_ratios = smooth_data(data['clipping_ratios'][:min_length], smooth_window)
-    kl_from_ref = smooth_data(data['kl_from_ref'][:min_length], smooth_window)
+    kl_values_from_ref = smooth_data(data['kl_values_from_ref'][:min_length], smooth_window)
     batch_selection_entropy = smooth_data(data['batch_selection_entropy'][:min_length], smooth_window)
     
     # Enhanced debugging metrics (required)
@@ -249,12 +250,14 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[0].legend(fontsize=8)
     axes[0].grid(True, alpha=0.3)
     
-    # Plot 2: Rewards with Baseline Update Markers
-    axes[1].plot(training_steps, avg_rewards, 'purple', linewidth=2)
+    # Plot 2: Rewards (uncentered vs centered) with Baseline Update Markers
+    axes[1].plot(training_steps, avg_rewards, color='purple', linewidth=2, label='Avg Reward (Adapter - Ref)')
+    axes[1].plot(training_steps, avg_centered_rewards, color='green', linewidth=1.5, linestyle='--', label='Avg Centered Reward (GRPO)')
     axes[1].set_xlabel('Training Step')
-    axes[1].set_ylabel('Average Reward')
-    axes[1].set_title(f'Average Reward (Baseline Updates Marked){title_suffix}')
+    axes[1].set_ylabel('Reward')
+    axes[1].set_title(f'Reward: Uncentered vs Centered{title_suffix}')
     axes[1].grid(True, alpha=0.3)
+    axes[1].legend(fontsize=8)
     if len(training_steps) > 10:
         z = np.polyfit(training_steps, avg_rewards, 1)
         p = np.poly1d(z)
@@ -277,19 +280,22 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[2].legend(fontsize=8)
     axes[2].grid(True, alpha=0.3)
     
-    # Plot 4: Chain Rule Component Analysis
-    policy_term_abs = [abs(x) for x in policy_term_values]
-    reward_term_abs = [abs(x) for x in reward_term_values]
-    
-    axes[3].plot(training_steps, policy_term_abs, 'green', linewidth=2, label=r'$|R_\theta(\tau) \cdot \nabla\log\pi_\theta(\tau)|$')
-    axes[3].plot(training_steps, reward_term_abs, 'red', linewidth=2, label=r'$|\nabla R_\theta(\tau)|$')
-    axes[3].plot(training_steps, policy_reward_ratio, 'blue', linewidth=1.5, linestyle='--', label='Policy/Reward Ratio')
+    # Plot 4: Centered Reward Diagnostic
+    # Show average uncentered reward, zero baseline, centered reward, and reward std dev
+    try:
+        import numpy as _np
+        reward_std = [(_v ** 0.5) for _v in reward_variance]
+    except Exception:
+        reward_std = [0.0] * len(training_steps)
+    axes[3].plot(training_steps, avg_rewards, color='purple', linewidth=2, label='Avg Reward (Adapter - Ref)')
+    axes[3].plot(training_steps, avg_centered_rewards, color='green', linewidth=1.5, linestyle='--', label='Avg Centered Reward (GRPO)')
+    axes[3].plot(training_steps, [0.0] * len(training_steps), 'k--', alpha=0.5, label='Zero Baseline')
+    axes[3].plot(training_steps, reward_std, color='gray', linewidth=1.5, linestyle=':', label='Reward Std Dev')
     axes[3].set_xlabel('Training Step')
-    axes[3].set_ylabel('Magnitude')
-    axes[3].set_title(f'Chain Rule Component Magnitudes{title_suffix}')
+    axes[3].set_ylabel('Reward')
+    axes[3].set_title(f'Reward Centering Diagnostic{title_suffix}')
     axes[3].legend(fontsize=8)
     axes[3].grid(True, alpha=0.3)
-    axes[3].set_yscale('log')
     
     # Plot 5: Gradient Norm
     axes[4].plot(training_steps, gradient_magnitudes, 'red', linewidth=2)
@@ -317,15 +323,11 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[5].grid(True, alpha=0.3)
     
     # Plot 7: KL Divergence from Reference (diagnostic)
-    kl_keys = data.get('kl_keys_from_ref', [])
     kl_values = data.get('kl_values_from_ref', [])
-    if kl_keys and len(kl_keys) == len(training_steps):
-        axes[6].plot(training_steps, kl_keys, label='KL (keys)', color='darkred', linewidth=2)
     if kl_values and len(kl_values) == len(training_steps):
         axes[6].plot(training_steps, kl_values, label='KL (values)', color='orange', linewidth=2)
-    if (not kl_keys) and (not kl_values):
-        # Back-compat: single series
-        axes[6].plot(training_steps, kl_from_ref, label='KL (keys)', color='darkred', linewidth=2)
+    else:
+        axes[6].text(0.5, 0.5, 'No KL (values) data available', ha='center', va='center', transform=axes[6].transAxes)
     axes[6].set_xlabel('Training Step')
     axes[6].set_ylabel('KL Divergence')
     axes[6].set_title(f'KL Divergence from Reference Model (diagnostic){title_suffix}')

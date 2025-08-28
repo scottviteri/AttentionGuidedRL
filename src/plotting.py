@@ -26,6 +26,8 @@ class PlotData:
     policy_losses: List[float] = field(default_factory=list)
     kl_losses: List[float] = field(default_factory=list)
     avg_rewards: List[float] = field(default_factory=list)
+    # New: batch-centered reward (GRPO) per episode (mean after centering). Typically ~0.
+    avg_centered_rewards: List[float] = field(default_factory=list)
     
     # Model log probabilities
     adapter_log_probs: List[float] = field(default_factory=list)
@@ -76,6 +78,7 @@ class PlotData:
         policy_loss: float,
         kl_loss: float,
         avg_reward: float,
+        avg_centered_reward: float,
         adapter_log_prob: float,
         baseline_log_prob: float,
         base_log_prob: float,
@@ -134,6 +137,7 @@ class PlotData:
         new_policy_losses = self.policy_losses + [policy_loss]
         new_kl_losses = self.kl_losses + [kl_loss]
         new_avg_rewards = self.avg_rewards + [avg_reward]
+        new_avg_centered_rewards = self.avg_centered_rewards + [avg_centered_reward]
         new_adapter_log_probs = self.adapter_log_probs + [adapter_log_prob]
         new_baseline_log_probs = self.baseline_log_probs + [baseline_log_prob]
         new_base_log_probs = self.base_log_probs + [base_log_prob]
@@ -187,6 +191,7 @@ class PlotData:
             policy_losses=new_policy_losses,
             kl_losses=new_kl_losses,
             avg_rewards=new_avg_rewards,
+            avg_centered_rewards=new_avg_centered_rewards,
             adapter_log_probs=new_adapter_log_probs,
             baseline_log_probs=new_baseline_log_probs,
             base_log_probs=new_base_log_probs,

@@ -189,10 +189,10 @@ Each action receives uniform credit: the trajectory average reward $\bar{R}(\tau
 
 \section{Training Algorithm}
 
-\textbf{Loss Function:} The training implements the full chain rule gradient with optional KL regularization to a fixed reference policy:
+\textbf{Loss Function:} The training implements the full chain rule gradient with optional KL regularization on value-token distributions against a fixed reference model:
 
 \begin{align}
-\mathcal{L}(\theta) = \mathbb{E}_{\text{batch}} \left[ -\frac{1}{T} \sum_{t=1}^T r_\theta^t - \operatorname{sg}\!\left[\bar{R}(\tau)\right] \sum_{t=1}^T \log \pi_\theta(a_t | s_t) + \beta\, \frac{1}{T} \sum_{t=1}^T D_{\mathrm{KL}}\!\left(\pi_\theta(\cdot\mid s_t) \parallel \pi_{\mathrm{ref}}(\cdot\mid s_t)\right) \right]
+\mathcal{L}(\theta) = \mathbb{E}_{\text{batch}} \left[ -\frac{1}{T} \sum_{t=1}^T r_\theta^t - \operatorname{sg}\!\left[\bar{R}(\tau)\right] \sum_{t=1}^T \log \pi_\theta(a_t | s_t) + \beta\, \frac{1}{T} \sum_{t=1}^T D_{\mathrm{KL}}\!\left(p_\theta( v_t\mid c_t, k_t ) \parallel p_{\mathrm{ref}}( v_t\mid c_t, k_t )\right) \right]
 \end{align}
 
 where:
@@ -200,7 +200,7 @@ where:
     \item $\bar{R}(\tau) = \frac{1}{T} \sum_{t=1}^T r_\theta^t$ is the trajectory average reward
     \item The first term optimizes rewards directly via $\nabla_\theta r_\theta^t$
     \item The second term is the trajectory-average weighted policy gradient
-    \item The third term is an optional KL regularizer towards a fixed reference policy with coefficient $\beta \ge 0$
+    \item The third term is an optional KL regularizer on value-token distributions with coefficient $\beta \ge 0$
 \end{itemize}
 
 \begin{algorithm}

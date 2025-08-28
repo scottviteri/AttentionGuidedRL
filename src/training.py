@@ -490,18 +490,8 @@ def compute_policy_loss(
 
         old_action_log_probs = old_log_probs_full[torch.arange(batch_size, device=device), selected_idx]
 
-        # --- Compute reference-policy log-probabilities for KL divergence ---
-        with torch.no_grad():
-            ref_query_emb = generate_query_vector(ref_model, tokenizer, context_tokens, layer_idx=-2)
-            # Get attention parameters from the reference model
-            ref_num_heads, ref_num_groups, ref_head_dim = get_attention_params(ref_model)
-            # Apply same availability mask inside compute_similarity
-            ref_similarities = compute_similarity(ref_query_emb, key_embs_full, ref_num_heads, ref_num_groups, ref_head_dim,
-                                                availability_mask=availability_mask)
-            ref_log_probs_full = ref_similarities
-
-        # Compute KL divergence between current and reference policies over available keys (masked)
-        kl_step = F.kl_div(current_log_probs_full, ref_log_probs_full, reduction="batchmean", log_target=True)
+        # Key-selection KL removed: no KL contribution at the key-selection level
+        kl_step = torch.tensor(0.0, device=device, requires_grad=True)
 
         # Detach advantage weights for the policy term (baseline acts as a constant)
         step_advantages = advantages[:, t].detach().to(device)
@@ -534,7 +524,6 @@ def compute_policy_loss(
             if verbose and t == 0:  # Print info for first step
                 print(f"PPO ratio mean: {ratio.mean().item():.4f}, std: {ratio.std().item():.4f}")
                 print(f"Clipped ratio range: [{clipped_ratio.min().item():.4f}, {clipped_ratio.max().item():.4f}]")
-                print(f"KL divergence vs ref (masked): {kl_step.item():.4f}")
         else:
             # Vanilla Policy Gradient (REINFORCE): No ratio clipping
             # Direct policy gradient: log π(a|s) * A(s,a)
@@ -547,7 +536,6 @@ def compute_policy_loss(
             if verbose and t == 0:  # Print info for first step
                 print(f"Vanilla PG: log_prob mean: {current_action_log_probs.mean().item():.4f}")
                 print(f"Advantages mean: {step_advantages.mean().item():.4f}, std: {step_advantages.std().item():.4f}")
-                print(f"KL divergence vs ref (masked): {kl_step.item():.4f}")
         
         policy_loss = policy_loss + batch_policy_gradient  # Accumulate across timesteps
         
@@ -563,7 +551,7 @@ def compute_policy_loss(
     if count > 0:
         # Sum policy loss across trajectory steps (not average)
         total_policy_loss = policy_loss  # Already summed
-        total_kl_loss = kl_loss / count  # Average KL loss across steps
+        total_kl_loss = torch.tensor(0.0, device=device, requires_grad=True)  # Key-selection KL removed
         
         # Convert to loss: negate policy gradient (since we want to maximize expected reward)
         # and add KL penalty (since we want to minimize divergence)
@@ -578,10 +566,7 @@ def compute_policy_loss(
             print(f"\n=== {method_name} Loss Components ===")
             print(f"Policy gradient sum (before negation): {-total_policy_loss.item():.4f}")
             print(f"Policy loss (after negation): {total_policy_loss.item():.4f}")
-            print(f"KL divergence loss: {total_kl_loss.item():.4f}")
-            print(f"KL penalty coefficient: {kl_penalty_coef:.4f}")
             print(f"Total loss: {total_loss.item():.4f}")
-            print(f"  = {total_policy_loss.item():.4f} + {kl_penalty_term.item():.4f}")
             print(f"Method: Vanilla Policy Gradient (no clipping)")
             print(f"=== End {method_name} Loss Components ===\n")
             

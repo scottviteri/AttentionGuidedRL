@@ -144,32 +144,6 @@ def policy_gradient_train_step(
         policy_gradient_t = step_advantages * current_action_log_probs
         policy_term = policy_term + policy_gradient_t.sum()  # Sum over batch
         
-        # === KL REGULARIZATION TERM: D_KL(π_θ(·|s_t) || π_ref(·|s_t)) ===
-        if CONFIG.kl_penalty_coefficient > 0.0:
-            # Compute reference distribution over keys using the same context and mask (no gradient)
-            with torch.no_grad():
-                sep_for_ref = tokenizer([CONFIG.chunk_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-                ref_query_context = torch.cat([current_context, sep_for_ref], dim=1)
-                ref_query_emb = generate_query_vector(
-                    ref_model,
-                    tokenizer,
-                    ref_query_context,
-                    layer_idx=-2
-                )
-                ref_num_heads, ref_num_groups, ref_head_dim = get_attention_params(ref_model)
-                ref_similarities = compute_similarity(
-                    ref_query_emb,
-                    trajectory.all_key_embeddings,
-                    ref_num_heads,
-                    ref_num_groups,
-                    ref_head_dim,
-                    availability_mask=qkv_step.available_mask if hasattr(qkv_step, 'available_mask') else None
-                )
-            # KL in log-space: both inputs are log-probabilities
-            kl_step = F.kl_div(current_similarities, ref_similarities, reduction="batchmean", log_target=True)
-            kl_loss_term = kl_loss_term + kl_step
-            kl_count += 1
-
         # === REWARD GRADIENT TERM: ∇_θ r_{θ,t} ===
         # Prepare context for reward computation
         sep_tokens = tokenizer([CONFIG.chunk_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
@@ -182,6 +156,27 @@ def policy_gradient_train_step(
             qkv_step.key_tokens.to(device),
             kv_sep_tokens
         ], dim=1)
+
+        # === KL REGULARIZATION TERM (Value tokens): D_KL(p_θ(v_t|context) || p_ref(v_t|context)) ===
+        if CONFIG.kl_penalty_coefficient > 0.0:
+            # Adapter logits for value tokens (enable grad)
+            adapter_full = torch.cat([reward_context, qkv_step.value_tokens.to(device)], dim=1)
+            adapter_logits = adapter_model(adapter_full).logits
+            ctx_len = reward_context.shape[1]
+            adapter_token_logits = adapter_logits[:, ctx_len-1:ctx_len + qkv_step.value_tokens.shape[1] - 1, :]
+            adapter_log_probs = F.log_softmax(adapter_token_logits, dim=-1)
+
+            # Reference logits (no grad)
+            with torch.no_grad():
+                ref_full = adapter_full  # same sequence
+                ref_logits = ref_model(ref_full).logits
+                ref_token_logits = ref_logits[:, ctx_len-1:ctx_len + qkv_step.value_tokens.shape[1] - 1, :]
+                ref_log_probs = F.log_softmax(ref_token_logits, dim=-1)
+
+            # KL over tokens, average across batch and tokens
+            kl_step = F.kl_div(adapter_log_probs, ref_log_probs, reduction="batchmean", log_target=True)
+            kl_loss_term = kl_loss_term + kl_step
+            kl_count += 1
         
         # Recompute reward differentiably if enabled; otherwise fall back to cached rewards
         if CONFIG.differentiable_rewards:
@@ -588,76 +583,7 @@ def test_edit_distance_function():
     return all_passed
 
 
-def compute_kl_from_reference(
-    trajectory: "Trajectory",
-    adapter_model: torch.nn.Module,
-    ref_model: torch.nn.Module,
-    tokenizer,
-) -> float:
-    """Compute KL(adapter || ref) over the key-selection distribution for an entire trajectory.
-
-    The adapter distribution is already stored in ``step.similarity_scores``.
-    We rebuild the reference distribution by generating a query vector with ``ref_model``
-    at each timestep and re-using the stored key embeddings / availability mask.
-
-    Returns
-    -------
-    float
-        Average KL divergence across all steps in the trajectory (batch-mean inside each step).
-    """
-    all_key_embs = getattr(trajectory, "all_key_embeddings", None)
-    if not isinstance(all_key_embs, torch.Tensor):
-        raise TypeError(f"trajectory.all_key_embeddings must be a torch.Tensor, got {type(all_key_embs)}")
-    
-
-
-    # Ensure context_tokens from tokenizer is a real tensor (unit-tests may return MagicMocks)
-    device = next(adapter_model.parameters()).device
-    batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
-
-    # Start with empty context; queries are triggered by SEP token appends
-    context_tokens = torch.zeros((batch_size, 0), dtype=torch.long, device=device)
-
-    kl_vals = []
-
-    # Iterate step-by-step so we respect the autoregressive context growth
-    for step in trajectory.qkv_steps:
-        # 1) Adapter distribution (already computed)
-        adapter_log_probs = step.similarity_scores
-
-        # 2) Reference distribution – build a query vector, compute similarities, apply mask
-        with torch.no_grad():
-            sep_for_ref = tokenizer([CONFIG.chunk_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-            ref_query_context = torch.cat([context_tokens, sep_for_ref], dim=1)
-            ref_query = generate_query_vector(ref_model, tokenizer, ref_query_context, layer_idx=-2)
-            key_embs_full = all_key_embs.to(device)
-            # Get attention parameters from the reference model
-            num_heads, num_groups, head_dim = get_attention_params(ref_model)
-            # Apply availability mask inside compute_similarity for proper probability distribution
-            availability_mask = step.available_mask if hasattr(step, "available_mask") else None
-            ref_sims = compute_similarity(ref_query, key_embs_full, num_heads, num_groups, head_dim,
-                                        availability_mask=availability_mask)  # [B, K]
-
-        ref_log_probs = ref_sims
-
-        # 3) KL(adapter || ref) in log-space.  "log_target=True" expects both inputs are log-probs.
-        kl_step = F.kl_div(adapter_log_probs, ref_log_probs, reduction="batchmean", log_target=True)
-        kl_vals.append(kl_step.item())
-
-        # 4) Advance context for next timestep using only separators
-        kv = tokenizer([CONFIG.kv_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-        sep = tokenizer([CONFIG.chunk_separator] * batch_size, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-        context_tokens = torch.cat([
-            context_tokens,
-            step.key_tokens.to(device),
-            kv,
-            step.value_tokens.to(device),
-            sep,
-        ], dim=1)
-
-    if not kl_vals:
-        return 0.0
-    return sum(kl_vals) / len(kl_vals)
+# Removed legacy key-selection KL function. Value-KL diagnostics retained below.
 
 
 def compute_value_kl_from_reference(
@@ -958,20 +884,15 @@ def main():
             # Policy gradient doesn't need old model log probs
             old_log_probs_batch = adapter_log_probs_batch
 
-            # KL(adapter || reference) over key-selection distribution (diagnostics always enabled)
-            kl_from_ref_value = compute_kl_from_reference(
-                trajectory,
-                adapter_model,
-                base_model,
-                tokenizer,
-            )
-            kl_keys_from_ref_value = kl_from_ref_value
+            # KL diagnostics: only value-token KL
+            kl_keys_from_ref_value = 0.0
             kl_values_from_ref_value = compute_value_kl_from_reference(
                 trajectory,
                 adapter_model,
                 base_model,
                 tokenizer,
             )
+            kl_from_ref_value = kl_values_from_ref_value
             
             # Update reward stats
             reward_stats = update_reward_stats(reward_stats, trajectory.avg_reward)
@@ -1225,12 +1146,19 @@ def main():
                     step_selected_indices_episode.append(selected_idx.float().mean().item())
             # Add episode data to plot_data using the clean functional approach
             trajectory_sample = trajectory_info if (episode % 50 == 0 or episode < 5) and 'trajectory_info' in locals() else None
+            # Compute centered reward for plotting (for clarity only)
+            centered_reward = 0.0
+            if trajectory.avg_reward is not None:
+                centered = trajectory.avg_reward - trajectory.avg_reward.mean()
+                centered_reward = centered.mean().item()
+
             plot_data = plot_data.add_episode_data(
                 episode=episode,
                 total_loss=total_loss,
                 policy_loss=policy_term.item() if isinstance(policy_term, torch.Tensor) else policy_term,
                 kl_loss=0.0,  # No KL loss in chain rule approach
                 avg_reward=avg_reward,
+                avg_centered_reward=centered_reward,
                 adapter_log_prob=adapter_log_prob,
                 baseline_log_prob=baseline_log_prob,
                 base_log_prob=base_log_prob,
