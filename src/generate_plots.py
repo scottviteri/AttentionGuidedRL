@@ -215,22 +215,35 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     reward_variance = smooth_data(data['reward_variance'][:min_length], smooth_window)
     gradient_magnitudes = smooth_data(data['gradient_magnitudes'][:min_length], smooth_window)
     step_log_probs = data.get('step_log_probs', [])
+    # Prefer directly-logged step_selected_indices when available; otherwise fill from trajectory_samples
     step_selected_indices = data.get('step_selected_indices', [])
-    # Fallback: reconstruct step_selected_indices from trajectory_samples if missing
-    if (not step_selected_indices) and data.get('trajectory_samples'):
+    # Normalize length to training_steps
+    if len(step_selected_indices) < len(training_steps):
+        step_selected_indices = step_selected_indices + [[] for _ in range(len(training_steps) - len(step_selected_indices))]
+    elif len(step_selected_indices) > len(training_steps):
+        step_selected_indices = step_selected_indices[:len(training_steps)]
+
+    # Determine if we need fallback (all episodes empty or list entirely missing)
+    need_fallback = (not step_selected_indices) or (not any(len(ep) > 0 for ep in step_selected_indices))
+    if need_fallback or data.get('trajectory_samples'):
         samples = data.get('trajectory_samples', [])
-        # Initialize with empty lists per episode
-        step_selected_indices = [[] for _ in range(len(training_steps))]
+        # Build per-episode averages from index_sequences
+        derived_by_episode = {}
         for sample in samples:
             ep = sample.get('episode')
             idx_seqs = sample.get('index_sequences', [])
             if isinstance(ep, int) and 0 <= ep < len(training_steps) and idx_seqs:
-                # Compute average selected index across batch for each step
                 maxlen = max((len(seq) for seq in idx_seqs if seq), default=0)
                 avgs = []
                 for s_idx in range(maxlen):
                     vals = [seq[s_idx] for seq in idx_seqs if len(seq) > s_idx]
                     avgs.append(float(np.mean(vals)) if vals else 0.0)
+                derived_by_episode[ep] = avgs
+        # If we need fallback entirely, replace; otherwise fill only missing episodes
+        if need_fallback:
+            step_selected_indices = [[] for _ in range(len(training_steps))]
+        for ep, avgs in derived_by_episode.items():
+            if need_fallback or (ep < len(step_selected_indices) and not step_selected_indices[ep]):
                 step_selected_indices[ep] = avgs
     policy_gradients = smooth_data(data['policy_gradients'][:min_length], smooth_window)
     clipping_ratios = smooth_data(data['clipping_ratios'][:min_length], smooth_window)
@@ -266,19 +279,26 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[0].legend(fontsize=8)
     axes[0].grid(True, alpha=0.3)
     
-    # Plot 2: Rewards (uncentered vs centered) with Baseline Update Markers
-    axes[1].plot(training_steps, avg_rewards, color='purple', linewidth=2, label='Avg Reward (Adapter - Ref)')
-    axes[1].plot(training_steps, avg_centered_rewards, color='green', linewidth=1.5, linestyle='--', label='Avg Centered Reward (GRPO)')
+    # Plot 2: Reward Centering Diagnostic (moved here)
+    # Apply 2x smoothing specifically for this subplot
+    _win_2x = max(1, 2 * smooth_window)
+    avg_rewards_2x = smooth_data(data['avg_rewards'][:min_length], _win_2x)
+    avg_centered_rewards_2x = smooth_data(data.get('avg_centered_rewards', [0.0] * min_length)[:min_length], _win_2x)
+    try:
+        import numpy as _np
+        reward_std_diag = [(_v ** 0.5) for _v in reward_variance]
+        reward_std_diag = smooth_data(reward_std_diag[:min_length], _win_2x)
+    except Exception:
+        reward_std_diag = [0.0] * len(training_steps)
+    axes[1].plot(training_steps, avg_rewards_2x, color='purple', linewidth=2, label='Avg Reward (Adapter - Ref)')
+    axes[1].plot(training_steps, avg_centered_rewards_2x, color='green', linewidth=1.5, linestyle='--', label='Avg Centered Reward (GRPO)')
+    axes[1].plot(training_steps, [0.0] * len(training_steps), 'k--', alpha=0.5, label='Zero Baseline')
+    axes[1].plot(training_steps, reward_std_diag, color='gray', linewidth=1.5, linestyle=':', label='Reward Std Dev')
     axes[1].set_xlabel('Training Step')
     axes[1].set_ylabel('Reward')
-    axes[1].set_title(f'Reward: Uncentered vs Centered{title_suffix}')
+    axes[1].set_title(f'Reward Centering Diagnostic{title_suffix}')
     axes[1].grid(True, alpha=0.3)
     axes[1].legend(fontsize=8)
-    if len(training_steps) > 10:
-        z = np.polyfit(training_steps, avg_rewards, 1)
-        p = np.poly1d(z)
-        axes[1].plot(training_steps, p(training_steps), "k--", alpha=0.5, label=f'Trend (slope={z[0]:.2e})')
-        axes[1].legend(fontsize=8)
     
     # Add baseline update markers
     BASELINE_UPDATE_FREQUENCY = config.get('BASELINE_UPDATE_FREQUENCY', 10)
@@ -286,9 +306,8 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
         if episode <= max(training_steps):
             axes[1].axvline(x=episode, color='red', linestyle='--', alpha=0.6, linewidth=1)
     
-    # Plot 3: θ-Dependent Step Rewards  
+    # Plot 3: θ-Dependent Step Rewards  (adapter vs reference)
     axes[2].plot(training_steps, adapter_log_probs, 'darkgreen', label=r'$r_{\theta,t}$ (Adapter)', linewidth=2)
-    axes[2].plot(training_steps, baseline_log_probs, 'orange', label=r'$r_{\theta,t}$ (Baseline)', linewidth=2)
     axes[2].plot(training_steps, base_log_probs, 'blue', label=r'$r_{\theta,t}$ (Reference)', linewidth=2)
     axes[2].set_xlabel('Training Step')
     axes[2].set_ylabel(r'$r_{\theta,t} = \log p_\theta(v_t | c_t, k_t)$')
@@ -296,20 +315,17 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[2].legend(fontsize=8)
     axes[2].grid(True, alpha=0.3)
     
-    # Plot 4: Centered Reward Diagnostic
-    # Show average uncentered reward, zero baseline, centered reward, and reward std dev
+    # Plot 4: New - Action Selection Entropy (mean over steps)
+    # Use similarity_score_stats['entropy'] as a proxy for policy entropy over steps
     try:
-        import numpy as _np
-        reward_std = [(_v ** 0.5) for _v in reward_variance]
+        entropies_over_time = [s['entropy'] for s in similarity_score_stats]
     except Exception:
-        reward_std = [0.0] * len(training_steps)
-    axes[3].plot(training_steps, avg_rewards, color='purple', linewidth=2, label='Avg Reward (Adapter - Ref)')
-    axes[3].plot(training_steps, avg_centered_rewards, color='green', linewidth=1.5, linestyle='--', label='Avg Centered Reward (GRPO)')
-    axes[3].plot(training_steps, [0.0] * len(training_steps), 'k--', alpha=0.5, label='Zero Baseline')
-    axes[3].plot(training_steps, reward_std, color='gray', linewidth=1.5, linestyle=':', label='Reward Std Dev')
+        entropies_over_time = [0.0] * len(training_steps)
+    entropies_smoothed = smooth_data(entropies_over_time[:min_length], smooth_window)
+    axes[3].plot(training_steps, entropies_smoothed, color='navy', linewidth=2, label='Mean Selection Entropy')
     axes[3].set_xlabel('Training Step')
-    axes[3].set_ylabel('Reward')
-    axes[3].set_title(f'Reward Centering Diagnostic{title_suffix}')
+    axes[3].set_ylabel('Entropy (nats)')
+    axes[3].set_title(f'Action Selection Entropy Over Time{title_suffix}')
     axes[3].legend(fontsize=8)
     axes[3].grid(True, alpha=0.3)
     
@@ -490,11 +506,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[11].legend(fontsize=7)
     axes[11].grid(True, alpha=0.3)
     
-    # Add baseline update markers
-    BASELINE_UPDATE_FREQUENCY = config.get('BASELINE_UPDATE_FREQUENCY', 10)
-    for episode in range(BASELINE_UPDATE_FREQUENCY, max(training_steps) + 1, BASELINE_UPDATE_FREQUENCY):
-        if episode <= max(training_steps):
-            axes[11].axvline(x=episode, color='orange', linestyle=':', alpha=0.6, linewidth=1)
+    # (Removed baseline update markers from Advantage Distribution to reduce visual clutter)
     
     # Adjust layout
     plt.tight_layout(pad=2.0)
@@ -779,11 +791,11 @@ def main():
     if args.kl_coef is not None:
         custom_config['KL_PENALTY_COEFFICIENT'] = args.kl_coef
     
-    # Determine effective smoothing window (dynamic default)
+    # Determine effective smoothing window (dynamic default). Double the previous default.
     if args.smooth_window is None:
         training_steps = data.get('training_steps', [])
         current_step = training_steps[-1] if training_steps else 0
-        effective_window = max(1, int(current_step // 50))
+        effective_window = max(1, 2 * int(current_step // 50))
     else:
         effective_window = args.smooth_window
 

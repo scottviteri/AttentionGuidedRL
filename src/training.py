@@ -299,33 +299,23 @@ def update_reward_stats(
 
 def compute_returns(rewards: torch.Tensor) -> torch.Tensor:
     """
-    Placeholder for compatibility; returns are equal to rewards here.
+    Compute simple undiscounted returns-from-t: G_t = sum_{k=t}^T r_k
+    Args:
+        rewards: Tensor [batch_size, num_steps]
+    Returns:
+        Tensor of same shape with returns-from-t
     """
-    return rewards.clone()
+    return torch.flip(torch.cumsum(torch.flip(rewards, dims=[1]), dim=1), dims=[1])
 
 
 def compute_advantages(
     rewards: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute advantages using trajectory average (simple baseline).
-    
-    Args:
-        rewards: Tensor of rewards [batch_size, num_steps]
-        
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: (advantages, returns)
+    Compute returns-from-t and use as default advantages (baseline handled in caller).
     """
-    # Compute per-trajectory average reward
-    trajectory_avg = rewards.mean(dim=1, keepdim=True)  # [batch_size, 1]
-    # Broadcast to all steps
-    avg_expanded = trajectory_avg.expand_as(rewards)  # [batch_size, num_steps]
-    
-    # Centering decision deferred to training loop via CONFIG.use_grpo
-    # Here we return uncentered returns and uncentered "advantages" by default
-    advantages = avg_expanded
-    returns = avg_expanded.clone()
-
+    returns = compute_returns(rewards)
+    advantages = returns.clone()
     return advantages, returns
 
 

@@ -46,6 +46,7 @@ class TrainingConfig:
     
     # RL-specific parameters (minimal)
     differentiable_rewards: bool = True   # Enable chain-rule reward gradients
+    use_returns_from_t: bool = True       # Use return-from-t for policy weighting by default
     
     # Training behavior
     subtract_base_model_logprobs: bool = True
@@ -166,6 +167,7 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
         
         # RL parameters (CLI overrides or defaults)
         differentiable_rewards=differentiable_rewards,
+        use_returns_from_t=not getattr(args, 'use_reward_at_t', False) if hasattr(args, 'use_reward_at_t') else base_config.use_returns_from_t,
         kl_penalty_coefficient=getattr(args, 'kl_penalty_coefficient', None) if getattr(args, 'kl_penalty_coefficient', None) is not None else base_config.kl_penalty_coefficient,
         
         # Training behavior (CLI overrides or defaults)

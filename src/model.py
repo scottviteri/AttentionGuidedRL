@@ -249,11 +249,11 @@ def setup_model_and_tokenizer():
     sep_ids = tokenizer.encode(CONFIG.chunk_separator, add_special_tokens=False)
     kv_ids = tokenizer.encode(CONFIG.kv_separator, add_special_tokens=False)
     if len(sep_ids) != 1:
-        logging.warning(f"Separator '{CONFIG.chunk_separator}' tokenizes to {len(sep_ids)} tokens: {sep_ids}")
+        logging.info(f"Separator '{CONFIG.chunk_separator}' tokenizes to {len(sep_ids)} tokens: {sep_ids}")
     else:
         logging.info(f"Separator '{CONFIG.chunk_separator}' has token ID: {sep_ids[0]}")
     if len(kv_ids) != 1:
-        logging.warning(f"KV separator '{CONFIG.kv_separator}' tokenizes to {len(kv_ids)} tokens: {kv_ids}")
+        logging.info(f"KV separator '{CONFIG.kv_separator}' tokenizes to {len(kv_ids)} tokens: {kv_ids}")
     else:
         logging.info(f"KV separator '{CONFIG.kv_separator}' has token ID: {kv_ids[0]}")
         

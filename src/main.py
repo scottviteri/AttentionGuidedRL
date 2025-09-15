@@ -97,19 +97,28 @@ def policy_gradient_train_step(
     # Initialize empty context for computing current action probabilities and rewards
     current_context = torch.zeros((batch_size, 0), dtype=torch.long, device=device)
     
-    # Use average reward over the entire trajectory for each action
+    # Determine weighting: returns-from-t or trajectory-average
     batch_size = trajectory.qkv_steps[0].key_tokens.shape[0]
     T = len(trajectory.qkv_steps)
-    
-    # Compute average reward over entire trajectory: R̄ = (1/T) * Σ_{s=1}^T r_s
-    avg_trajectory_reward = trajectory.rewards.mean(dim=1, keepdim=True)  # [batch_size, 1]
-    if CONFIG.use_grpo:
-        # Center with batch mean baseline (stop-grad in policy term)
-        batch_mean = avg_trajectory_reward.mean().detach()
-        advantages = (avg_trajectory_reward - batch_mean).detach().expand(-1, T)  # [batch_size, T]
+
+    if CONFIG.use_returns_from_t:
+        # Compute simple undiscounted returns-from-t: G_t = sum_{k=t}^T r_k
+        rewards = trajectory.rewards  # [B, T]
+        returns = torch.flip(torch.cumsum(torch.flip(rewards, dims=[1]), dim=1), dims=[1])  # [B, T]
+        if CONFIG.use_grpo:
+            # Center per-step across batch for variance reduction
+            batch_means = returns.mean(dim=0, keepdim=True).detach()  # [1, T]
+            advantages = (returns - batch_means).detach()
+        else:
+            advantages = returns.detach()
     else:
-        # Uncentered uniform credit assignment
-        advantages = avg_trajectory_reward.detach().expand(-1, T)
+        # Fallback: use per-trajectory average reward for all steps
+        avg_trajectory_reward = trajectory.rewards.mean(dim=1, keepdim=True)  # [B, 1]
+        if CONFIG.use_grpo:
+            batch_mean = avg_trajectory_reward.mean().detach()
+            advantages = (avg_trajectory_reward - batch_mean).detach().expand(-1, T)  # [B, T]
+        else:
+            advantages = avg_trajectory_reward.detach().expand(-1, T)
     
     for t, qkv_step in enumerate(trajectory.qkv_steps):
         # === POLICY GRADIENT TERM: A_t * ∇log π_θ(a_t|s_t) ===
@@ -489,6 +498,7 @@ def parse_args():
     parser.add_argument('--disable-differentiable-rewards', action='store_true', help='Disable differentiable reward backprop through value tokens')
     parser.add_argument('--debug-generators', action='store_true', help='Enable detailed debugging of generator pipelines')
     parser.add_argument('--kl-penalty-coefficient', type=float, help='KL penalty coefficient beta; 0 disables KL regularization')
+    parser.add_argument('--use-reward-at-t', action='store_true', help='Use reward at t (disable returns-from-t weighting)')
     
     return parser.parse_args()
 
@@ -948,7 +958,7 @@ def main():
             # DEBUG: Removed - EMA updates are now enabled
             
             # Periodically verify weight changes (every 5 episodes) – check LoRA params correctly
-            if (episode + 1) % 5 == 0:
+            if (episode + 1) % 1000 == 0:
                 # Build initial snapshot of LoRA params if not already
                 if 'initial_lora_weights' not in locals():
                     initial_lora_weights = {name: p.data.clone() for name, p in adapter_model.named_parameters() if 'lora' in name}
@@ -1216,7 +1226,6 @@ def main():
                 
                 base_msg = (
                     f"Episode {episode}/{CONFIG.num_episodes}, "
-                    f"Total Loss: {total_loss:.4f}, "
                     f"Policy Term: {policy_term_val:.4f}, "
                     f"Reward Term: {reward_term_val:.4f}, "
                     f"Reward: {avg_reward:.4f}, "
