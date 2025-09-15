@@ -300,11 +300,7 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     axes[1].grid(True, alpha=0.3)
     axes[1].legend(fontsize=8)
     
-    # Add baseline update markers
-    BASELINE_UPDATE_FREQUENCY = config.get('BASELINE_UPDATE_FREQUENCY', 10)
-    for episode in range(BASELINE_UPDATE_FREQUENCY, max(training_steps) + 1, BASELINE_UPDATE_FREQUENCY):
-        if episode <= max(training_steps):
-            axes[1].axvline(x=episode, color='red', linestyle='--', alpha=0.6, linewidth=1)
+    # Removed baseline update markers for a cleaner view (user request)
     
     # Plot 3: θ-Dependent Step Rewards  (adapter vs reference)
     axes[2].plot(training_steps, adapter_log_probs, 'darkgreen', label=r'$r_{\theta,t}$ (Adapter)', linewidth=2)
