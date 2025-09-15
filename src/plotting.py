@@ -68,8 +68,7 @@ class PlotData:
     reward_gradient_norm: List[float] = field(default_factory=list)
     policy_reward_ratio: List[float] = field(default_factory=list)
     
-    # Metadata
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    # Metadata removed; plot data is self-contained
     
     def add_episode_data(
         self,
@@ -222,43 +221,10 @@ class PlotData:
             policy_term_variance=new_policy_term_variance,
             reward_term_variance=new_reward_term_variance,
             reward_gradient_norm=new_reward_gradient_norm,
-            policy_reward_ratio=new_policy_reward_ratio,
-            metadata=self.metadata  # Metadata is updated separately
+            policy_reward_ratio=new_policy_reward_ratio
         )
     
-    def with_metadata(self, metadata: Dict[str, Any]) -> 'PlotData':
-        """
-        Return a new PlotData instance with updated metadata.
-        """
-        return PlotData(
-            training_steps=self.training_steps,
-            total_losses=self.total_losses,
-            policy_losses=self.policy_losses,
-            kl_losses=self.kl_losses,
-            avg_rewards=self.avg_rewards,
-            adapter_log_probs=self.adapter_log_probs,
-            baseline_log_probs=self.baseline_log_probs,
-            base_log_probs=self.base_log_probs,
-            avg_advantages=self.avg_advantages,
-            trajectory_log_probs=self.trajectory_log_probs,
-            wikipedia_order_consistency=self.wikipedia_order_consistency,
-            entropy_values=self.entropy_values,
-            kl_penalty_terms=self.kl_penalty_terms,
-            reward_variance=self.reward_variance,
-            gradient_magnitudes=self.gradient_magnitudes,
-            step_log_probs=self.step_log_probs,
-            clipping_ratios=self.clipping_ratios,
-            batch_selection_entropy=self.batch_selection_entropy,
-            trajectory_samples=self.trajectory_samples,
-            kl_from_ref=self.kl_from_ref,
-            kl_keys_from_ref=self.kl_keys_from_ref,
-            kl_values_from_ref=self.kl_values_from_ref,
-            policy_gradients=self.policy_gradients,
-            lora_layer_gradients=self.lora_layer_gradients,
-            advantage_distributions=self.advantage_distributions,
-            similarity_score_stats=self.similarity_score_stats,
-            metadata=metadata
-        )
+    # with_metadata removed; logging uses PlotData directly
     
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -292,7 +258,6 @@ class PlotData:
             'lora_layer_gradients': self.lora_layer_gradients,
             'advantage_distributions': self.advantage_distributions,
             'similarity_score_stats': self.similarity_score_stats,
-            'metadata': self.metadata,
         }
     
     @classmethod
@@ -328,7 +293,6 @@ class PlotData:
             lora_layer_gradients=data.get('lora_layer_gradients', {}),
             advantage_distributions=data.get('advantage_distributions', []),
             similarity_score_stats=data.get('similarity_score_stats', []),
-            metadata=data.get('metadata', {}),
         )
 
 
@@ -431,19 +395,4 @@ def load_plot_data(filepath: str) -> PlotData:
     return PlotData.from_dict(data)
 
 
-def create_metadata(episode: int, config_values: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Create metadata dictionary for the plotting data.
-    
-    Args:
-        episode: Current episode number
-        config_values: Configuration values to include
-        
-    Returns:
-        Metadata dictionary
-    """
-    return {
-        'episode': episode,
-        'timestamp': datetime.now().isoformat(),
-        'config': config_values
-    } 
+# create_metadata removed

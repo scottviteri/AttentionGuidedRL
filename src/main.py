@@ -33,7 +33,7 @@ from src.training import (
     calculate_conditional_log_prob,
     compute_returns,
 )
-from src.plotting import PlotData, save_plot_data, create_metadata
+from src.plotting import PlotData, save_plot_data
 from src.metrics import (
     compute_wikipedia_order_consistency,
     compute_batch_selection_entropy,
@@ -340,6 +340,8 @@ def generate_trajectory(
 
     num_keys = len(available_qkv_steps)
     available_indices_per_batch: List[List[int]] = [list(range(num_keys)) for _ in range(batch_size)]
+    # Track per-batch selections to assert no duplicate key selection within a trajectory
+    selected_indices_seen_per_batch = [set() for _ in range(batch_size)]
 
     # Ensure each key embedding has batch dimension = batch_size
     key_emb_list = []
@@ -382,6 +384,12 @@ def generate_trajectory(
         else:
             # Stochastic: sample from policy distribution over available keys
             selected_indices, _ = sample_key_value(similarity_scores, available_indices_per_batch, batch_size, rng=rng)
+
+        # === ASSERTION: No duplicate selection within the same batch element ===
+        for b, idx in enumerate(selected_indices):
+            if idx in selected_indices_seen_per_batch[b]:
+                raise AssertionError(f"Duplicate key selection detected in batch {b}: index {idx} already selected in this trajectory")
+            selected_indices_seen_per_batch[b].add(idx)
 
         # 5) Assemble tensors for the chosen KV pair
         selected_key_tokens = []
@@ -1197,11 +1205,7 @@ def main():
             # Save and plot metrics periodically
             if episode > 0 and episode % 15 == 0:
                 # Add metadata to plot data and save
-                metadata = create_metadata(episode, {
-                    'NUM_KV_PAIRS': CONFIG.num_kv_pairs,
-                })
-                plot_data_with_metadata = plot_data.with_metadata(metadata)
-                save_plot_data(plot_data_with_metadata, log_dir)
+                save_plot_data(plot_data, log_dir)
                 plot_metrics(log_dir, policy_gradients)
             
             # Log every log_interval episodes
@@ -1264,11 +1268,7 @@ def main():
         save_checkpoint(adapter_model, "latest")
         
         # Save final plot data and create plots
-        final_metadata = create_metadata(episode, {
-            'NUM_KV_PAIRS': CONFIG.num_kv_pairs,
-        })
-        final_plot_data = plot_data.with_metadata(final_metadata)
-        save_plot_data(final_plot_data, log_dir)
+        save_plot_data(plot_data, log_dir)
         plot_metrics(log_dir, None)
         
         logging.info("Training complete!")

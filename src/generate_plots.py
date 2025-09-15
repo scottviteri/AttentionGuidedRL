@@ -216,6 +216,22 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
     gradient_magnitudes = smooth_data(data['gradient_magnitudes'][:min_length], smooth_window)
     step_log_probs = data.get('step_log_probs', [])
     step_selected_indices = data.get('step_selected_indices', [])
+    # Fallback: reconstruct step_selected_indices from trajectory_samples if missing
+    if (not step_selected_indices) and data.get('trajectory_samples'):
+        samples = data.get('trajectory_samples', [])
+        # Initialize with empty lists per episode
+        step_selected_indices = [[] for _ in range(len(training_steps))]
+        for sample in samples:
+            ep = sample.get('episode')
+            idx_seqs = sample.get('index_sequences', [])
+            if isinstance(ep, int) and 0 <= ep < len(training_steps) and idx_seqs:
+                # Compute average selected index across batch for each step
+                maxlen = max((len(seq) for seq in idx_seqs if seq), default=0)
+                avgs = []
+                for s_idx in range(maxlen):
+                    vals = [seq[s_idx] for seq in idx_seqs if len(seq) > s_idx]
+                    avgs.append(float(np.mean(vals)) if vals else 0.0)
+                step_selected_indices[ep] = avgs
     policy_gradients = smooth_data(data['policy_gradients'][:min_length], smooth_window)
     clipping_ratios = smooth_data(data['clipping_ratios'][:min_length], smooth_window)
     kl_values_from_ref = smooth_data(data['kl_values_from_ref'][:min_length], smooth_window)
@@ -383,7 +399,8 @@ def generate_plots(data: Dict[str, Any], output_dir: Optional[str] = None, custo
             
             axes[8].set_xlabel('Step Index')
             axes[8].set_ylabel('Avg Log Prob of Selected Action')
-            axes[8].set_title(f'Log Prob by Step Index (training progression){title_suffix}')
+            # Do not imply smoothing on this plot since data is averaged by step, not smoothed
+            axes[8].set_title('Log Prob by Step Index (training progression)')
             axes[8].grid(True, alpha=0.3)
             axes[8].set_xticks(step_indices)
         else:

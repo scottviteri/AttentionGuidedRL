@@ -42,16 +42,15 @@ class TrainingConfig:
     # Training hyperparameters
     learning_rate: float = 5e-4
     num_episodes: int = 10000
-    batch_size: int = 64
+    batch_size: int = 16 
     
     # RL-specific parameters (minimal)
     differentiable_rewards: bool = True   # Enable chain-rule reward gradients
     
     # Training behavior
     subtract_base_model_logprobs: bool = True
-    use_grpo: bool = False  # GRPO off by default; enable via --use-grpo
-    kl_penalty_coefficient: float = 0.0
-    # PPO/GAE removed (not used)
+    use_grpo: bool = True  # GRPO off by default; enable via --use-grpo
+    kl_penalty_coefficient: float = 0.1
     
     # Ablations / deterministic baselines
     force_linear_action_order: bool = False  # If True, pick keys in linear order instead of sampling
@@ -61,7 +60,7 @@ class TrainingConfig:
     # Training infrastructure
     checkpoint_interval: int = 100
     checkpoint_dir: str = "checkpoints"
-    log_interval: int = 10
+    log_interval: int = 1000
     enable_wandb: bool = False
     debug_print_context: bool = False
     
