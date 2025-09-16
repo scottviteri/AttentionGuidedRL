@@ -49,8 +49,8 @@ class TrainingConfig:
     use_returns_from_t: bool = True       # Use return-from-t for policy weighting by default
     
     # Training behavior
-    subtract_base_model_logprobs: bool = True
-    use_grpo: bool = True  # GRPO off by default; enable via --use-grpo
+    subtract_base_model_logprobs: bool = False 
+    use_grpo: bool = True  
     kl_penalty_coefficient: float = 0.1
     
     # Ablations / deterministic baselines
@@ -59,7 +59,7 @@ class TrainingConfig:
     # Reference diagnostics are always enabled (no config flag)
     
     # Training infrastructure
-    checkpoint_interval: int = 100
+    checkpoint_interval: int = 1000
     checkpoint_dir: str = "checkpoints"
     log_interval: int = 1000
     enable_wandb: bool = False
@@ -148,8 +148,10 @@ def create_training_config_from_args(args: argparse.Namespace) -> TrainingConfig
         use_grpo = False
     else:
         use_grpo = base_config.use_grpo
-    # Resolve subtract_base_model_logprobs with explicit disable flag
-    subtract_base = False if getattr(args, 'no_subtract_base_logprobs', False) else True
+    # Resolve subtract_base_model_logprobs: respect default unless explicitly disabled via CLI
+    subtract_base = base_config.subtract_base_model_logprobs
+    if getattr(args, 'no_subtract_base_logprobs', False):
+        subtract_base = False
     # Resolve differentiable rewards with explicit disable flag
     differentiable_rewards = False if getattr(args, 'disable_differentiable_rewards', False) else True
 
