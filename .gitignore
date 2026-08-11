@@ -86,3 +86,6 @@ logs/
 checkpoints/
 wandb/
 .DS_Store 
+.ipynb_checkpoints/
+node_modules/
+.venv/
